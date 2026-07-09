@@ -107,12 +107,9 @@ export function ColumnSymbol({
     else if (isVerified) { stroke = '#10B981' }
     else if (isLowConf || m.status === 'need_review') { stroke = '#F59E0B'; dash = '4,3' }
   }
-  const sw = (isHovered ? 2.2 : 1.4) + (isSelected ? 2 : 0)
-  const fillCol = isSuggested
-    ? 'none'
-    : isHovered
-    ? 'rgba(59, 130, 246, 0.35)'
-    : 'rgba(59, 130, 246, 0.15)'
+  const sw = (isHovered ? 3.0 : 2.0) + (isSelected ? 1.5 : 0)
+  // Use transparent instead of none so pointer events are still captured
+  const fillCol = 'transparent'
 
   // I-glyph rects
   const flangeH = !vert
@@ -134,6 +131,7 @@ export function ColumnSymbol({
       stroke={stroke}
       strokeWidth={sw}
       strokeDasharray={dash}
+      strokeLinejoin="round"
       className={isZoomTarget ? 'pulsing-member' : ''}
       style={{ transition: 'all 0.1s ease', filter: filterStyle }}
     />
