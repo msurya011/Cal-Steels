@@ -45,21 +45,20 @@ export function MemberExplorer({
 }: MemberExplorerProps) {
   const {
     selection,
-    hiddenKinds,
     hiddenIds,
     isolation,
-    colorMode,
     searchQuery,
     setSelection,
     toggleSelection,
     clearSelection,
-    toggleKindVisibility,
     toggleMemberVisibility,
     showAllMembers,
     setIsolation,
     setColorMode,
     setSearchQuery,
     setZoomTarget,
+    layers,
+    toggleLayerVisibility,
   } = useWorkspaceStore()
 
   // Tree collapse states
@@ -337,7 +336,7 @@ export function MemberExplorer({
       >
         {/* Color by selector */}
         <select
-          value={colorMode}
+          value={layers.colorMode}
           onChange={(e) => setColorMode(e.target.value as any)}
           style={{
             padding: '4px 8px',
@@ -419,7 +418,7 @@ export function MemberExplorer({
 
           const isKindExpanded = expandedKinds[kind]
           const kindSelectionState = getKindSelectionState(kind)
-          const isKindHidden = hiddenKinds.has(kind)
+          const isKindHidden = layers.classVisibility[kind] === false
           const isKindIsolated = isolation && isolation.kind === kind
 
           return (
@@ -485,7 +484,7 @@ export function MemberExplorer({
 
                 {/* Visibility Eye */}
                 <button
-                  onClick={() => toggleKindVisibility(kind)}
+                  onClick={() => toggleLayerVisibility(kind)}
                   style={{
                     background: 'none',
                     border: 'none',

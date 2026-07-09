@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState } from 'react'
 import { useWorkspaceStore, Point, CropRect } from '../../../../lib/stores/workspaceStore'
 import { OverlayLayer } from './OverlayLayer'
+import { CanvasLegendChip } from './CanvasLegendChip'
 
 interface Member {
   id: string
@@ -69,11 +70,6 @@ export function PlanCanvas({
     imageAspect,
     setImageAspect,
     zoomTarget,
-    selection,
-    hiddenKinds,
-    hiddenIds,
-    isolation,
-    colorMode,
   } = useWorkspaceStore()
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -246,6 +242,9 @@ export function PlanCanvas({
         width: '100%',
       }}
     >
+      {/* Floating Canvas Legend */}
+      <CanvasLegendChip members={members} />
+
       {imageUrl ? (
         <div
           ref={imageWrapperRef}
@@ -285,12 +284,6 @@ export function PlanCanvas({
             }}
             hoveredMemberId={hoveredMemberId}
             onMemberHover={setHoveredMemberId}
-            selection={selection}
-            hiddenKinds={hiddenKinds}
-            hiddenIds={hiddenIds}
-            isolation={isolation}
-            colorMode={colorMode}
-            zoomTarget={zoomTarget}
           />
 
           {/* Ruler calibration preview overlay lines */}

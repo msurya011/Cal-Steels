@@ -13,6 +13,7 @@ from app.api.v1.notifications import router as notifications_router
 from app.api.v1.events import router as events_router
 from app.api.v1.sections import router as sections_router
 from app.api.v1.exports import router as exports_router
+from app.api.v1.layer_presets import router as layer_presets_router
 
 api_router = APIRouter(prefix="/api/v1")
 
@@ -28,3 +29,4 @@ api_router.include_router(notifications_router)
 api_router.include_router(events_router)
 api_router.include_router(sections_router)
 api_router.include_router(exports_router)
+api_router.include_router(layer_presets_router)

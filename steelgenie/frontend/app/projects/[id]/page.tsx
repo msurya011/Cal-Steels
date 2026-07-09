@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
+import { Columns } from 'lucide-react'
 import { useWorkspaceStore } from '../../../lib/stores/workspaceStore'
 import { useWorkspace } from '../../../features/workspace/hooks/useWorkspace'
 import { useMembers } from '../../../features/workspace/hooks/useMembers'
@@ -15,7 +16,7 @@ import { ScaleCalibrationModal } from '../../../features/workspace/components/Sc
 import { SheetSummary } from '../../../features/workspace/components/SheetSummary'
 import { VerticalToolStrip } from '../../../features/workspace/components/VerticalToolStrip'
 import { supabase } from '../../../lib/supabase'
-import { getEventsWebSocketUrl, jobsApi, membersApi } from '../../../lib/api'
+import { getEventsWebSocketUrl, jobsApi, membersApi, layerPresetsApi } from '../../../lib/api'
 import { toast } from 'sonner'
 import { useQueryClient } from '@tanstack/react-query'
 
@@ -67,6 +68,8 @@ export default function TakeoffWorkspacePage() {
   const [extractingPageId, setExtractingPageId] = useState<string | null>(null)
   const [extractProgress, setExtractProgress] = useState<{ pct: number; msg: string } | null>(null)
   const queryClient = useQueryClient()
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [leftTab, setLeftTab] = useState<'pages' | 'members'>('pages')
 
   // Card-level page updates (scale / T.O.S. / status) — keeps store in sync
   const handleCardUpdatePage = async (pageId: string, data: any) => {
@@ -368,6 +371,30 @@ export default function TakeoffWorkspacePage() {
     }
   }, [])
 
+  // Load layer presets from server
+  useEffect(() => {
+    if (!projectId) return
+    layerPresetsApi
+      .list(projectId)
+      .then((serverPresets) => {
+        if (serverPresets && serverPresets.length > 0) {
+          const formatted = serverPresets.map((p: any) => ({
+            id: p.id,
+            name: p.name,
+            classVisibility: p.payload.classVisibility,
+            classOpacity: p.payload.classOpacity,
+            classColors: p.payload.classColors,
+            aids: p.payload.aids,
+            colorMode: p.payload.colorMode
+          }))
+          useWorkspaceStore.getState().setPresetsFromServer(formatted)
+        }
+      })
+      .catch(() => {
+        // ignore background fetch error
+      })
+  }, [projectId])
+
   const handleScaleChange = async (label: string, ratio: number) => {
     if (!currentPageId) return
     setScale(label, ratio)
@@ -530,56 +557,145 @@ export default function TakeoffWorkspacePage() {
 
   return (
     <div style={{ display: 'flex', height: '100%', width: '100%', overflow: 'hidden' }}>
-      {/* Left Sidebar: Pages rail */}
-      <PageRail
-        projectId={projectId}
-        pages={pages}
-        isLoading={workspaceLoading}
-        refetchWorkspace={() => {
-          queryClient.invalidateQueries({ queryKey: ['drawings', projectId] })
-          queryClient.invalidateQueries({ queryKey: ['pages'] })
-        }}
-        onUpdatePage={handleCardUpdatePage}
-        onExtract={handleCardExtract}
-        extractingPageId={extractingPageId}
-        extractProgress={extractProgress}
-      />
-
-      {/* Second Sidebar: Member Explorer (placed where marked in red) */}
-      <div
-        style={{
-          width: '260px',
-          backgroundColor: '#111827',
-          borderRight: '1px solid rgba(59, 130, 246, 0.1)',
-          display: 'flex',
-          flexDirection: 'column',
-          height: '100%',
-          flexShrink: 0,
-        }}
-      >
+      {/* Integrated Left Sidebar: Navigation (Pages / Members) */}
+      {sidebarOpen && (
         <div
           style={{
-            height: '42px',
-            borderBottom: '1px solid rgba(59, 130, 246, 0.1)',
+            width: '270px',
+            backgroundColor: '#111827',
+            borderRight: '1px solid rgba(59, 130, 246, 0.1)',
             display: 'flex',
-            alignItems: 'center',
-            padding: '0 16px',
-            backgroundColor: '#0F172A',
-            fontWeight: 700,
-            fontSize: '12px',
-            color: '#F1F5F9',
+            flexDirection: 'column',
+            height: '100%',
+            flexShrink: 0,
           }}
         >
-          Members ({members.length})
+          {/* Sidebar Header */}
+          <div
+            style={{
+              height: '48px',
+              borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              padding: '0 16px',
+              backgroundColor: '#0F172A',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#F1F5F9' }}>
+              <Columns size={16} style={{ color: '#3B82F6' }} />
+              <span style={{ fontSize: '13px', fontWeight: 700 }}>Navigation</span>
+            </div>
+            <button
+              onClick={() => setSidebarOpen(false)}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: '#64748B',
+                cursor: 'pointer',
+                fontSize: '18px',
+                lineHeight: 1,
+                padding: '2px',
+              }}
+              title="Close Navigation"
+            >
+              &times;
+            </button>
+          </div>
+
+          {/* Capsule Segmented Tabs Control */}
+          <div style={{ padding: '12px 16px', backgroundColor: '#111827' }}>
+            <div
+              style={{
+                display: 'flex',
+                backgroundColor: '#0F172A',
+                padding: '4px',
+                borderRadius: '24px',
+                border: '1px solid rgba(59, 130, 246, 0.15)',
+              }}
+            >
+              <button
+                onClick={() => setLeftTab('pages')}
+                style={{
+                  flex: 1,
+                  backgroundColor: leftTab === 'pages' ? '#1B3A60' : 'transparent',
+                  color: leftTab === 'pages' ? '#FFFFFF' : '#94A3B8',
+                  border: leftTab === 'pages' ? '1px solid rgba(59, 130, 246, 0.3)' : 'none',
+                  borderRadius: '20px',
+                  padding: '6px 12px',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  outline: 'none',
+                  transition: 'all 0.2s ease',
+                }}
+              >
+                Pages
+              </button>
+              <button
+                onClick={() => setLeftTab('members')}
+                style={{
+                  flex: 1,
+                  backgroundColor: leftTab === 'members' ? '#1B3A60' : 'transparent',
+                  color: leftTab === 'members' ? '#FFFFFF' : '#94A3B8',
+                  border: leftTab === 'members' ? '1px solid rgba(59, 130, 246, 0.3)' : 'none',
+                  borderRadius: '20px',
+                  padding: '6px 12px',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  outline: 'none',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  transition: 'all 0.2s ease',
+                }}
+              >
+                <span>Members</span>
+                <span
+                  style={{
+                    backgroundColor: '#F59E0B',
+                    color: '#0F172A',
+                    padding: '2px 6px',
+                    borderRadius: '10px',
+                    fontSize: '10px',
+                    fontWeight: 800,
+                    marginLeft: '6px',
+                    lineHeight: 1,
+                  }}
+                >
+                  {members.length}
+                </span>
+              </button>
+            </div>
+          </div>
+
+          {/* Sidebar Content */}
+          <div style={{ flex: 1, overflow: 'hidden' }}>
+            {leftTab === 'pages' ? (
+              <PageRail
+                projectId={projectId}
+                pages={pages}
+                isLoading={workspaceLoading}
+                refetchWorkspace={() => {
+                  queryClient.invalidateQueries({ queryKey: ['drawings', projectId] })
+                  queryClient.invalidateQueries({ queryKey: ['pages'] })
+                }}
+                onUpdatePage={handleCardUpdatePage}
+                onExtract={handleCardExtract}
+                extractingPageId={extractingPageId}
+                extractProgress={extractProgress}
+              />
+            ) : (
+              <MemberExplorer
+                members={members}
+                bulkUpdateMembers={handleBulkUpdate}
+                bulkDeleteMembers={handleBulkDelete}
+              />
+            )}
+          </div>
         </div>
-        <div style={{ flex: 1, overflow: 'hidden' }}>
-          <MemberExplorer
-            members={members}
-            bulkUpdateMembers={handleBulkUpdate}
-            bulkDeleteMembers={handleBulkDelete}
-          />
-        </div>
-      </div>
+      )}
 
       {/* Center workspace canvas */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -588,9 +704,23 @@ export default function TakeoffWorkspacePage() {
           onRunAnalyse={handleRunAnalyse}
           isAnalysing={analysingState}
         />
-
         <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-          <VerticalToolStrip />
+          <div
+            style={{
+              position: 'absolute',
+              top: '16px',
+              left: sidebarOpen ? '282px' : '12px',
+              zIndex: 30,
+              transition: 'left 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+            }}
+          >
+            <VerticalToolStrip
+              members={members}
+              projectId={projectId}
+              sidebarOpen={sidebarOpen}
+              onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+            />
+          </div>
           <PlanCanvas
             imageUrl={activePage?.image_url || null}
             members={members}

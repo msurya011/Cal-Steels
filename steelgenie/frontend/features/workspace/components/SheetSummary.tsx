@@ -1,7 +1,8 @@
 'use client'
 
 import React, { useMemo, useState } from 'react'
-import { ChevronDown, ChevronUp } from 'lucide-react'
+import { ChevronDown, ChevronUp, Eye, EyeOff, Target, AlertTriangle } from 'lucide-react'
+import { useWorkspaceStore } from '../../../lib/stores/workspaceStore'
 
 interface Member {
   id: string
@@ -9,6 +10,7 @@ interface Member {
   section: string | null
   length_ft: number | null
   geometry?: any
+  status?: string
 }
 
 interface SheetSummaryProps {
@@ -29,7 +31,17 @@ function unitWeightLbFt(section: string | null): number | null {
 }
 
 export function SheetSummary({ members }: SheetSummaryProps) {
+  const store = useWorkspaceStore()
+  const {
+    layers,
+    toggleLayerVisibility,
+    isolation,
+    setIsolation,
+    setSearchQuery,
+  } = store
+
   const [open, setOpen] = useState(true)
+  const [hoveredRow, setHoveredRow] = useState<string | null>(null)
 
   const stats = useMemo(() => {
     const counts = { column: 0, beam: 0, vbrace: 0, hbrace: 0, joist: 0 }
@@ -42,7 +54,16 @@ export function SheetSummary({ members }: SheetSummaryProps) {
     return { counts, tons: weightLbs / 2000 }
   }, [members])
 
-  const row = (label: string, value: React.ReactNode, highlight = false) => (
+  const reviewStats = useMemo(() => {
+    const total = members.length
+    if (total === 0) return { pct: 100, remain: 0 }
+    const verified = members.filter(m => m.status === 'verified').length
+    const remain = members.filter(m => m.status !== 'verified' && m.status !== 'excluded').length
+    const pct = Math.round((verified / total) * 100)
+    return { pct, remain }
+  }, [members])
+
+  const totalsRow = (label: string, value: React.ReactNode) => (
     <div
       key={label}
       style={{
@@ -53,28 +74,112 @@ export function SheetSummary({ members }: SheetSummaryProps) {
         borderBottom: '1px solid rgba(255,255,255,0.05)',
       }}
     >
-      <span style={{ fontSize: '12px', color: '#B9C7D8', fontWeight: 600 }}>{label}:</span>
-      <span
-        style={{
-          fontSize: '12px',
-          fontWeight: 700,
-          color: '#F1F5F9',
-          backgroundColor: highlight ? 'rgba(59,130,246,0.35)' : 'transparent',
-          padding: highlight ? '1px 6px' : undefined,
-          borderRadius: highlight ? '4px' : undefined,
-        }}
-      >
-        {value}
-      </span>
+      <span style={{ fontSize: '11px', color: '#94A3B8', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.4px' }}>{label}:</span>
+      <span style={{ fontSize: '12px', fontWeight: 700, color: '#F1F5F9' }}>{value}</span>
     </div>
   )
+
+  const handleRowClick = (kind: string) => {
+    // Filter Member Explorer list by kind
+    setSearchQuery(kind)
+  }
+
+  const handleIsolateClick = (e: React.MouseEvent, kind: string) => {
+    e.stopPropagation()
+    const activeIsolateKind = isolation?.kind
+    if (activeIsolateKind === kind) {
+      setIsolation(null)
+    } else {
+      setIsolation({ kind })
+    }
+  }
+
+  const renderSummaryRow = (label: string, kindKey: string, count: number, isTotals = false) => {
+    const visible = layers.classVisibility[kindKey] !== false
+    const isIsolated = isolation?.kind === kindKey
+    const isHovered = hoveredRow === kindKey
+
+    return (
+      <div
+        key={label}
+        onClick={() => handleRowClick(kindKey)}
+        onMouseEnter={() => setHoveredRow(kindKey)}
+        onMouseLeave={() => setHoveredRow(null)}
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          padding: '7px 14px',
+          borderBottom: '1px solid rgba(255,255,255,0.05)',
+          cursor: 'pointer',
+          backgroundColor: isHovered ? 'rgba(59, 130, 246, 0.08)' : 'transparent',
+          transition: 'background-color 0.15s ease',
+        }}
+      >
+        <span style={{ fontSize: '12px', color: '#B9C7D8', fontWeight: 600 }}>{label}</span>
+        
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          {/* Action buttons revealed on hover */}
+          {(isHovered || isIsolated || !visible) && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  toggleLayerVisibility(kindKey)
+                }}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: visible ? '#3B82F6' : '#64748B',
+                  cursor: 'pointer',
+                  padding: 0,
+                  display: 'flex',
+                }}
+                title={visible ? 'Hide layer' : 'Show layer'}
+              >
+                {visible ? <Eye size={13} /> : <EyeOff size={13} />}
+              </button>
+              
+              <button
+                onClick={(e) => handleIsolateClick(e, kindKey)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: isIsolated ? '#10B981' : '#64748B',
+                  cursor: 'pointer',
+                  padding: 0,
+                  display: 'flex',
+                }}
+                title={isIsolated ? 'Clear Isolation' : 'Isolate category'}
+              >
+                <Target size={13} />
+              </button>
+            </div>
+          )}
+
+          <span
+            style={{
+              fontSize: '12px',
+              fontWeight: 700,
+              color: isTotals ? '#F1F5F9' : '#FFFFFF',
+              backgroundColor: isTotals ? 'rgba(59,130,246,0.35)' : 'transparent',
+              padding: isTotals ? '1px 6px' : undefined,
+              borderRadius: isTotals ? '4px' : undefined,
+            }}
+          >
+            {isTotals ? count.toFixed(2) : count}
+          </span>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div
       style={{
         width: '260px',
-        backgroundColor: '#132E4F',
-        borderLeft: '1px solid rgba(59, 130, 246, 0.12)',
+        backgroundColor: '#111827',
+        borderLeft: '1px solid rgba(59, 130, 246, 0.1)',
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
@@ -82,15 +187,23 @@ export function SheetSummary({ members }: SheetSummaryProps) {
         overflowY: 'auto',
       }}
     >
-      {/* Top quick metrics (mirrors reference layout) */}
+      {/* 1. PROJECT TOTALS */}
       <div style={{ padding: '10px 0 0' }}>
-        {row('Weld Studs', 0)}
-        {row('Total Weight (tons)', stats.tons.toFixed(2))}
-        {row('Hrs/Ton', <span style={{ color: '#94A3B8' }}>WIP</span>)}
+        {totalsRow('Weld Studs', 0)}
+        {totalsRow('Total Weight (tons)', stats.tons.toFixed(2))}
+        {totalsRow('Hrs/Ton', <span style={{ color: '#64748B', fontSize: '10px', fontWeight: 700 }}>WIP</span>)}
       </div>
 
-      {/* Collapsible Sheet Summary card */}
-      <div style={{ margin: '12px 10px', borderRadius: '8px', overflow: 'hidden', border: '1px solid rgba(59,130,246,0.18)' }}>
+      {/* 2. SHEET SUMMARY (COLLAPSIBLE CARD) */}
+      <div
+        style={{
+          margin: '12px 10px',
+          borderRadius: '8px',
+          overflow: 'hidden',
+          border: '1px solid rgba(59,130,246,0.12)',
+          backgroundColor: '#0F172A',
+        }}
+      >
         <button
           onClick={() => setOpen(!open)}
           style={{
@@ -99,36 +212,96 @@ export function SheetSummary({ members }: SheetSummaryProps) {
             justifyContent: 'space-between',
             alignItems: 'center',
             padding: '9px 14px',
-            backgroundColor: '#1B3A60',
+            backgroundColor: '#0F172A',
             border: 'none',
             color: '#F1F5F9',
-            fontSize: '13px',
+            fontSize: '12px',
             fontWeight: 700,
             cursor: 'pointer',
+            borderBottom: open ? '1px solid rgba(255,255,255,0.05)' : 'none',
           }}
         >
-          Sheet Summary
-          {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          <span>SHEET SUMMARY</span>
+          {open ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
         </button>
 
         {open && (
-          <div style={{ backgroundColor: '#122B4A' }}>
-            {row('Column', stats.counts.column)}
-            {row('Beam', stats.counts.beam)}
-            {row('Vertical Brace', stats.counts.vbrace)}
-            {row('Horizontal Brace', stats.counts.hbrace)}
-            {row('Joists', stats.counts.joist)}
-            {row('Moment Connection', 0)}
-            {row('Bolt', 0)}
-            {row('Embed Plate', 0)}
-            {row('Camber', 0)}
-            {row('Weld Studs', 0)}
-            {row('Total Weight (tons)', stats.tons.toFixed(2), true)}
+          <div style={{ backgroundColor: '#111827' }}>
+            {renderSummaryRow('Column', 'column', stats.counts.column)}
+            {renderSummaryRow('Beam', 'beam', stats.counts.beam)}
+            {renderSummaryRow('Vertical Brace', 'vbrace', stats.counts.vbrace)}
+            {renderSummaryRow('Horizontal Brace', 'hbrace', stats.counts.hbrace)}
+            {renderSummaryRow('Joist', 'joist', stats.counts.joist)}
+            {renderSummaryRow('Total Weight (tons)', 'weight', stats.tons, true)}
           </div>
         )}
       </div>
 
-      <div style={{ padding: '0 14px 14px', fontSize: '10px', color: '#64748B', lineHeight: 1.5 }}>
+      {/* 3. REVIEW PROGRESS TRACKING CARD */}
+      <div
+        style={{
+          margin: '0 10px 12px',
+          padding: '12px 14px',
+          borderRadius: '8px',
+          border: '1px solid rgba(59,130,246,0.12)',
+          backgroundColor: '#0F172A',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '10px',
+        }}
+      >
+        <div style={{ fontSize: '10px', fontWeight: 700, color: '#94A3B8', textTransform: 'uppercase' }}>
+          Review
+        </div>
+        
+        {/* Progress bar */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', fontWeight: 600 }}>
+            <span>{reviewStats.pct}% verified</span>
+            <span>{members.length - reviewStats.remain}/{members.length}</span>
+          </div>
+          <div style={{ width: '100%', height: '6px', backgroundColor: '#1E293B', borderRadius: '3px', overflow: 'hidden' }}>
+            <div
+              style={{
+                width: `${reviewStats.pct}%`,
+                height: '100%',
+                backgroundColor: '#10B981',
+                borderRadius: '3px',
+                transition: 'width 0.3s ease',
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Need Review badge/trigger button */}
+        {reviewStats.remain > 0 && (
+          <button
+            onClick={() => setSearchQuery('need_review')}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '6px',
+              padding: '6px 10px',
+              backgroundColor: 'rgba(245, 158, 11, 0.1)',
+              border: '1px solid rgba(245, 158, 11, 0.25)',
+              borderRadius: '6px',
+              color: '#F59E0B',
+              fontSize: '11px',
+              fontWeight: 700,
+              cursor: 'pointer',
+              transition: 'background-color 0.2s',
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'rgba(245, 158, 11, 0.18)'}
+            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'rgba(245, 158, 11, 0.1)'}
+          >
+            <AlertTriangle size={13} />
+            <span>{reviewStats.remain} remain to verify</span>
+          </button>
+        )}
+      </div>
+
+      <div style={{ padding: '0 14px 14px', fontSize: '10px', color: '#475569', lineHeight: 1.5 }}>
         Weight computed from W/S/C/M/HP designations × member length. Connection
         quantities (bolts, plates, camber, studs) populate after the Build step (M4).
       </div>

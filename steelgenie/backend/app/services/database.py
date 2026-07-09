@@ -36,7 +36,8 @@ def _load_db() -> dict:
         "bom_items": [],
         "sections": [],
         "configurations": [],
-        "notifications": []
+        "notifications": [],
+        "layer_presets": []
     }
     if not os.path.exists(_DB_FILE):
         db = default_db

@@ -217,6 +217,25 @@ export const sectionsApi = {
   get: (designation: string) => apiFetch(`/api/v1/sections/${designation}`),
 }
 
+// ── LAYER PRESETS API ────────────────────────────────────────────────────────
+export const layerPresetsApi = {
+  list: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/layer-presets`),
+  create: (projectId: string, name: string, payload: any) =>
+    apiFetch(`/api/v1/projects/${projectId}/layer-presets`, {
+      method: 'POST',
+      body: JSON.stringify({ name, payload }),
+    }),
+  update: (projectId: string, presetId: string, name: string, payload: any) =>
+    apiFetch(`/api/v1/projects/${projectId}/layer-presets/${presetId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name, payload }),
+    }),
+  delete: (projectId: string, presetId: string) =>
+    apiFetch(`/api/v1/projects/${projectId}/layer-presets/${presetId}`, {
+      method: 'DELETE',
+    }),
+}
+
 // ── WEBSOCKET SETUP ──────────────────────────────────────────────────────────
 export function getEventsWebSocketUrl(token: string) {
   const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'

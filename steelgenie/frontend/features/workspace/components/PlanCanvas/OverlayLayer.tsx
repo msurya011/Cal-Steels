@@ -1,4 +1,5 @@
 import React from 'react'
+import { useWorkspaceStore, getMemberRenderProps } from '../../../../lib/stores/workspaceStore'
 
 interface Member {
   id: string
@@ -21,6 +22,7 @@ interface Member {
   }
   confidence?: number | null
   status?: string
+  source?: string
 }
 
 interface OverlayLayerProps {
@@ -28,18 +30,6 @@ interface OverlayLayerProps {
   onMemberClick: (member: Member, e: React.MouseEvent) => void
   hoveredMemberId: string | null
   onMemberHover: (id: string | null) => void
-  selection?: Set<string>
-  hiddenKinds?: Set<string>
-  hiddenIds?: Set<string>
-  isolation?: { kind?: string; ids?: Set<string> } | null
-  colorMode?: 'kind' | 'status' | 'confidence'
-  zoomTarget?: { id: string; nonce: number } | null
-}
-
-const isMatchKind = (mKind: string, targetKind: string) => {
-  if (mKind === targetKind) return true
-  if (targetKind === 'vbrace' && (mKind === 'vbrace' || mKind === 'hbrace' || mKind === 'brace')) return true
-  return false
 }
 
 export function OverlayLayer({
@@ -47,43 +37,9 @@ export function OverlayLayer({
   onMemberClick,
   hoveredMemberId,
   onMemberHover,
-  selection = new Set(),
-  hiddenKinds = new Set(),
-  hiddenIds = new Set(),
-  isolation = null,
-  colorMode = 'kind',
-  zoomTarget = null,
 }: OverlayLayerProps) {
-
-  const isIsolated = !!isolation
-  const isolatedKind = isolation?.kind
-  const isolatedIds = isolation?.ids
-
-  const getMemberColor = (m: Member) => {
-    // If category isolation is enabled and this member is the isolated category, force green!
-    if (isolatedKind && isMatchKind(m.kind, isolatedKind)) {
-      return '#10B981' // Green
-    }
-    if (colorMode === 'status') {
-      if (m.status === 'verified') return '#10B981' // green
-      if (m.status === 'rejected') return '#EF4444' // red
-      if (m.status === 'need_review') return '#F59E0B' // orange
-      return '#64748B' // gray
-    }
-    if (colorMode === 'confidence') {
-      const conf = m.confidence ?? 0
-      if (conf >= 0.9) return '#10B981'
-      if (conf >= 0.7) return '#3B82F6'
-      if (conf >= 0.5) return '#F59E0B'
-      return '#EF4444'
-    }
-    
-    // Default: color by kind
-    if (m.kind === 'column') return '#3B82F6' // Blue
-    if (m.kind === 'beam') return '#EC4899'   // Pink
-    if (m.kind === 'vbrace' || m.kind === 'hbrace' || m.kind === 'brace') return '#F59E0B' // Orange
-    return '#10B981' // Green
-  }
+  const store = useWorkspaceStore()
+  const { layers, selection, hiddenIds, isolation, zoomTarget } = store
 
   return (
     <svg
@@ -105,42 +61,43 @@ export function OverlayLayer({
         .pulsing-member {
           animation: pulse-highlight 0.8s ease-in-out 3;
         }
+        @keyframes pulse-halo {
+          0% { opacity: 0.2; }
+          50% { opacity: 0.55; }
+          100% { opacity: 0.2; }
+        }
+        .pulse-halo-animation {
+          animation: pulse-halo 1.5s infinite ease-in-out;
+        }
       `}</style>
 
       {members.map((m) => {
         const geo = m.geometry
-        const isHidden = hiddenKinds.has(m.kind) || hiddenIds.has(m.id)
-        if (isHidden) return null
 
-        // If category isolation is enabled, hide all other categories completely
-        const isTargetKind = isolatedKind ? isMatchKind(m.kind, isolatedKind) : false
-        if (isolatedKind && !isTargetKind) {
+        // Check markers aid visibility
+        if (m.source === 'manual' && !layers.aids.markers) {
           return null
         }
 
-        // Determine if isolated / dimmed
-        const isTarget =
-          !isIsolated ||
-          (isolatedKind && isTargetKind) ||
-          (isolatedIds && isolatedIds.has(m.id))
-        const isDimmed = isIsolated && !isTarget
+        // Get visibility, color and opacity from centralized selector
+        const { visible, color, opacity } = getMemberRenderProps({ layers, hiddenIds, isolation }, m)
+        if (!visible) return null
 
-        const color = getMemberColor(m)
         const isHovered = hoveredMemberId === m.id
         const isSelected = selection.has(m.id)
         const isZoomTarget = zoomTarget && zoomTarget.id === m.id
-
-        // Render styles
-        const opacity = isDimmed ? 0.15 : 1.0
-        const strokeWidthModifier = isSelected ? 1.5 : 0
         const isLowConf = m.confidence !== undefined && m.confidence !== null && m.confidence < 0.70
-        
+        const showHalo = layers.aids.confidenceHalo && isLowConf
+
         let filterStyle = undefined
+        const isDimmed = opacity < 0.5 && !isSelected
         if (isDimmed) {
           filterStyle = 'grayscale(100%)'
         } else if (isSelected || isZoomTarget) {
           filterStyle = `drop-shadow(0 0 4px ${isZoomTarget ? '#F59E0B' : '#3B82F6'})`
         }
+
+        const strokeWidthModifier = isSelected ? 1.5 : 0
 
         // 1. Column rendering
         if (m.kind === 'column') {
@@ -157,6 +114,20 @@ export function OverlayLayer({
               onMouseEnter={() => onMemberHover(m.id)}
               onMouseLeave={() => onMemberHover(null)}
             >
+              {/* Confidence Halo */}
+              {showHalo && (
+                <rect
+                  x={`${cx - (w + 0.8) / 2}%`}
+                  y={`${cy - (h + 0.8) / 2}%`}
+                  width={`${w + 0.8}%`}
+                  height={`${h + 0.8}%`}
+                  fill="none"
+                  stroke="#F59E0B"
+                  strokeWidth={4}
+                  className="pulse-halo-animation"
+                  style={{ filter: 'blur(1px)' }}
+                />
+              )}
               {isSelected && (
                 <rect
                   x={`${cx - (w + 0.4) / 2}%`}
@@ -174,7 +145,7 @@ export function OverlayLayer({
                 width={`${w}%`}
                 height={`${h}%`}
                 fill={isHovered ? 'rgba(59, 130, 246, 0.4)' : 'rgba(59, 130, 246, 0.2)'}
-                stroke={isLowConf && colorMode === 'kind' ? '#F59E0B' : color}
+                stroke={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color}
                 strokeWidth={isHovered ? 2.5 + strokeWidthModifier : 1.5 + strokeWidthModifier}
                 className={isZoomTarget ? 'pulsing-member' : ''}
                 style={{
@@ -183,24 +154,24 @@ export function OverlayLayer({
                 }}
               />
               {/* Text label */}
-              {m.section && (
+              {layers.aids.labels && m.section && (
                 <text
                   x={`${cx}%`}
                   y={`${cy - h / 2 - 1}%`}
-                  fill={isLowConf && colorMode === 'kind' ? '#F59E0B' : '#F1F5F9'}
+                  fill={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : '#F1F5F9'}
                   fontSize="9px"
                   fontWeight="bold"
                   textAnchor="middle"
                   style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
                 >
-                  {isLowConf && colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
+                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
                 </text>
               )}
             </g>
           )
         }
 
-        // 2. Beam rendering (using span line endpoint percentages)
+        // 2. Beam rendering
         if (m.kind === 'beam') {
           const x1 = geo.bx1 !== undefined && geo.bx1 !== null ? geo.bx1 * 100 : geo.x * 100 - 3
           const y1 = geo.by1 !== undefined && geo.by1 !== null ? geo.by1 * 100 : geo.y * 100
@@ -215,7 +186,21 @@ export function OverlayLayer({
               onMouseEnter={() => onMemberHover(m.id)}
               onMouseLeave={() => onMemberHover(null)}
             >
-              {/* Thick transparent interactive buffer path */}
+              {/* Confidence Halo */}
+              {showHalo && (
+                <line
+                  x1={`${x1}%`}
+                  y1={`${y1}%`}
+                  x2={`${x2}%`}
+                  y2={`${y2}%`}
+                  fill="none"
+                  stroke="#F59E0B"
+                  strokeWidth={6}
+                  className="pulse-halo-animation"
+                  style={{ filter: 'blur(1px)' }}
+                />
+              )}
+              {/* Thick interactive buffer path */}
               <line
                 x1={`${x1}%`}
                 y1={`${y1}%`}
@@ -225,7 +210,7 @@ export function OverlayLayer({
                 stroke="transparent"
                 strokeWidth={14}
               />
-              {/* White background border line for selected state */}
+              {/* Selection background line */}
               {isSelected && (
                 <line
                   x1={`${x1}%`}
@@ -244,7 +229,7 @@ export function OverlayLayer({
                 x2={`${x2}%`}
                 y2={`${y2}%`}
                 fill="none"
-                stroke={isLowConf && colorMode === 'kind' ? '#F59E0B' : color}
+                stroke={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color}
                 strokeWidth={isHovered ? 3.5 + strokeWidthModifier : 2.0 + strokeWidthModifier}
                 className={isZoomTarget ? 'pulsing-member' : ''}
                 style={{
@@ -253,17 +238,17 @@ export function OverlayLayer({
                 }}
               />
               {/* Label */}
-              {m.section && (
+              {layers.aids.labels && m.section && (
                 <text
                   x={`${(x1 + x2) / 2}%`}
                   y={`${(y1 + y2) / 2 - 1.5}%`}
-                  fill={isLowConf && colorMode === 'kind' ? '#F59E0B' : (colorMode === 'kind' ? '#EC4899' : color)}
+                  fill={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : (layers.colorMode === 'kind' ? '#EC4899' : color)}
                   fontSize="9px"
                   fontWeight="bold"
                   textAnchor="middle"
                   style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
                 >
-                  {isLowConf && colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
+                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
                 </text>
               )}
             </g>
@@ -273,6 +258,7 @@ export function OverlayLayer({
         // 3. Brace / Joist / Default rendering
         const bx = geo.x * 100
         const by = geo.y * 100
+
         return (
           <g
             key={m.id}
@@ -281,6 +267,19 @@ export function OverlayLayer({
             onMouseEnter={() => onMemberHover(m.id)}
             onMouseLeave={() => onMemberHover(null)}
           >
+            {/* Confidence Halo */}
+            {showHalo && (
+              <circle
+                cx={`${bx}%`}
+                cy={`${by}%`}
+                r={10}
+                fill="none"
+                stroke="#F59E0B"
+                strokeWidth={4}
+                className="pulse-halo-animation"
+                style={{ filter: 'blur(1px)' }}
+              />
+            )}
             {isSelected && (
               <circle
                 cx={`${bx}%`}
@@ -295,7 +294,7 @@ export function OverlayLayer({
               cx={`${bx}%`}
               cy={`${by}%`}
               r={isHovered ? 6 + strokeWidthModifier : 4 + strokeWidthModifier}
-              fill={isLowConf && colorMode === 'kind' ? '#F59E0B' : color}
+              fill={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color}
               stroke="#FFFFFF"
               strokeWidth={isHovered ? 1.5 : 1}
               className={isZoomTarget ? 'pulsing-member' : ''}
@@ -304,17 +303,17 @@ export function OverlayLayer({
                 filter: filterStyle,
               }}
             />
-            {m.section && (
+            {layers.aids.labels && m.section && (
               <text
                 x={`${bx}%`}
                 y={`${by - 6}%`}
-                fill={isLowConf && colorMode === 'kind' ? '#F59E0B' : (colorMode === 'kind' ? '#F59E0B' : color)}
+                fill={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : (layers.colorMode === 'kind' ? '#F59E0B' : color)}
                 fontSize="9px"
                 fontWeight="bold"
                 textAnchor="middle"
                 style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
               >
-                {isLowConf && colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
+                {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
               </text>
             )}
           </g>

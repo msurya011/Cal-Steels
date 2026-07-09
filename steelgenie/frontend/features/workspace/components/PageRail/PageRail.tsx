@@ -74,9 +74,8 @@ export function PageRail({
   return (
     <div
       style={{
-        width: '240px',
-        backgroundColor: '#132E4F',
-        borderRight: '1px solid rgba(59, 130, 246, 0.1)',
+        width: '100%',
+        backgroundColor: '#111827',
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
