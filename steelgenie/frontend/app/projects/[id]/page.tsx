@@ -64,6 +64,44 @@ export default function TakeoffWorkspacePage() {
     validateColumns,
   } = useMembers(currentPageId)
 
+  // Listen for 'R' key to rotate the selected column 90 degrees
+  useEffect(() => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      // Ignore if user is typing in an input or textarea
+      const tag = (e.target as HTMLElement).tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement).isContentEditable) {
+        return
+      }
+
+      if (e.key === 'r' || e.key === 'R') {
+        const selectedIds = Array.from(selection)
+        if (selectedIds.length === 1) {
+          const id = selectedIds[0]
+          const selectedMember = members.find((m: any) => m.id === id)
+          if (selectedMember && selectedMember.kind === 'column') {
+            e.preventDefault()
+            const currentRotation = selectedMember.rotation || 0
+            const nextRotation = (currentRotation + 90) % 180 // toggle between 0 and 90
+            try {
+              await updateMember({ 
+                id, 
+                data: { rotation: nextRotation } 
+              })
+              toast.success(`Rotated column to ${nextRotation}°`)
+            } catch {
+              toast.error('Failed to rotate column')
+            }
+          }
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [selection, members, updateMember])
+
   const activePage = pages.find((p: any) => p.id === currentPageId) || null
   const [analysingState, setAnalysingState] = useState(false)
   const [extractingPageId, setExtractingPageId] = useState<string | null>(null)
@@ -526,6 +564,7 @@ export default function TakeoffWorkspacePage() {
         section: KIND_DEFAULT_SECTION[kind],
         source: 'manual',
         status: 'need_review',
+        rotation: kind === 'column' ? 90 : 0,
         geometry: {
           x: (geom.x1 + geom.x2) / 2,
           y: (geom.y1 + geom.y2) / 2,
