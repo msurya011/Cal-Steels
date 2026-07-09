@@ -34,6 +34,11 @@ export interface LayerPreset {
     confidenceHalo: boolean
     detectionRegion: boolean
     grid: boolean
+    piecemarks: boolean
+    lengths: boolean
+    reactions: boolean
+    columnProjections: boolean
+    lengthFilter: boolean
   }
   colorMode: 'kind' | 'status' | 'confidence' | 'section'
 }
@@ -42,6 +47,7 @@ export interface LayersState {
   classVisibility: Record<string, boolean>
   classOpacity: Record<string, number>
   classColors: Record<string, string>
+  planVisible: boolean
   aids: {
     markers: boolean
     rulers: boolean
@@ -49,6 +55,11 @@ export interface LayersState {
     confidenceHalo: boolean
     detectionRegion: boolean
     grid: boolean
+    piecemarks: boolean
+    lengths: boolean
+    reactions: boolean
+    columnProjections: boolean
+    lengthFilter: boolean
   }
   colorMode: 'kind' | 'status' | 'confidence' | 'section'
   activePresetId: string | null
@@ -62,7 +73,19 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
     classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
-    aids: { markers: true, rulers: true, labels: true, confidenceHalo: true, detectionRegion: true, grid: true },
+    aids: {
+      markers: true,
+      rulers: true,
+      labels: true,
+      confidenceHalo: true,
+      detectionRegion: true,
+      grid: true,
+      piecemarks: true,
+      lengths: false,
+      reactions: false,
+      columnProjections: true,
+      lengthFilter: false,
+    },
     colorMode: 'kind'
   },
   {
@@ -71,7 +94,19 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
     classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
-    aids: { markers: false, rulers: false, labels: false, confidenceHalo: false, detectionRegion: false, grid: false },
+    aids: {
+      markers: false,
+      rulers: false,
+      labels: false,
+      confidenceHalo: false,
+      detectionRegion: false,
+      grid: false,
+      piecemarks: false,
+      lengths: false,
+      reactions: false,
+      columnProjections: false,
+      lengthFilter: false,
+    },
     colorMode: 'kind'
   },
   {
@@ -80,7 +115,19 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
     classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
-    aids: { markers: true, rulers: true, labels: true, confidenceHalo: true, detectionRegion: false, grid: true },
+    aids: {
+      markers: true,
+      rulers: true,
+      labels: true,
+      confidenceHalo: true,
+      detectionRegion: false,
+      grid: true,
+      piecemarks: true,
+      lengths: false,
+      reactions: false,
+      columnProjections: true,
+      lengthFilter: false,
+    },
     colorMode: 'confidence'
   },
   {
@@ -89,7 +136,19 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     classVisibility: { beam: false, column: false, vbrace: true, hbrace: true, joist: false, unlabelled: false },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
     classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
-    aids: { markers: true, rulers: true, labels: true, confidenceHalo: false, detectionRegion: false, grid: true },
+    aids: {
+      markers: true,
+      rulers: true,
+      labels: true,
+      confidenceHalo: false,
+      detectionRegion: false,
+      grid: true,
+      piecemarks: true,
+      lengths: false,
+      reactions: false,
+      columnProjections: true,
+      lengthFilter: false,
+    },
     colorMode: 'kind'
   }
 ]
@@ -101,6 +160,14 @@ const getInitialLayers = (): LayersState => {
       try {
         const parsed = JSON.parse(saved)
         parsed.hiddenLegendKeys = new Set(parsed.hiddenLegendKeys || [])
+        // Fill back-compatibility keys if missing
+        if (parsed.planVisible === undefined) parsed.planVisible = true
+        if (!parsed.aids) parsed.aids = {}
+        if (parsed.aids.piecemarks === undefined) parsed.aids.piecemarks = true
+        if (parsed.aids.lengths === undefined) parsed.aids.lengths = false
+        if (parsed.aids.reactions === undefined) parsed.aids.reactions = false
+        if (parsed.aids.columnProjections === undefined) parsed.aids.columnProjections = true
+        if (parsed.aids.lengthFilter === undefined) parsed.aids.lengthFilter = false
         return parsed
       } catch {
         // ignore
@@ -111,7 +178,20 @@ const getInitialLayers = (): LayersState => {
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1.0, column: 1.0, vbrace: 1.0, hbrace: 1.0, joist: 1.0, unlabelled: 1.0 },
     classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
-    aids: { markers: true, rulers: true, labels: true, confidenceHalo: false, detectionRegion: false, grid: false },
+    planVisible: true,
+    aids: {
+      markers: true,
+      rulers: true,
+      labels: true,
+      confidenceHalo: false,
+      detectionRegion: false,
+      grid: false,
+      piecemarks: true,
+      lengths: false,
+      reactions: false,
+      columnProjections: true,
+      lengthFilter: false,
+    },
     colorMode: 'kind',
     activePresetId: null,
     hiddenLegendKeys: new Set<string>()
@@ -124,7 +204,25 @@ const getInitialPresets = (): LayerPreset[] => {
     if (saved) {
       try {
         const parsed = JSON.parse(saved)
-        return [...DEFAULT_PRESETS, ...parsed]
+        // ensure default aids are populated
+        const validated = parsed.map((p: any) => ({
+          ...p,
+          aids: {
+            markers: true,
+            rulers: true,
+            labels: true,
+            confidenceHalo: false,
+            detectionRegion: false,
+            grid: false,
+            piecemarks: true,
+            lengths: false,
+            reactions: false,
+            columnProjections: true,
+            lengthFilter: false,
+            ...p.aids
+          }
+        }))
+        return [...DEFAULT_PRESETS, ...validated]
       } catch {
         // ignore
       }
@@ -201,6 +299,7 @@ interface WorkspaceState {
 
   // Layer slice mutations
   toggleLayerVisibility: (kind: string) => void
+  togglePlanVisibility: () => void
   setLayerOpacity: (kind: string, opacity: number) => void
   setLayerColor: (kind: string, hexColor: string) => void
   toggleAid: (aidName: string) => void
@@ -286,7 +385,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
         classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
         classOpacity: { beam: 1.0, column: 1.0, vbrace: 1.0, hbrace: 1.0, joist: 1.0, unlabelled: 1.0 },
         classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
-        aids: { markers: true, rulers: true, labels: true, confidenceHalo: false, detectionRegion: false, grid: false },
+        planVisible: true,
+        aids: {
+          markers: true,
+          rulers: true,
+          labels: true,
+          confidenceHalo: false,
+          detectionRegion: false,
+          grid: false,
+          piecemarks: true,
+          lengths: false,
+          reactions: false,
+          columnProjections: true,
+          lengthFilter: false,
+        },
         colorMode: 'kind' as const,
         activePresetId: null,
         hiddenLegendKeys: new Set<string>()
@@ -364,6 +476,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
       localStorage.setItem('calsteel-layers', JSON.stringify({ ...nextLayers, hiddenLegendKeys: Array.from(nextLayers.hiddenLegendKeys) }))
       return { layers: nextLayers }
     }),
+  togglePlanVisibility: () =>
+    set((state) => {
+      const nextLayers = { ...state.layers, planVisible: !state.layers.planVisible }
+      localStorage.setItem('calsteel-layers', JSON.stringify({ ...nextLayers, hiddenLegendKeys: Array.from(nextLayers.hiddenLegendKeys) }))
+      return { layers: nextLayers }
+    }),
   setLayerOpacity: (kind, opacity) =>
     set((state) => {
       const nextOp = { ...state.layers.classOpacity, [kind]: opacity }
@@ -399,6 +517,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
         classVisibility: { ...preset.classVisibility },
         classOpacity: { ...preset.classOpacity },
         classColors: { ...preset.classColors },
+        planVisible: true,
         aids: { ...preset.aids },
         colorMode: preset.colorMode,
         activePresetId: presetId,

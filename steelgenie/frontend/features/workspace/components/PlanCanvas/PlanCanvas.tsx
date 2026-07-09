@@ -70,6 +70,7 @@ export function PlanCanvas({
     imageAspect,
     setImageAspect,
     zoomTarget,
+    layers,
   } = useWorkspaceStore()
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -268,7 +269,7 @@ export function PlanCanvas({
               setImageNaturalWidth(img.naturalWidth)
               setImageAspect(img.naturalHeight / img.naturalWidth)
             }}
-            style={{ width: '100%', height: 'auto', display: 'block', userSelect: 'none' }}
+            style={{ width: '100%', height: 'auto', display: 'block', userSelect: 'none', opacity: layers.planVisible === false ? 0 : 1, transition: 'opacity 0.2s ease' }}
           />
 
           {/* SVG Overlay layer */}

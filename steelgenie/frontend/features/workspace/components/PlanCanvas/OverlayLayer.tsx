@@ -23,6 +23,9 @@ interface Member {
   confidence?: number | null
   status?: string
   source?: string
+  length_ft?: number | null
+  piecemark?: string | null
+  reaction?: string | null
 }
 
 interface OverlayLayerProps {
@@ -41,6 +44,34 @@ export function OverlayLayer({
   const store = useWorkspaceStore()
   const { layers, selection, hiddenIds, isolation, zoomTarget } = store
 
+  // Helper to compose label text dynamically
+  const getLabelText = (m: Member) => {
+    if (layers.aids.labels === false) return null
+
+    const parts: string[] = []
+
+    // 1. Piecemarks
+    if (layers.aids.piecemarks !== false) {
+      parts.push(m.piecemark || m.section || '')
+    }
+
+    // 2. Lengths
+    if (layers.aids.lengths === true && m.length_ft) {
+      parts.push(`${m.length_ft.toFixed(1)}'`)
+    }
+
+    // 3. Reactions
+    if (layers.aids.reactions === true && m.reaction) {
+      parts.push(m.reaction)
+    }
+
+    if (parts.length === 0 && layers.aids.labels) {
+      return m.section || ''
+    }
+
+    return parts.filter(Boolean).join(' - ')
+  }
+
   return (
     <svg
       style={{
@@ -52,93 +83,88 @@ export function OverlayLayer({
         zIndex: 10,
       }}
     >
-      <style>{`
-        @keyframes pulse-highlight {
-          0% { filter: drop-shadow(0 0 2px #3B82F6); stroke-width: 3.5px; }
-          50% { filter: drop-shadow(0 0 10px #3B82F6); stroke-width: 6.5px; }
-          100% { filter: drop-shadow(0 0 2px #3B82F6); stroke-width: 3.5px; }
-        }
-        .pulsing-member {
-          animation: pulse-highlight 0.8s ease-in-out 3;
-        }
-        @keyframes pulse-halo {
-          0% { opacity: 0.2; }
-          50% { opacity: 0.55; }
-          100% { opacity: 0.2; }
-        }
-        .pulse-halo-animation {
-          animation: pulse-halo 1.5s infinite ease-in-out;
-        }
-      `}</style>
+      {/* Glow Filter for Hover & ZoomTarget */}
+      <defs>
+        <filter id="glow-select" x="-20%" y="-20%" width="140%" height="140%">
+          <feGaussianBlur stdDeviation="3" result="blur" />
+          <feComposite in="SourceGraphic" in2="blur" operator="over" />
+        </filter>
+      </defs>
 
       {members.map((m) => {
-        const geo = m.geometry
+        const renderProps = getMemberRenderProps({ layers, hiddenIds, isolation }, m)
+        if (!renderProps.visible) return null
 
-        // Check markers aid visibility
+        const { color, opacity } = renderProps
+        const geo = m.geometry
+        const isSelected = selection.has(m.id)
+        const isHovered = hoveredMemberId === m.id
+        const isZoomTarget = zoomTarget?.id === m.id
+        const isLowConf = m.confidence !== undefined && m.confidence !== null && m.confidence < 0.7
+
+        // Filter visual styles
+        let filterStyle = undefined
+        if (isSelected || isZoomTarget) {
+          filterStyle = 'url(#glow-select)'
+        }
+
+        // Handle manually added highlights
         if (m.source === 'manual' && !layers.aids.markers) {
           return null
         }
 
-        // Get visibility, color and opacity from centralized selector
-        const { visible, color, opacity } = getMemberRenderProps({ layers, hiddenIds, isolation }, m)
-        if (!visible) return null
+        const strokeWidthModifier = isSelected ? 2 : 0
 
-        const isHovered = hoveredMemberId === m.id
-        const isSelected = selection.has(m.id)
-        const isZoomTarget = zoomTarget && zoomTarget.id === m.id
-        const isLowConf = m.confidence !== undefined && m.confidence !== null && m.confidence < 0.70
+        // Confidence Halo
         const showHalo = layers.aids.confidenceHalo && isLowConf
-
-        let filterStyle = undefined
-        const isDimmed = opacity < 0.5 && !isSelected
-        if (isDimmed) {
-          filterStyle = 'grayscale(100%)'
-        } else if (isSelected || isZoomTarget) {
-          filterStyle = `drop-shadow(0 0 4px ${isZoomTarget ? '#F59E0B' : '#3B82F6'})`
-        }
-
-        const strokeWidthModifier = isSelected ? 1.5 : 0
 
         // 1. Column rendering
         if (m.kind === 'column') {
+          const w = geo.w !== undefined ? geo.w * 100 : 2.5
+          const h = geo.h !== undefined ? geo.h * 100 : 2.5
           const cx = geo.x * 100
           const cy = geo.y * 100
-          const w = (geo.w || 0.01) * 100
-          const h = (geo.h || 0.01) * 100
 
           return (
             <g
               key={m.id}
-              style={{ pointerEvents: 'auto', cursor: 'pointer', opacity }}
-              onClick={(e) => onMemberClick(m, e)}
+              onClick={(e) => {
+                e.stopPropagation()
+                onMemberClick(m, e)
+              }}
               onMouseEnter={() => onMemberHover(m.id)}
               onMouseLeave={() => onMemberHover(null)}
+              style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
             >
               {/* Confidence Halo */}
               {showHalo && (
                 <rect
-                  x={`${cx - (w + 0.8) / 2}%`}
-                  y={`${cy - (h + 0.8) / 2}%`}
-                  width={`${w + 0.8}%`}
-                  height={`${h + 0.8}%`}
+                  x={`${cx - w / 2 - 1}%`}
+                  y={`${cy - h / 2 - 1}%`}
+                  width={`${w + 2}%`}
+                  height={`${h + 2}%`}
                   fill="none"
                   stroke="#F59E0B"
-                  strokeWidth={4}
-                  className="pulse-halo-animation"
-                  style={{ filter: 'blur(1px)' }}
+                  strokeWidth={2}
+                  strokeDasharray="4,4"
+                  className="pulsing-halo"
                 />
               )}
+
+              {/* Selection Border indicator */}
               {isSelected && (
                 <rect
-                  x={`${cx - (w + 0.4) / 2}%`}
-                  y={`${cy - (h + 0.4) / 2}%`}
-                  width={`${w + 0.4}%`}
-                  height={`${h + 0.4}%`}
+                  x={`${cx - w / 2 - 1}%`}
+                  y={`${cy - h / 2 - 1}%`}
+                  width={`${w + 2}%`}
+                  height={`${h + 2}%`}
                   fill="none"
-                  stroke="#FFFFFF"
-                  strokeWidth={1}
+                  stroke="#3B82F6"
+                  strokeWidth={2}
                 />
               )}
+
+              {/* Base Column overlay shape */}
               <rect
                 x={`${cx - w / 2}%`}
                 y={`${cy - h / 2}%`}
@@ -154,7 +180,7 @@ export function OverlayLayer({
                 }}
               />
               {/* Text label */}
-              {layers.aids.labels && m.section && (
+              {getLabelText(m) && (
                 <text
                   x={`${cx}%`}
                   y={`${cy - h / 2 - 1}%`}
@@ -164,7 +190,7 @@ export function OverlayLayer({
                   textAnchor="middle"
                   style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
                 >
-                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
+                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${getLabelText(m)}` : getLabelText(m)}
                 </text>
               )}
             </g>
@@ -181,10 +207,13 @@ export function OverlayLayer({
           return (
             <g
               key={m.id}
-              style={{ pointerEvents: 'auto', cursor: 'pointer', opacity }}
-              onClick={(e) => onMemberClick(m, e)}
+              onClick={(e) => {
+                e.stopPropagation()
+                onMemberClick(m, e)
+              }}
               onMouseEnter={() => onMemberHover(m.id)}
               onMouseLeave={() => onMemberHover(null)}
+              style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
             >
               {/* Confidence Halo */}
               {showHalo && (
@@ -196,21 +225,13 @@ export function OverlayLayer({
                   fill="none"
                   stroke="#F59E0B"
                   strokeWidth={6}
-                  className="pulse-halo-animation"
-                  style={{ filter: 'blur(1px)' }}
+                  strokeDasharray="4,4"
+                  className="pulsing-halo"
+                  style={{ opacity: 0.8 }}
                 />
               )}
-              {/* Thick interactive buffer path */}
-              <line
-                x1={`${x1}%`}
-                y1={`${y1}%`}
-                x2={`${x2}%`}
-                y2={`${y2}%`}
-                fill="none"
-                stroke="transparent"
-                strokeWidth={14}
-              />
-              {/* Selection background line */}
+
+              {/* Selection line indicator */}
               {isSelected && (
                 <line
                   x1={`${x1}%`}
@@ -218,11 +239,13 @@ export function OverlayLayer({
                   x2={`${x2}%`}
                   y2={`${y2}%`}
                   fill="none"
-                  stroke="#FFFFFF"
-                  strokeWidth={4.5}
+                  stroke="#3B82F6"
+                  strokeWidth={6}
+                  style={{ opacity: 0.6 }}
                 />
               )}
-              {/* Solid visible overlay line */}
+
+              {/* Base Beam line */}
               <line
                 x1={`${x1}%`}
                 y1={`${y1}%`}
@@ -238,7 +261,7 @@ export function OverlayLayer({
                 }}
               />
               {/* Label */}
-              {layers.aids.labels && m.section && (
+              {getLabelText(m) && (
                 <text
                   x={`${(x1 + x2) / 2}%`}
                   y={`${(y1 + y2) / 2 - 1.5}%`}
@@ -248,48 +271,55 @@ export function OverlayLayer({
                   textAnchor="middle"
                   style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
                 >
-                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
+                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${getLabelText(m)}` : getLabelText(m)}
                 </text>
               )}
             </g>
           )
         }
 
-        // 3. Brace / Joist / Default rendering
+        // 3. Brace rendering
         const bx = geo.x * 100
         const by = geo.y * 100
 
         return (
           <g
             key={m.id}
-            style={{ pointerEvents: 'auto', cursor: 'pointer', opacity }}
-            onClick={(e) => onMemberClick(m, e)}
+            onClick={(e) => {
+              e.stopPropagation()
+              onMemberClick(m, e)
+            }}
             onMouseEnter={() => onMemberHover(m.id)}
             onMouseLeave={() => onMemberHover(null)}
+            style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
           >
             {/* Confidence Halo */}
             {showHalo && (
               <circle
                 cx={`${bx}%`}
                 cy={`${by}%`}
-                r={10}
+                r={isHovered ? 10 : 8}
                 fill="none"
                 stroke="#F59E0B"
-                strokeWidth={4}
-                className="pulse-halo-animation"
-                style={{ filter: 'blur(1px)' }}
+                strokeWidth={1.5}
+                strokeDasharray="3,3"
+                className="pulsing-halo"
               />
             )}
+
+            {/* Selection highlight circle */}
             {isSelected && (
               <circle
                 cx={`${bx}%`}
                 cy={`${by}%`}
-                r={isHovered ? 8 : 6}
+                r={isHovered ? 9 : 7}
                 fill="none"
-                stroke="#FFFFFF"
-                strokeWidth={1}
+                stroke="#3B82F6"
+                strokeWidth={1.5}
               />
             )}
+
+            {/* Base Brace circle */}
             <circle
               cx={`${bx}%`}
               cy={`${by}%`}
@@ -303,7 +333,7 @@ export function OverlayLayer({
                 filter: filterStyle,
               }}
             />
-            {layers.aids.labels && m.section && (
+            {getLabelText(m) && (
               <text
                 x={`${bx}%`}
                 y={`${by - 6}%`}
@@ -313,7 +343,7 @@ export function OverlayLayer({
                 textAnchor="middle"
                 style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
               >
-                {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${m.section}` : m.section}
+                {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${getLabelText(m)}` : getLabelText(m)}
               </text>
             )}
           </g>
