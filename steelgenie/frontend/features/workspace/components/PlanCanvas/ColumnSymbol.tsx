@@ -177,16 +177,19 @@ export function ColumnSymbol({
         />
       )}
 
-      {/* Selection border */}
+      {/* Selection outline */}
       {isSelected && (
         <rect
-          x={`${cx - s / 2 - 0.5}%`} y={`${cy - s / 2 - 0.5}%`}
-          width={`${s + 1}%`} height={`${s + 1}%`}
-          fill="none" stroke="#3B82F6" strokeWidth={2}
+          x={`${cx - s / 2 - 0.4}%`}
+          y={`${cy - s / 2 - 0.4}%`}
+          width={`${s + 0.8}%`}
+          height={`${s + 0.8}%`}
+          fill="none"
+          stroke="#22C55E"
+          strokeWidth={1.5}
+          strokeDasharray="2,2"
         />
-      )}
-
-      {/* Steel symbol with precise rotation */}
+      )}{/* Steel symbol with precise rotation */}
       <g style={{ transformOrigin: 'center', transformBox: 'fill-box', transform: `rotate(${m.rotation || 0}deg)` }}>
         {symbol === 'BOX' ? (
           rectEl({ x: cx - s / 2, y: cy - s / 2, w: s, h: s }, 'box')

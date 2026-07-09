@@ -154,35 +154,6 @@ export function PropertiesPanel({
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  const { selectedRatio, imageNaturalWidth, imageAspect } = useWorkspaceStore()
-
-  // Calculate geometric angle of the beam line
-  const getBeamAngle = () => {
-    if (!member) return null
-    if (member.geometry?.angle_deg !== undefined && member.geometry?.angle_deg !== null) {
-      return Math.round(member.geometry.angle_deg * 10) / 10
-    }
-    const g = member.geometry || {}
-    if (g.bx1 !== undefined && g.by1 !== undefined && g.bx2 !== undefined && g.by2 !== undefined) {
-      const dx = g.bx2 - g.bx1
-      const dy = (g.by2 - g.by1) * (imageAspect || 0.75)
-      const rad = Math.atan2(dy, dx)
-      let deg = (rad * 180) / Math.PI
-      deg = (deg + 180) % 180
-      return Math.round(deg * 10) / 10
-    }
-    return null
-  }
-
-  // Gather unique sections on this sheet
-  const uniqueSheetSections = Array.from(
-    new Set(
-      members
-        .map((m) => m.section)
-        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
-    )
-  ).sort()
-
   const handleSectionChange = async (val: string, isBulk = false) => {
     if (isBulk) {
       setBulkSection(val)
@@ -201,6 +172,39 @@ export function PropertiesPanel({
     } else {
       setSuggestions([])
       setShowSuggestions(false)
+    }
+  }
+
+  // Auto-save logic triggers update to parent / database instantly
+  const autoSave = async (updatedFields: any) => {
+    if (!member) return
+    try {
+      const updatedGeo = updatedFields.geometry || {}
+      
+      const geoUpdate = {
+        ...(member.geometry || {}),
+        copes: updatedGeo.hasOwnProperty('copes') ? updatedGeo.copes : copes,
+        camber: updatedGeo.hasOwnProperty('camber') ? updatedGeo.camber : camber,
+        studs: updatedGeo.hasOwnProperty('studs') ? updatedGeo.studs : studs,
+        pour_stop: updatedGeo.hasOwnProperty('pour_stop') ? updatedGeo.pour_stop : pourStop,
+        left_end: updatedGeo.hasOwnProperty('left_end') ? updatedGeo.left_end : (leftEnd || formatFtIn(pageTos)),
+        right_end: updatedGeo.hasOwnProperty('right_end') ? updatedGeo.right_end : (rightEnd || formatFtIn(pageTos)),
+      }
+      
+      await onUpdate(member.id, {
+        kind: updatedFields.hasOwnProperty('kind') ? updatedFields.kind : kind,
+        section: updatedFields.hasOwnProperty('section') ? updatedFields.section : (section || null),
+        grade: updatedFields.hasOwnProperty('grade') ? updatedFields.grade : grade,
+        length_ft: updatedFields.hasOwnProperty('length') 
+          ? (updatedFields.length ? parseFloat(updatedFields.length) : null) 
+          : (length ? parseFloat(length) : null),
+        status: updatedFields.hasOwnProperty('status') ? updatedFields.status : status,
+        rotation: updatedFields.hasOwnProperty('rotation') ? updatedFields.rotation : rotation,
+        piecemark: updatedFields.hasOwnProperty('piecemark') ? updatedFields.piecemark : (piecemark || null),
+        geometry: geoUpdate,
+      })
+    } catch {
+      // ignore
     }
   }
 
@@ -234,25 +238,8 @@ export function PropertiesPanel({
     if (!member) return
     setSaving(true)
     try {
-      const geoUpdate = {
-        ...(member.geometry || {}),
-        copes,
-        camber,
-        studs,
-        pour_stop: pourStop,
-        left_end: leftEnd || formatFtIn(pageTos),
-        right_end: rightEnd || formatFtIn(pageTos),
-      }
-      await onUpdate(member.id, {
-        kind,
-        section: section || null,
-        grade: grade || null,
-        length_ft: length ? parseFloat(length) : null,
-        status,
-        rotation,
-        piecemark: piecemark || null,
-        geometry: geoUpdate,
-      })
+      await autoSave({})
+      toast.success('Member properties saved')
     } catch {
       // error toast handled in parent
     } finally {
@@ -453,7 +440,6 @@ export function PropertiesPanel({
               <input
                 value={bulkSection}
                 onChange={(e) => handleSectionChange(e.target.value, true)}
-                onFocus={() => setShowSuggestions(true)}
                 placeholder="No change"
                 style={{
                   padding: '8px 10px',
@@ -465,7 +451,7 @@ export function PropertiesPanel({
                   outline: 'none',
                 }}
               />
-              {showSuggestions && (suggestions.length > 0 || uniqueSheetSections.length > 0) && (
+              {showSuggestions && suggestions.length > 0 && (
                 <div
                   style={{
                     position: 'absolute',
@@ -482,36 +468,6 @@ export function PropertiesPanel({
                     marginTop: '4px',
                   }}
                 >
-                  {/* Unique Sheet Sections List */}
-                  {uniqueSheetSections.length > 0 && !bulkSection && (
-                    <div>
-                      <div style={{ padding: '6px 12px', fontSize: '9px', color: '#3B82F6', fontWeight: 700, backgroundColor: 'rgba(59, 130, 246, 0.05)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                        Sheet Profiles
-                      </div>
-                      {uniqueSheetSections.map((sec) => (
-                        <div
-                          key={sec}
-                          onClick={() => {
-                            setBulkSection(sec)
-                            setShowSuggestions(false)
-                          }}
-                          style={{
-                            padding: '8px 12px',
-                            cursor: 'pointer',
-                            fontSize: '12px',
-                            color: '#F1F5F9',
-                            borderBottom: '1px solid rgba(255,255,255,0.03)',
-                            fontWeight: 600,
-                          }}
-                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
-                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                        >
-                          {sec}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
                   {suggestions.map((s) => (
                     <div
                       key={s.designation}
@@ -681,7 +637,11 @@ export function PropertiesPanel({
                 <input
                   type="number"
                   value={rotation}
-                  onChange={(e) => setRotation(parseInt(e.target.value) || 0)}
+                  onChange={(e) => {
+                    const rotVal = parseInt(e.target.value) || 0
+                    setRotation(rotVal)
+                  }}
+                  onBlur={() => autoSave({ rotation })}
                   style={{
                     flex: 1,
                     padding: '8px 10px',
@@ -694,7 +654,11 @@ export function PropertiesPanel({
                   }}
                 />
                 <button
-                  onClick={() => setRotation((r) => (r - 90 + 360) % 360)}
+                  onClick={() => {
+                    const next = (rotation - 90 + 360) % 360
+                    setRotation(next)
+                    autoSave({ rotation: next })
+                  }}
                   style={{
                     padding: '8px 10px',
                     backgroundColor: 'rgba(30, 41, 59, 0.8)',
@@ -709,7 +673,11 @@ export function PropertiesPanel({
                   <RotateCcw size={14} />
                 </button>
                 <button
-                  onClick={() => setRotation((r) => (r + 90) % 360)}
+                  onClick={() => {
+                    const next = (rotation + 90) % 360
+                    setRotation(next)
+                    autoSave({ rotation: next })
+                  }}
                   style={{
                     padding: '8px 10px',
                     backgroundColor: 'rgba(30, 41, 59, 0.8)',
@@ -726,26 +694,6 @@ export function PropertiesPanel({
               </div>
             </div>
 
-            {/* Angle (Geometric) */}
-            {getBeamAngle() !== null && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Angle (Geometric)</label>
-                <input
-                  readOnly
-                  value={`${getBeamAngle()}°`}
-                  style={{
-                    padding: '8px 10px',
-                    backgroundColor: 'rgba(15, 23, 42, 0.6)',
-                    border: '1px solid rgba(255, 255, 255, 0.05)',
-                    borderRadius: '6px',
-                    color: '#94A3B8',
-                    fontSize: '13px',
-                    outline: 'none',
-                  }}
-                />
-              </div>
-            )}
-
             {/* Piecemark & Copes Row */}
             <div style={{ display: 'flex', gap: '10px' }}>
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -753,6 +701,7 @@ export function PropertiesPanel({
                 <input
                   value={piecemark}
                   onChange={(e) => setPiecemark(e.target.value)}
+                  onBlur={() => autoSave({ piecemark })}
                   placeholder="B_76"
                   style={{
                     padding: '8px 10px',
@@ -773,6 +722,7 @@ export function PropertiesPanel({
                   type="number"
                   value={copes}
                   onChange={(e) => setCopes(parseInt(e.target.value) || 0)}
+                  onBlur={() => autoSave({ geometry: { copes } })}
                   style={{
                     padding: '8px 10px',
                     backgroundColor: 'rgba(30, 41, 59, 0.8)',
@@ -833,7 +783,11 @@ export function PropertiesPanel({
               <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Member Type</label>
               <select
                 value={kind}
-                onChange={(e) => setKind(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setKind(val)
+                  autoSave({ kind: val })
+                }}
                 style={{
                   padding: '8px 10px',
                   backgroundColor: 'rgba(30, 41, 59, 0.8)',
@@ -860,7 +814,12 @@ export function PropertiesPanel({
               <input
                 value={section}
                 onChange={(e) => handleSectionChange(e.target.value, false)}
-                onFocus={() => setShowSuggestions(true)}
+                onBlur={() => autoSave({ section })}
+                onFocus={() => {
+                  if (section.trim().length >= 1) {
+                    handleSectionChange(section, false)
+                  }
+                }}
                 placeholder="Select section size"
                 style={{
                   padding: '8px 10px',
@@ -877,7 +836,7 @@ export function PropertiesPanel({
                   {kind[0].toUpperCase() + kind.slice(1)} section size is empty
                 </span>
               )}
-              {showSuggestions && (suggestions.length > 0 || uniqueSheetSections.length > 0) && (
+              {showSuggestions && suggestions.length > 0 && (
                 <div
                   style={{
                     position: 'absolute',
@@ -888,75 +847,37 @@ export function PropertiesPanel({
                     backgroundColor: '#1E293B',
                     border: '1px solid rgba(59, 130, 246, 0.2)',
                     borderRadius: '6px',
-                    maxHeight: '220px',
+                    maxHeight: '180px',
                     overflowY: 'auto',
                     boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
                     marginTop: '4px',
                   }}
                 >
-                  {/* Unique Sheet Sections List */}
-                  {uniqueSheetSections.length > 0 && !section && (
-                    <div>
-                      <div style={{ padding: '6px 12px', fontSize: '9px', color: '#3B82F6', fontWeight: 700, backgroundColor: 'rgba(59, 130, 246, 0.05)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                        Sheet Profiles
+                  {suggestions.map((s) => (
+                    <div
+                      key={s.designation}
+                      onClick={() => {
+                        setSection(s.designation)
+                        setShowSuggestions(false)
+                        autoSave({ section: s.designation })
+                      }}
+                      style={{
+                        padding: '8px 12px',
+                        cursor: 'pointer',
+                        fontSize: '12px',
+                        color: '#F1F5F9',
+                        borderBottom: '1px solid rgba(59, 130, 246, 0.05)',
+                        transition: 'background-color 0.2s',
+                      }}
+                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
+                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                    >
+                      <div style={{ fontWeight: 600 }}>{s.designation}</div>
+                      <div style={{ fontSize: '10px', color: '#64748B' }}>
+                        {s.weight_per_ft} lbs/ft • d={s.depth_in}" • bf={s.flange_width_in}"
                       </div>
-                      {uniqueSheetSections.map((sec) => (
-                        <div
-                          key={sec}
-                          onClick={() => {
-                            setSection(sec)
-                            setShowSuggestions(false)
-                          }}
-                          style={{
-                            padding: '8px 12px',
-                            cursor: 'pointer',
-                            fontSize: '12px',
-                            color: '#F1F5F9',
-                            borderBottom: '1px solid rgba(255,255,255,0.03)',
-                            fontWeight: 600,
-                          }}
-                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
-                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                        >
-                          {sec}
-                        </div>
-                      ))}
                     </div>
-                  )}
-
-                  {suggestions.length > 0 && (
-                    <div>
-                      {uniqueSheetSections.length > 0 && !section && (
-                        <div style={{ padding: '6px 12px', fontSize: '9px', color: '#94A3B8', fontWeight: 700, backgroundColor: 'rgba(255, 255, 255, 0.02)', textTransform: 'uppercase', letterSpacing: '0.5px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-                          All Profiles
-                        </div>
-                      )}
-                      {suggestions.map((s) => (
-                        <div
-                          key={s.designation}
-                          onClick={() => {
-                            setSection(s.designation)
-                            setShowSuggestions(false)
-                          }}
-                          style={{
-                            padding: '8px 12px',
-                            cursor: 'pointer',
-                            fontSize: '12px',
-                            color: '#F1F5F9',
-                            borderBottom: '1px solid rgba(255, 255, 255, 0.03)',
-                            transition: 'background-color 0.2s',
-                          }}
-                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
-                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                        >
-                          <div style={{ fontWeight: 600 }}>{s.designation}</div>
-                          <div style={{ fontSize: '10px', color: '#64748B' }}>
-                            {s.weight_per_ft} lbs/ft • d={s.depth_in}" • bf={s.flange_width_in}"
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  ))}
                 </div>
               )}
             </div>
@@ -966,7 +887,11 @@ export function PropertiesPanel({
               <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Status</label>
               <select
                 value={status}
-                onChange={(e) => setStatus(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setStatus(val)
+                  autoSave({ status: val })
+                }}
                 style={{
                   padding: '8px 10px',
                   backgroundColor: 'rgba(30, 41, 59, 0.8)',
@@ -991,6 +916,7 @@ export function PropertiesPanel({
                 <input
                   value={camber}
                   onChange={(e) => setCamber(e.target.value)}
+                  onBlur={() => autoSave({ geometry: { camber } })}
                   placeholder="Enter camber"
                   style={{
                     padding: '8px 10px',
@@ -1011,6 +937,7 @@ export function PropertiesPanel({
                   type="number"
                   value={studs}
                   onChange={(e) => setStuds(parseInt(e.target.value) || 0)}
+                  onBlur={() => autoSave({ geometry: { studs } })}
                   style={{
                     padding: '8px 10px',
                     backgroundColor: 'rgba(30, 41, 59, 0.8)',
@@ -1078,7 +1005,11 @@ export function PropertiesPanel({
                 type="checkbox"
                 id="pourStop"
                 checked={pourStop}
-                onChange={(e) => setPourStop(e.target.checked)}
+                onChange={(e) => {
+                  const val = e.target.checked
+                  setPourStop(val)
+                  autoSave({ geometry: { pour_stop: val } })
+                }}
                 style={{ cursor: 'pointer', width: '15px', height: '15px' }}
               />
               <label htmlFor="pourStop" style={{ fontSize: '12px', color: '#F1F5F9', cursor: 'pointer', fontWeight: 600 }}>

@@ -199,7 +199,7 @@ export function OverlayLayer({
                   x2={`${x2}%`}
                   y2={`${y2}%`}
                   fill="none"
-                  stroke="#3B82F6"
+                  stroke="#22C55E"
                   strokeWidth={6}
                   style={{ opacity: 0.6 }}
                 />
@@ -283,7 +283,7 @@ export function OverlayLayer({
                 cy={`${by}%`}
                 r={isHovered ? 9 : 7}
                 fill="none"
-                stroke="#3B82F6"
+                stroke="#22C55E"
                 strokeWidth={1.5}
               />
             )}
