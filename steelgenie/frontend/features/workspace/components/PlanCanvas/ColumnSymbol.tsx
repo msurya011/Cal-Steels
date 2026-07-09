@@ -138,14 +138,14 @@ export function ColumnSymbol({
     ? { x: cx - ft / 2, y: cy - s / 2 + ft, w: ft, h: s - 2 * ft }
     : { x: cx - s / 2 + ft, y: cy - ft / 2, w: s - 2 * ft, h: ft }
 
-  const rectEl = (r: { x: number; y: number; w: number; h: number }, key: string) => (
+  const rectEl = (r: { x: number; y: number; w: number; h: number }, key: string, isSolid: boolean = false) => (
     <rect
       key={key}
       x={`${r.x}%`} y={`${r.y}%`} width={`${r.w}%`} height={`${r.h}%`}
-      fill={fillCol}
-      stroke={stroke}
-      strokeWidth={sw}
-      strokeDasharray={dash}
+      fill={isSolid ? stroke : fillCol}
+      stroke={isSolid ? 'none' : stroke}
+      strokeWidth={isSolid ? 0 : sw}
+      strokeDasharray={isSolid ? undefined : dash}
       strokeLinejoin="round"
       className={isZoomTarget ? 'pulsing-member' : ''}
       style={{ transition: 'all 0.1s ease', filter: filterStyle }}
@@ -207,9 +207,9 @@ export function ColumnSymbol({
         />
       ) : (
         <>
-          {rectEl(f1, 'f1')}
-          {rectEl(f2, 'f2')}
-          {rectEl(web, 'web')}
+          {rectEl(f1, 'f1', true)}
+          {rectEl(f2, 'f2', true)}
+          {rectEl(web, 'web', true)}
         </>
       )}
 
