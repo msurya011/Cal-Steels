@@ -163,6 +163,18 @@ export function OverlayLayer({
               onMouseLeave={() => onMemberHover(null)}
               style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
             >
+              {/* Invisible thick click-target helper */}
+              <line
+                x1={`${x1}%`}
+                y1={`${y1}%`}
+                x2={`${x2}%`}
+                y2={`${y2}%`}
+                fill="none"
+                stroke="transparent"
+                strokeWidth={16}
+                style={{ cursor: 'pointer' }}
+              />
+
               {/* Confidence Halo */}
               {showHalo && (
                 <line
@@ -241,6 +253,15 @@ export function OverlayLayer({
             onMouseLeave={() => onMemberHover(null)}
             style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
           >
+            {/* Invisible thick click-target helper */}
+            <circle
+              cx={`${bx}%`}
+              cy={`${by}%`}
+              r={16}
+              fill="transparent"
+              style={{ cursor: 'pointer' }}
+            />
+
             {/* Confidence Halo */}
             {showHalo && (
               <circle
