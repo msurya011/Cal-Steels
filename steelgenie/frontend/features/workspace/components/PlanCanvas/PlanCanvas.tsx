@@ -129,6 +129,12 @@ export function PlanCanvas({
   }
 
   const handleMouseDown = (e: React.MouseEvent) => {
+    // Clear selection if they click empty background space
+    if (e.target === e.currentTarget || (e.target as HTMLElement).tagName === 'IMG') {
+      useWorkspaceStore.getState().clearSelection()
+      onMemberSelect(null)
+    }
+
     if (activeTool === 'hand') {
       e.preventDefault()
       setIsPanning(true)

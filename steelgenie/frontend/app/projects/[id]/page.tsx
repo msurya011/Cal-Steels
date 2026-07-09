@@ -493,9 +493,7 @@ export default function TakeoffWorkspacePage() {
   }
 
   const handleMemberSelect = (m: any | null) => {
-    if (m) {
-      toggleSelection(m.id)
-    } else {
+    if (!m) {
       clearSelection()
     }
   }
