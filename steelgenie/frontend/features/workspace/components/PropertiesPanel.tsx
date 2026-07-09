@@ -154,6 +154,35 @@ export function PropertiesPanel({
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
+  const { selectedRatio, imageNaturalWidth, imageAspect } = useWorkspaceStore()
+
+  // Calculate geometric angle of the beam line
+  const getBeamAngle = () => {
+    if (!member) return null
+    if (member.geometry?.angle_deg !== undefined && member.geometry?.angle_deg !== null) {
+      return Math.round(member.geometry.angle_deg * 10) / 10
+    }
+    const g = member.geometry || {}
+    if (g.bx1 !== undefined && g.by1 !== undefined && g.bx2 !== undefined && g.by2 !== undefined) {
+      const dx = g.bx2 - g.bx1
+      const dy = (g.by2 - g.by1) * (imageAspect || 0.75)
+      const rad = Math.atan2(dy, dx)
+      let deg = (rad * 180) / Math.PI
+      deg = (deg + 180) % 180
+      return Math.round(deg * 10) / 10
+    }
+    return null
+  }
+
+  // Gather unique sections on this sheet
+  const uniqueSheetSections = Array.from(
+    new Set(
+      members
+        .map((m) => m.section)
+        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+    )
+  ).sort()
+
   const handleSectionChange = async (val: string, isBulk = false) => {
     if (isBulk) {
       setBulkSection(val)
@@ -424,6 +453,7 @@ export function PropertiesPanel({
               <input
                 value={bulkSection}
                 onChange={(e) => handleSectionChange(e.target.value, true)}
+                onFocus={() => setShowSuggestions(true)}
                 placeholder="No change"
                 style={{
                   padding: '8px 10px',
@@ -435,7 +465,7 @@ export function PropertiesPanel({
                   outline: 'none',
                 }}
               />
-              {showSuggestions && suggestions.length > 0 && (
+              {showSuggestions && (suggestions.length > 0 || uniqueSheetSections.length > 0) && (
                 <div
                   style={{
                     position: 'absolute',
@@ -452,6 +482,36 @@ export function PropertiesPanel({
                     marginTop: '4px',
                   }}
                 >
+                  {/* Unique Sheet Sections List */}
+                  {uniqueSheetSections.length > 0 && !bulkSection && (
+                    <div>
+                      <div style={{ padding: '6px 12px', fontSize: '9px', color: '#3B82F6', fontWeight: 700, backgroundColor: 'rgba(59, 130, 246, 0.05)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                        Sheet Profiles
+                      </div>
+                      {uniqueSheetSections.map((sec) => (
+                        <div
+                          key={sec}
+                          onClick={() => {
+                            setBulkSection(sec)
+                            setShowSuggestions(false)
+                          }}
+                          style={{
+                            padding: '8px 12px',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            color: '#F1F5F9',
+                            borderBottom: '1px solid rgba(255,255,255,0.03)',
+                            fontWeight: 600,
+                          }}
+                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
+                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                        >
+                          {sec}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {suggestions.map((s) => (
                     <div
                       key={s.designation}
@@ -666,6 +726,26 @@ export function PropertiesPanel({
               </div>
             </div>
 
+            {/* Angle (Geometric) */}
+            {getBeamAngle() !== null && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Angle (Geometric)</label>
+                <input
+                  readOnly
+                  value={`${getBeamAngle()}°`}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(15, 23, 42, 0.6)',
+                    border: '1px solid rgba(255, 255, 255, 0.05)',
+                    borderRadius: '6px',
+                    color: '#94A3B8',
+                    fontSize: '13px',
+                    outline: 'none',
+                  }}
+                />
+              </div>
+            )}
+
             {/* Piecemark & Copes Row */}
             <div style={{ display: 'flex', gap: '10px' }}>
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -780,11 +860,7 @@ export function PropertiesPanel({
               <input
                 value={section}
                 onChange={(e) => handleSectionChange(e.target.value, false)}
-                onFocus={() => {
-                  if (section.trim().length >= 1) {
-                    handleSectionChange(section, false)
-                  }
-                }}
+                onFocus={() => setShowSuggestions(true)}
                 placeholder="Select section size"
                 style={{
                   padding: '8px 10px',
@@ -801,7 +877,7 @@ export function PropertiesPanel({
                   {kind[0].toUpperCase() + kind.slice(1)} section size is empty
                 </span>
               )}
-              {showSuggestions && suggestions.length > 0 && (
+              {showSuggestions && (suggestions.length > 0 || uniqueSheetSections.length > 0) && (
                 <div
                   style={{
                     position: 'absolute',
@@ -812,36 +888,75 @@ export function PropertiesPanel({
                     backgroundColor: '#1E293B',
                     border: '1px solid rgba(59, 130, 246, 0.2)',
                     borderRadius: '6px',
-                    maxHeight: '180px',
+                    maxHeight: '220px',
                     overflowY: 'auto',
                     boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
                     marginTop: '4px',
                   }}
                 >
-                  {suggestions.map((s) => (
-                    <div
-                      key={s.designation}
-                      onClick={() => {
-                        setSection(s.designation)
-                        setShowSuggestions(false)
-                      }}
-                      style={{
-                        padding: '8px 12px',
-                        cursor: 'pointer',
-                        fontSize: '12px',
-                        color: '#F1F5F9',
-                        borderBottom: '1px solid rgba(59, 130, 246, 0.05)',
-                        transition: 'background-color 0.2s',
-                      }}
-                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
-                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                    >
-                      <div style={{ fontWeight: 600 }}>{s.designation}</div>
-                      <div style={{ fontSize: '10px', color: '#64748B' }}>
-                        {s.weight_per_ft} lbs/ft • d={s.depth_in}" • bf={s.flange_width_in}"
+                  {/* Unique Sheet Sections List */}
+                  {uniqueSheetSections.length > 0 && !section && (
+                    <div>
+                      <div style={{ padding: '6px 12px', fontSize: '9px', color: '#3B82F6', fontWeight: 700, backgroundColor: 'rgba(59, 130, 246, 0.05)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                        Sheet Profiles
                       </div>
+                      {uniqueSheetSections.map((sec) => (
+                        <div
+                          key={sec}
+                          onClick={() => {
+                            setSection(sec)
+                            setShowSuggestions(false)
+                          }}
+                          style={{
+                            padding: '8px 12px',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            color: '#F1F5F9',
+                            borderBottom: '1px solid rgba(255,255,255,0.03)',
+                            fontWeight: 600,
+                          }}
+                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
+                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                        >
+                          {sec}
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  )}
+
+                  {suggestions.length > 0 && (
+                    <div>
+                      {uniqueSheetSections.length > 0 && !section && (
+                        <div style={{ padding: '6px 12px', fontSize: '9px', color: '#94A3B8', fontWeight: 700, backgroundColor: 'rgba(255, 255, 255, 0.02)', textTransform: 'uppercase', letterSpacing: '0.5px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                          All Profiles
+                        </div>
+                      )}
+                      {suggestions.map((s) => (
+                        <div
+                          key={s.designation}
+                          onClick={() => {
+                            setSection(s.designation)
+                            setShowSuggestions(false)
+                          }}
+                          style={{
+                            padding: '8px 12px',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            color: '#F1F5F9',
+                            borderBottom: '1px solid rgba(255, 255, 255, 0.03)',
+                            transition: 'background-color 0.2s',
+                          }}
+                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(59, 130, 246, 0.15)')}
+                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                        >
+                          <div style={{ fontWeight: 600 }}>{s.designation}</div>
+                          <div style={{ fontSize: '10px', color: '#64748B' }}>
+                            {s.weight_per_ft} lbs/ft • d={s.depth_in}" • bf={s.flange_width_in}"
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
