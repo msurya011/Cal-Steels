@@ -709,7 +709,7 @@ export default function TakeoffWorkspacePage() {
             style={{
               position: 'absolute',
               top: '16px',
-              left: sidebarOpen ? '282px' : '12px',
+              left: '12px',
               zIndex: 30,
               transition: 'left 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
             }}

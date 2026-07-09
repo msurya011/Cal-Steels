@@ -179,36 +179,59 @@ export function LayerFilterPopover({ members, onClose, projectId }: LayerFilterP
         </button>
       </div>
 
-      {/* Preset select & Search filter */}
+      {/* Preset select & Search filter (mockup style: side by side) */}
       <div
         style={{
-          padding: '12px 14px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '8px',
+          padding: '10px 12px',
           borderBottom: '1px solid rgba(255, 255, 255, 0.04)',
+          display: 'flex',
+          gap: '8px',
+          alignItems: 'center',
         }}
       >
+        {/* Search */}
+        <div style={{ position: 'relative', flex: 1 }}>
+          <Search
+            size={12}
+            style={{ position: 'absolute', left: '8px', top: '7px', color: '#64748B' }}
+          />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Filter layers..."
+            style={{
+              width: '100%',
+              padding: '5px 8px 5px 24px',
+              backgroundColor: '#0F172A',
+              border: '1px solid rgba(255, 255, 255, 0.08)',
+              borderRadius: '5px',
+              color: '#F1F5F9',
+              fontSize: '11px',
+              outline: 'none',
+              boxSizing: 'border-box',
+            }}
+          />
+        </div>
+
         {/* Preset Selector */}
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          <span style={{ fontSize: '11px', color: '#94A3B8', fontWeight: 600 }}>Preset:</span>
+        <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
           <select
             value={layers.activePresetId || ''}
             onChange={(e) => handleApplyPreset(e.target.value)}
             style={{
-              flex: 1,
+              width: '110px',
               backgroundColor: '#0F172A',
               border: '1px solid rgba(59, 130, 246, 0.15)',
               borderRadius: '5px',
               color: '#F1F5F9',
               fontSize: '11px',
-              padding: '4px 8px',
+              padding: '4px 6px',
               outline: 'none',
               cursor: 'pointer',
             }}
           >
             <option value="" disabled>
-              Select preset...
+              Presets...
             </option>
             {presets.map((p) => (
               <option key={p.id} value={p.id}>
@@ -228,41 +251,18 @@ export function LayerFilterPopover({ members, onClose, projectId }: LayerFilterP
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
+                padding: '2px',
               }}
               title="Delete preset"
             >
-              <Trash2 size={13} />
+              <Trash2 size={12} />
             </button>
           )}
-        </div>
-
-        {/* Search */}
-        <div style={{ position: 'relative' }}>
-          <Search
-            size={13}
-            style={{ position: 'absolute', left: '8px', top: '8px', color: '#64748B' }}
-          />
-          <input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Filter layers..."
-            style={{
-              width: '100%',
-              padding: '6px 8px 6px 26px',
-              backgroundColor: '#0F172A',
-              border: '1px solid rgba(255, 255, 255, 0.08)',
-              borderRadius: '5px',
-              color: '#F1F5F9',
-              fontSize: '11px',
-              outline: 'none',
-              boxSizing: 'border-box',
-            }}
-          />
         </div>
       </div>
 
       {/* Content wrapper */}
-      <div style={{ overflowY: 'auto', maxHeight: '350px', padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+      <div style={{ overflowY: 'auto', maxHeight: '520px', padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
         {/* MEMBER CLASSES */}
         <div>
           <div style={{ fontSize: '10px', fontWeight: 700, color: '#64748B', marginBottom: '8px', textTransform: 'uppercase' }}>
