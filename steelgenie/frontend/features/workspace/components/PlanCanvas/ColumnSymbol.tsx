@@ -1,4 +1,5 @@
 import React, { useRef } from 'react'
+import { useWorkspaceStore } from '../../../../lib/stores/workspaceStore'
 
 export interface ColumnSymbolProps {
   member: any
@@ -92,8 +93,22 @@ export function ColumnSymbol({
     window.addEventListener('pointerup', handlePointerUp)
   }
 
-  // Symbol sizing
-  const s = Math.min(2.6, Math.max(1.2, (geo.w ? geo.w * 100 : 0) || 1.8))
+  const { selectedRatio, imageNaturalWidth } = useWorkspaceStore()
+
+  // Symbol sizing based on true physical depth and scale ratio
+  const depthIn = geo.depth_in ?? 10
+  let sPct = 1.0
+  if (selectedRatio && imageNaturalWidth) {
+    // 150 DPI rendering: physical pixels for the given column depth
+    const sizePx = (depthIn * 150) / selectedRatio
+    // Clamp the pixel size for readability (min 12px, max 45px)
+    const clampedPx = Math.max(12, Math.min(45, sizePx))
+    sPct = (clampedPx / imageNaturalWidth) * 100
+  } else {
+    // Fallback if no scale is set on the page yet
+    sPct = Math.min(2.0, Math.max(0.5, (geo.w ? geo.w * 100 : 0) || 1.0))
+  }
+  const s = sPct
   const ft = s * 0.22 
   const rot = ((m.rotation || 0) % 180 + 180) % 180
   const vert = rot >= 45 && rot < 135
