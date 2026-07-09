@@ -110,8 +110,6 @@ export function ColumnSymbol({
   }
   const s = sPct
   const ft = s * 0.22 
-  const rot = ((m.rotation || 0) % 180 + 180) % 180
-  const vert = rot >= 45 && rot < 135
   const symbol = geo.symbol || 'I'
 
   let stroke = color
@@ -126,17 +124,10 @@ export function ColumnSymbol({
   // Use transparent instead of none so pointer events are still captured
   const fillCol = 'transparent'
 
-  // I-glyph rects
-  const flangeH = !vert
-  const f1 = flangeH
-    ? { x: cx - s / 2, y: cy - s / 2, w: s, h: ft }
-    : { x: cx - s / 2, y: cy - s / 2, w: ft, h: s }
-  const f2 = flangeH
-    ? { x: cx - s / 2, y: cy + s / 2 - ft, w: s, h: ft }
-    : { x: cx + s / 2 - ft, y: cy - s / 2, w: ft, h: s }
-  const web = flangeH
-    ? { x: cx - ft / 2, y: cy - s / 2 + ft, w: ft, h: s - 2 * ft }
-    : { x: cx - s / 2 + ft, y: cy - ft / 2, w: s - 2 * ft, h: ft }
+  // Base case (rotation 0 = horizontal web, vertical flanges)
+  const f1 = { x: cx - s / 2, y: cy - s / 2, w: ft, h: s }
+  const f2 = { x: cx + s / 2 - ft, y: cy - s / 2, w: ft, h: s }
+  const web = { x: cx - s / 2 + ft, y: cy - ft / 2, w: s - 2 * ft, h: ft }
 
   const rectEl = (r: { x: number; y: number; w: number; h: number }, key: string, isSolid: boolean = false) => (
     <rect
@@ -195,23 +186,25 @@ export function ColumnSymbol({
         />
       )}
 
-      {/* Steel symbol */}
-      {symbol === 'BOX' ? (
-        rectEl({ x: cx - s / 2, y: cy - s / 2, w: s, h: s }, 'box')
-      ) : symbol === 'PIPE' ? (
-        <circle
-          cx={`${cx}%`} cy={`${cy}%`} r={s / 2}
-          fill={fillCol} stroke={stroke} strokeWidth={sw} strokeDasharray={dash}
-          className={isZoomTarget ? 'pulsing-member' : ''}
-          style={{ transition: 'all 0.1s ease', filter: filterStyle }}
-        />
-      ) : (
-        <>
-          {rectEl(f1, 'f1', true)}
-          {rectEl(f2, 'f2', true)}
-          {rectEl(web, 'web', true)}
-        </>
-      )}
+      {/* Steel symbol with precise rotation */}
+      <g style={{ transformOrigin: 'center', transformBox: 'fill-box', transform: `rotate(${m.rotation || 0}deg)` }}>
+        {symbol === 'BOX' ? (
+          rectEl({ x: cx - s / 2, y: cy - s / 2, w: s, h: s }, 'box')
+        ) : symbol === 'PIPE' ? (
+          <circle
+            cx={`${cx}%`} cy={`${cy}%`} r={s / 2}
+            fill={fillCol} stroke={stroke} strokeWidth={sw} strokeDasharray={dash}
+            className={isZoomTarget ? 'pulsing-member' : ''}
+            style={{ transition: 'all 0.1s ease', filter: filterStyle }}
+          />
+        ) : (
+          <>
+            {rectEl(f1, 'f1', true)}
+            {rectEl(f2, 'f2', true)}
+            {rectEl(web, 'web', true)}
+          </>
+        )}
+      </g>
 
       {/* Matched Profile Section Link Icon */}
       {isSelected && m.section && (
