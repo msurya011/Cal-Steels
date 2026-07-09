@@ -61,6 +61,7 @@ export default function TakeoffWorkspacePage() {
     bulkUpdateMembers,
     bulkDeleteMembers,
     analysePage,
+    validateColumns,
   } = useMembers(currentPageId)
 
   const activePage = pages.find((p: any) => p.id === currentPageId) || null
@@ -152,6 +153,24 @@ export default function TakeoffWorkspacePage() {
       }
     }, 2000)
   }
+
+  // R: rotate selected column(s) by 90° (drafting detents)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (document.activeElement as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (e.key.toLowerCase() !== 'r' || e.ctrlKey || e.metaKey) return
+      const cols = members.filter((m: any) => selection.has(m.id) && m.kind === 'column')
+      if (cols.length === 0) return
+      e.preventDefault()
+      cols.forEach((c: any) =>
+        updateMember({ id: c.id, data: { rotation: (((c.rotation || 0) + 90) % 360) } })
+      )
+      toast.info(`Rotated ${cols.length} column${cols.length > 1 ? 's' : ''} 90°`)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [members, selection, updateMember])
 
   // Listen to WebSocket events for job progress
   useEffect(() => {
@@ -443,6 +462,21 @@ export default function TakeoffWorkspacePage() {
     }
   }
 
+  const handleMemberDragEnd = async (id: string, newX: number, newY: number) => {
+    try {
+      const existing = members.find((m: any) => m.id === id)
+      if (!existing) return
+      await updateMember({ 
+        id, 
+        data: { geometry: { ...existing.geometry, x: newX, y: newY } } 
+      })
+      await validateColumns()
+      toast.success('Member position updated and snapped')
+    } catch {
+      toast.error('Failed to update member position')
+    }
+  }
+
   const handleAddAnnotationMarker = async (pt: any) => {
     try {
       await createMember({
@@ -728,6 +762,7 @@ export default function TakeoffWorkspacePage() {
             onAddAnnotationMarker={handleAddAnnotationMarker}
             onRulerCalibrate={handleRulerCalibrate}
             onDrawMember={handleDrawMember}
+            onMemberDragEnd={handleMemberDragEnd}
           />
 
           {calibLine && imageNaturalWidth && (

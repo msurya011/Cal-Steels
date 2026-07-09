@@ -34,6 +34,7 @@ interface PlanCanvasProps {
     kind: 'column' | 'beam' | 'brace',
     geom: { x1: number; y1: number; x2: number; y2: number }
   ) => void
+  onMemberDragEnd?: (id: string, x: number, y: number) => void
 }
 
 export function PlanCanvas({
@@ -43,6 +44,7 @@ export function PlanCanvas({
   onAddAnnotationMarker,
   onRulerCalibrate,
   onDrawMember,
+  onMemberDragEnd,
 }: PlanCanvasProps) {
   const {
     activeTool,
@@ -285,6 +287,7 @@ export function PlanCanvas({
             }}
             hoveredMemberId={hoveredMemberId}
             onMemberHover={setHoveredMemberId}
+            onMemberDragEnd={onMemberDragEnd}
           />
 
           {/* Ruler calibration preview overlay lines */}

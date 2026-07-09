@@ -1,5 +1,6 @@
 import React from 'react'
 import { useWorkspaceStore, getMemberRenderProps } from '../../../../lib/stores/workspaceStore'
+import { ColumnSymbol } from './ColumnSymbol'
 
 interface Member {
   id: string
@@ -33,6 +34,7 @@ interface OverlayLayerProps {
   onMemberClick: (member: Member, e: React.MouseEvent) => void
   hoveredMemberId: string | null
   onMemberHover: (id: string | null) => void
+  onMemberDragEnd?: (id: string, x: number, y: number) => void
 }
 
 export function OverlayLayer({
@@ -40,6 +42,7 @@ export function OverlayLayer({
   onMemberClick,
   hoveredMemberId,
   onMemberHover,
+  onMemberDragEnd,
 }: OverlayLayerProps) {
   const store = useWorkspaceStore()
   const { layers, selection, hiddenIds, isolation, zoomTarget } = store
@@ -118,82 +121,27 @@ export function OverlayLayer({
         // Confidence Halo
         const showHalo = layers.aids.confidenceHalo && isLowConf
 
-        // 1. Column rendering
+        // 1. Column rendering — oriented steel symbol (I / box / pipe) with states
         if (m.kind === 'column') {
-          const w = geo.w !== undefined ? geo.w * 100 : 2.5
-          const h = geo.h !== undefined ? geo.h * 100 : 2.5
-          const cx = geo.x * 100
-          const cy = geo.y * 100
-
           return (
-            <g
+            <ColumnSymbol
               key={m.id}
+              member={m}
+              renderProps={renderProps}
+              layers={layers}
+              isSelected={isSelected}
+              isHovered={isHovered}
+              isZoomTarget={isZoomTarget}
+              isLowConf={isLowConf}
+              getLabelText={getLabelText}
               onClick={(e) => {
                 e.stopPropagation()
                 onMemberClick(m, e)
               }}
               onMouseEnter={() => onMemberHover(m.id)}
               onMouseLeave={() => onMemberHover(null)}
-              style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
-            >
-              {/* Confidence Halo */}
-              {showHalo && (
-                <rect
-                  x={`${cx - w / 2 - 1}%`}
-                  y={`${cy - h / 2 - 1}%`}
-                  width={`${w + 2}%`}
-                  height={`${h + 2}%`}
-                  fill="none"
-                  stroke="#F59E0B"
-                  strokeWidth={2}
-                  strokeDasharray="4,4"
-                  className="pulsing-halo"
-                />
-              )}
-
-              {/* Selection Border indicator */}
-              {isSelected && (
-                <rect
-                  x={`${cx - w / 2 - 1}%`}
-                  y={`${cy - h / 2 - 1}%`}
-                  width={`${w + 2}%`}
-                  height={`${h + 2}%`}
-                  fill="none"
-                  stroke="#3B82F6"
-                  strokeWidth={2}
-                />
-              )}
-
-              {/* Base Column overlay shape */}
-              <rect
-                x={`${cx - w / 2}%`}
-                y={`${cy - h / 2}%`}
-                width={`${w}%`}
-                height={`${h}%`}
-                fill={isHovered ? 'rgba(59, 130, 246, 0.4)' : 'rgba(59, 130, 246, 0.2)'}
-                stroke={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color}
-                strokeWidth={isHovered ? 2.5 + strokeWidthModifier : 1.5 + strokeWidthModifier}
-                className={isZoomTarget ? 'pulsing-member' : ''}
-                style={{
-                  transition: 'all 0.1s ease',
-                  filter: filterStyle,
-                }}
-              />
-              {/* Text label */}
-              {getLabelText(m) && (
-                <text
-                  x={`${cx}%`}
-                  y={`${cy - h / 2 - 1}%`}
-                  fill={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : '#F1F5F9'}
-                  fontSize="9px"
-                  fontWeight="bold"
-                  textAnchor="middle"
-                  style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
-                >
-                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${getLabelText(m)}` : getLabelText(m)}
-                </text>
-              )}
-            </g>
+              onDragEnd={onMemberDragEnd}
+            />
           )
         }
 

@@ -1602,27 +1602,131 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
     return (page_w * 0.03, page_h * 0.02, page_w * 0.97, page_h * 0.98)
 
 
+def refine_column_geometry(drawings, cluster_idx, scale_ratio):
+    lines = []
+    has_rect = False
+    has_circle = False
+    rect_dims = []
+    
+    for idx in cluster_idx:
+        d = drawings[idx]
+        items = d.get("items", [])
+        for item in items:
+            kind = item[0]
+            if kind == "l":
+                p1, p2 = item[1], item[2]
+                lines.append((p1.x, p1.y, p2.x, p2.y))
+            elif kind == "re":
+                rr = item[1]
+                rw = abs(rr.x1 - rr.x0)
+                rh = abs(rr.y1 - rr.y0)
+                rect_dims.append((rw, rh))
+                has_rect = True
+            elif kind == "c":
+                has_circle = True
+
+    # Default bounding box centre
+    rects = [drawings[k].get("rect") for k in cluster_idx if drawings[k].get("rect")]
+    if not rects:
+        return 0, 0, 0, "I", 12.0
+    u_x0 = min(r.x0 for r in rects)
+    u_y0 = min(r.y0 for r in rects)
+    u_x1 = max(r.x1 for r in rects)
+    u_y1 = max(r.y1 for r in rects)
+    cx = (u_x0 + u_x1) / 2
+    cy = (u_y0 + u_y1) / 2
+    w_pt = u_x1 - u_x0
+    h_pt = u_y1 - u_y0
+    depth_pt = max(w_pt, h_pt)
+    depth_in = depth_pt * scale_ratio / 72.0
+    
+    if depth_in < 4.0:
+        depth_in = 8.0
+    elif depth_in > 48.0:
+        depth_in = 14.0
+
+    rotation = 0
+    symbol_type = "I"
+
+    if has_circle:
+        symbol_type = "PIPE"
+        return cx, cy, 0, symbol_type, depth_in
+
+    if has_rect and not lines:
+        symbol_type = "BOX"
+        return cx, cy, 0, symbol_type, depth_in
+
+    if len(lines) >= 3:
+        angles = []
+        for (lx1, ly1, lx2, ly2) in lines:
+            dx = lx2 - lx1
+            dy = ly2 - ly1
+            length = math.hypot(dx, dy)
+            if length > 1.5:
+                angle = math.degrees(math.atan2(dy, dx)) % 180.0
+                angles.append((angle, length, (lx1, ly1, lx2, ly2)))
+        
+        best_angle = 0
+        best_count = 0
+        for angle, _, _ in angles:
+            count = 0
+            for a, _, _ in angles:
+                diff = abs(angle - a) % 180.0
+                if min(diff, 180.0 - diff) <= 20.0:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                best_angle = angle
+        
+        flange_lines = []
+        web_lines = []
+        for a, l, line in angles:
+            diff = abs(best_angle - a) % 180.0
+            if min(diff, 180.0 - diff) <= 20.0:
+                flange_lines.append(line)
+            elif abs(min(diff, 180.0 - diff) - 90.0) <= 20.0:
+                web_lines.append(line)
+
+        ref_cx, ref_cy = cx, cy
+        if web_lines:
+            web_xs = [ (ln[0] + ln[2])/2 for ln in web_lines ]
+            web_ys = [ (ln[1] + ln[3])/2 for ln in web_lines ]
+            ref_cx = sum(web_xs) / len(web_xs)
+            ref_cy = sum(web_ys) / len(web_ys)
+            
+            web_angles = []
+            for ln in web_lines:
+                web_angles.append(math.degrees(math.atan2(ln[3] - ln[1], ln[2] - ln[0])) % 180.0)
+            if web_angles:
+                avg_web_angle = sum(web_angles) / len(web_angles)
+                rotation = min([0, 45, 90, 135, 180], key=lambda a: abs(avg_web_angle - a)) % 180
+        else:
+            rotation = min([0, 45, 90, 135, 180], key=lambda a: abs(best_angle - a)) % 180
+            rotation = (rotation + 90) % 180
+
+        if len(flange_lines) >= 2:
+            rad = math.radians(best_angle + 90)
+            nx, ny = math.cos(rad), math.sin(rad)
+            projections = []
+            for ln in flange_lines:
+                mx = (ln[0] + ln[2]) / 2
+                my = (ln[1] + ln[3]) / 2
+                projections.append(mx * nx + my * ny)
+            projections.sort()
+            dist_pt = projections[-1] - projections[0]
+            if 3.0 < dist_pt < 60.0:
+                depth_in = dist_pt * scale_ratio / 72.0
+                
+        return ref_cx, ref_cy, rotation, "I", depth_in
+
+    return cx, cy, rotation, symbol_type, depth_in
+
+
 # ── Column symbol detection (I/H cross-section marks in vector drawings) ──────
 def detect_column_symbols(page, scale_ratio: float = 96):
     """
     Detect the small I-section / W-section plan-view symbols drawn in the PDF.
-
-    All distance thresholds are derived from real-world inches using the sheet's
-    scale_ratio so they remain correct across 1/8", 1/4", 1/2" and detail scales.
-
-    Conversion: PDF_pt = real_inches * 72 / scale_ratio
-      1/8"=1' (scale_ratio=96)  → 0.75 pt per real inch
-      1/4"=1' (scale_ratio=48)  → 1.50 pt per real inch
-      1/2"=1' (scale_ratio=24)  → 3.00 pt per real inch
-
-    Strategy:
-      1. Collect all drawing paths whose bounding box is within the expected
-         column-symbol size range (derived from scale).
-      2. For each path, inspect segments for I/H pattern (flanges + web).
-      3. Accept solid-black rectangles (some CAD exports use a filled box).
-      4. Cluster nearby hits with a scale-aware DBSCAN radius; return the
-         union-bbox centre of each cluster (not the average of sub-path centres
-         — asymmetric sub-path counts cannot drift the centre).
+    ...
     """
     try:
         drawings = page.get_drawings()
@@ -1630,34 +1734,19 @@ def detect_column_symbols(page, scale_ratio: float = 96):
         return []
 
     # ── Scale-aware thresholds ────────────────────────────────────────────────
-    # All in real-world INCHES; multiplied by _ipt to get PDF points.
-    _ipt = 72.0 / max(scale_ratio, 1)   # pt per real inch
+    _ipt = 72.0 / max(scale_ratio, 1)
 
-    # Column symbol bbox limits in real inches:
-    #   min = 3" (smallest standard section: W8 flange ≈ 8")
-    #   max = 48" (largest practical section + drafting pen width)
     SYM_MIN_PT = max(3, 3.0 * _ipt)
     SYM_MAX_PT = 48.0 * _ipt
-
-    # DBSCAN eps: governs chaining of sub-paths within the SAME symbol.
-    # Must be (a) large enough to step between adjacent sub-paths of a large
-    # column symbol and (b) small enough to never bridge two distinct columns.
-    # Minimum bay spacing ~10ft; symbol sub-path step ~1-2".  6" real is safe.
     EPS = max(4, 6.0 * _ipt)
 
-    raw = []   # (cx, cy, rect_tuple) candidates
+    raw = []
 
     def _ang_diff(a, b):
-        """Smallest angle between two undirected lines (0–90°)."""
         d = abs(a - b) % 180.0
         return min(d, 180.0 - d)
 
     def _has_IH_pattern(angles, tol=20.0):
-        """Rotation-invariant I/H test: ≥2 mutually-parallel segments (the two
-        flanges) PLUS ≥1 segment roughly perpendicular to them (the web), at ANY
-        orientation.  This recognises the column symbol whether it is drawn
-        upright (flanges horizontal) OR rotated to any angle (skewed grids,
-        canopy framing, angled wings)."""
         for a in angles:
             par  = sum(1 for b in angles if _ang_diff(a, b) <= tol)
             perp = sum(1 for b in angles if abs(_ang_diff(a, b) - 90.0) <= tol)
@@ -1665,7 +1754,7 @@ def detect_column_symbols(page, scale_ratio: float = 96):
                 return True
         return False
 
-    for d in drawings:
+    for i, d in enumerate(drawings):
         rect = d.get("rect")
         if rect is None:
             continue
@@ -1756,18 +1845,18 @@ def detect_column_symbols(page, scale_ratio: float = 96):
         # where the old strict horizontal/vertical test missed columns, leaving
         # beams with no centre to snap to.
         if not has_curve and _has_IH_pattern(seg_angles):
-            raw.append((cx, cy, _raw_rect))
+            raw.append((cx, cy, _raw_rect, i))
             continue
 
         # ── Accept small FILLED rectangle (solid black plan mark only) ────────
         if (not has_curve and n_lines == 4 and 0.5 < aspect < 2.0
                 and w < 28 and h < 28 and drawing_brightness < 0.25):
-            raw.append((cx, cy, _raw_rect))
+            raw.append((cx, cy, _raw_rect, i))
             continue
 
         # ── Accept small CIRCLED I/H symbol ───────────────────────────────────
         if has_curve and _has_IH_pattern(seg_angles) and 10 < w < 45 and 10 < h < 45:
-            raw.append((cx, cy, _raw_rect))
+            raw.append((cx, cy, _raw_rect, i))
 
     # Deduplicate using EXPANDING cluster (DBSCAN-style, eps=15pt).
     #
@@ -1804,18 +1893,14 @@ def detect_column_symbols(page, scale_ratio: float = 96):
                         cluster_idx.append(j)
                         queue.append(j)
 
-        # Use the UNION bounding box of all sub-paths in the cluster, then
-        # take its centre.  This is exact regardless of how many sub-rects
-        # each flange or web was split into — asymmetric sub-path counts
-        # cannot drift the centre any more.
-        rects = [raw[k][2] for k in cluster_idx]
-        u_x0 = min(r[0] for r in rects)
-        u_y0 = min(r[1] for r in rects)
-        u_x1 = max(r[2] for r in rects)
-        u_y1 = max(r[3] for r in rects)
+        ref_cx, ref_cy, rotation, symbol_type, depth_in = refine_column_geometry(
+            drawings, [raw[k][3] for k in cluster_idx], scale_ratio)
         symbols.append({
-            "cx": (u_x0 + u_x1) / 2,
-            "cy": (u_y0 + u_y1) / 2,
+            "cx": ref_cx,
+            "cy": ref_cy,
+            "rotation": rotation,
+            "symbol": symbol_type,
+            "depth_in": depth_in
         })
 
     print(f"[SYMBOLS] Column symbols detected: {len(symbols)}")
@@ -3975,7 +4060,8 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
 
 
 def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
-                        page_w, page_h, scale_ratio: float = 96):
+                        page_w, page_h, scale_ratio: float = 96,
+                        pts_per_foot: float = 0.0, profiles=None):
     """Emit a COLUMN member for each detected column symbol that sits at a grid
     intersection and isn't already represented by a column member.
 
@@ -3986,40 +4072,20 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     (near a vertical AND a horizontal grid line) keeps false marks out.
     """
     if not column_symbols:
-        return members
+        column_symbols = []
 
     # ── Scale-aware thresholds ────────────────────────────────────────────────
-    # All derived from real-world INCHES so they remain correct across sheets
-    # plotted at different scales in the same drawing set.
-    #
-    # Conversion: PDF_pt = real_inches * 72 / scale_ratio
-    #   1/8"=1'  (scale_ratio=96) → 0.75 pt/in
-    #   1/4"=1'  (scale_ratio=48) → 1.50 pt/in
-    #   1/2"=1'  (scale_ratio=24) → 3.00 pt/in
     _ipt = 72.0 / max(scale_ratio, 1)
+    if pts_per_foot <= 0.0:
+        pts_per_foot = 72.0 / max(scale_ratio, 1) * 12.0
 
-    # Beam endpoint search radius: column half-depth (≤12" for W24) +
-    # drafting tolerance (≤12").  24" real covers every standard section
-    # without reaching into adjacent bays (minimum bay ≥ 10ft = 120").
     FRAME_IN  = 24.0
     FRAME_PT  = FRAME_IN * _ipt
-
-    # Deduplication radius between the sub-paths of the same beam endpoint.
-    # Two endpoints within 4" real = same physical beam tip.
     END_EQ_IN = 4.0
     END_EQ_PT = END_EQ_IN * _ipt
-
-    # Minimum distinct beam endpoints confirming a column:
-    # real columns always have ≥ 2 framing beams; details/annotations ≤ 1.
     MIN_BEAMS = 2
-
-    # Grid snap: only snap to the idealised grid intersection when the symbol
-    # centre is within this tolerance.  6" real = half a typical column depth,
-    # which covers drafting offset without force-snapping clearly off-grid columns.
     SNAP_IN = 6.0
     SNAP_PT = SNAP_IN * _ipt
-
-    # Dedup: don't emit a second column within this of one already placed.
     DEDUP_IN = 6.0
     DEDUP_PT = DEDUP_IN * _ipt
 
@@ -4034,13 +4100,14 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
 
     added: list[tuple[float, float]] = []
     rejected = 0
+
     for s in column_symbols:
         cx, cy = s["cx"], s["cy"]   # union-bbox centre (raw)
 
         # Count distinct beam endpoints framing into this symbol.
         close_ends = [(ex, ey) for ex, ey in beam_ends
                       if math.hypot(cx - ex, cy - ey) < FRAME_PT]
-        unique_ends: list = []
+        unique_ends = []
         for (ex, ey) in close_ends:
             if not any(math.hypot(ex - ux, ey - uy) < END_EQ_PT
                        for ux, uy in unique_ends):
@@ -4048,19 +4115,13 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
 
         if len(unique_ends) < MIN_BEAMS:
             rejected += 1
-            continue   # stray annotation / connection detail — not a column
+            continue
 
-        # ── Placement: raw centre → try grid snap ────────────────────────────
-        # Store BOTH the raw (drawn) centre and the idealised grid position so
-        # downstream QA can compare them.
-        #
-        # Off-grid path: if the nearest grid intersection is farther than SNAP
-        # this is a genuinely off-grid column (transfer column, irregular edge,
-        # raked wall). Keep raw coordinate; tag off_grid=True.  Do NOT discard.
         raw_x, raw_y = cx, cy
         off_grid = True
         snap_x, snap_y = raw_x, raw_y
 
+        gx, gy = None, None
         if v_grid:
             gx = min(v_grid, key=lambda g: abs(cx - g))
             if abs(cx - gx) <= SNAP_PT:
@@ -4072,31 +4133,124 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                 snap_y = gy
                 off_grid = False
 
-        # Final position: snapped when on-grid, raw otherwise
         px, py = snap_x, snap_y
 
-        # Dedup using the FINAL position
         if any(math.hypot(px - ex, py - ey) < DEDUP_PT
                for ex, ey in existing + added):
             continue
 
+        # Match labels (within 20pt)
+        has_label_match = False
+        matched_profile = "COL"
+        if profiles:
+            for p in profiles:
+                if math.hypot(cx - p["cx"], cy - p["cy"]) < 20.0:
+                    has_label_match = True
+                    matched_profile = p["profile"]
+                    break
+
+        score = 0.0
+        if has_label_match:
+            score += 0.40
+        if not off_grid:
+            score += 0.30
+        if len(unique_ends) >= 2:
+            score += 0.20
+        if s.get("symbol") in ("I", "BOX", "PIPE"):
+            score += 0.10
+
+        status = 'active' if score >= 0.75 else 'need_review'
+
+        error_flags = []
+        if off_grid:
+            error_flags.append("no_grid")
+        if not has_label_match:
+            error_flags.append("no_label")
+        if len(unique_ends) < 2:
+            error_flags.append("orphan")
+
+        # Grid index naming
+        v_idx = sorted(v_grid).index(gx) + 1 if v_grid and gx is not None and gx in v_grid else "?"
+        h_idx = sorted(h_grid).index(gy) + 1 if h_grid and gy is not None and gy in h_grid else "?"
+        grid_ref = f"{v_idx}-{h_idx}" if (v_idx != "?" or h_idx != "?") else None
+
         added.append((px, py))
         members.append({
-            "profile": "COL", "type": "column", "length_ft": 0.0,
+            "profile": matched_profile, "type": "column", "length_ft": 0.0,
             "beam_dir": None,
             "bx1": None, "by1": None, "bx2": None, "by2": None,
-            # Placed (final) position
             "x":  round(px / page_w, 4), "y":  round(py / page_h, 4),
             "lx": round(px / page_w, 4), "ly": round(py / page_h, 4),
             "sx": round(px / page_w, 4), "sy": round(py / page_h, 4),
-            # Raw bbox-centre position (QA field)
-            "raw_x": round(raw_x / page_w, 4),
-            "raw_y": round(raw_y / page_h, 4),
-            "off_grid": off_grid,
+            "rotation": s.get("rotation", 0),
+            "source": "vector_symbol",
+            "status": status,
+            "geometry": {
+                "x": round(px / page_w, 4),
+                "y": round(py / page_h, 4),
+                "raw_x": round(raw_x / page_w, 4),
+                "raw_y": round(raw_y / page_h, 4),
+                "snap_offset_ft": round(math.hypot(px - raw_x, py - raw_y) / pts_per_foot, 2) if pts_per_foot > 0 else 0.0,
+                "grid_ref": grid_ref,
+                "symbol": s.get("symbol", "I"),
+                "depth_in": round(s.get("depth_in", 12.0), 1),
+                "error_flags": error_flags,
+            },
             "w": 0.018, "h": 0.018,
             "color": MEMBER_COLORS["column"], "confirmed": True,
-            "is_column": True, "size_unknown": True,
+            "is_column": True, "size_unknown": True if matched_profile == "COL" else False,
         })
+
+    # ── Emit Suggested Ghost Columns ──────────────────────────────────────────
+    if v_grid and h_grid:
+        for gx in v_grid:
+            for gy in h_grid:
+                close_ends = [(ex, ey) for ex, ey in beam_ends
+                              if math.hypot(gx - ex, gy - ey) < FRAME_PT]
+                unique_ends = []
+                for (ex, ey) in close_ends:
+                    if not any(math.hypot(ex - ux, ey - uy) < END_EQ_PT
+                               for ux, uy in unique_ends):
+                        unique_ends.append((ex, ey))
+
+                if len(unique_ends) >= 2:
+                    has_col = False
+                    for m in members:
+                        if m.get("type") == "column":
+                            mx, my = m["x"] * page_w, m["y"] * page_h
+                            if math.hypot(gx - mx, gy - my) < DEDUP_PT:
+                                has_col = True
+                                break
+                    if not has_col:
+                        v_idx = sorted(v_grid).index(gx) + 1
+                        h_idx = sorted(h_grid).index(gy) + 1
+                        grid_ref = f"{v_idx}-{h_idx}"
+
+                        members.append({
+                            "profile": "COL", "type": "column", "length_ft": 0.0,
+                            "beam_dir": None,
+                            "bx1": None, "by1": None, "bx2": None, "by2": None,
+                            "x":  round(gx / page_w, 4), "y":  round(gy / page_h, 4),
+                            "lx": round(gx / page_w, 4), "ly": round(gy / page_h, 4),
+                            "sx": round(gx / page_w, 4), "sy": round(gy / page_h, 4),
+                            "rotation": 0,
+                            "source": "suggested",
+                            "status": "need_review",
+                            "geometry": {
+                                "x": round(gx / page_w, 4),
+                                "y": round(gy / page_h, 4),
+                                "raw_x": round(gx / page_w, 4),
+                                "raw_y": round(gx / page_h, 4),
+                                "snap_offset_ft": 0.0,
+                                "grid_ref": grid_ref,
+                                "symbol": "I",
+                                "depth_in": 10.0,
+                                "error_flags": ["missing"],
+                            },
+                            "w": 0.018, "h": 0.018,
+                            "color": MEMBER_COLORS["column"], "confirmed": False,
+                            "is_column": True, "size_unknown": True,
+                        })
 
     print(f"[COLUMNS] emitted {len(added)} symbol columns "
           f"(rejected {rejected} fp — < {MIN_BEAMS} beam endpoints; "
@@ -4264,6 +4418,12 @@ def extract_col_text_columns(page, page_w, page_h, members,
                for ex, ey in existing + added):
             continue
 
+        # Grid index naming for text-placed columns
+        v_idx = sorted(v_grid).index(gx) + 1 if v_grid and 'gx' in locals() and gx in v_grid else "?"
+        h_idx = sorted(h_grid).index(gy) + 1 if h_grid and 'gy' in locals() and gy in h_grid else "?"
+        grid_ref = f"{v_idx}-{h_idx}" if (v_idx != "?" or h_idx != "?") else None
+        pts_pf = (72.0 / max(scale_ratio, 1)) * 12.0
+
         added.append((px, py))
         members.append({
             "profile": "COL", "type": "column", "length_ft": 0.0,
@@ -4281,6 +4441,17 @@ def extract_col_text_columns(page, page_w, page_h, members,
             "color": MEMBER_COLORS["column"], "confirmed": True,
             "is_column": True, "size_unknown": True,
             "source": "col_text_convergence",
+            "geometry": {
+                "x": round(px / page_w, 4),
+                "y": round(py / page_h, 4),
+                "raw_x": round(raw_x / page_w, 4),
+                "raw_y": round(raw_y / page_h, 4),
+                "snap_offset_ft": round(math.hypot(px - raw_x, py - raw_y) / pts_pf, 2) if pts_pf > 0 else 0.0,
+                "grid_ref": grid_ref,
+                "symbol": "I",
+                "depth_in": 12.0,
+                "error_flags": [],
+            }
         })
 
     if added:
@@ -5000,9 +5171,38 @@ async def analyse_pdf(req: AnalysisRequest):
         # 1. Plan boundary — excludes schedules, notes, title block
         plan_bounds = find_plan_boundary(page, page_w, page_h, text_dict=text_dict)
 
-        # 2. Detect column symbols (I/H shapes in vector paths) — skip for raster
-        column_symbols = [] if is_raster else detect_column_symbols(
-            page, scale_ratio=req.scale_ratio or 96)
+        # 2. Detect column symbols (I/H shapes in vector paths) — fallback to CV for raster
+        if is_raster:
+            column_symbols = []
+            try:
+                import cv2
+                from detection_cv import detect_column_symbols as detect_raster_cols
+                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+                cv_img = cv2.cvtColor(img_data, cv2.COLOR_RGB2BGR)
+                raw_cv_cols = detect_raster_cols(cv_img)
+                img_h, img_w = cv_img.shape[:2]
+                scale_x = page_w / img_w
+                scale_y = page_h / img_h
+                for rc in raw_cv_cols:
+                    cx_pix = rc["x"] + rc["w"] / 2
+                    cy_pix = rc["y"] + rc["h"] / 2
+                    cx_pt = cx_pix * scale_x
+                    cy_pt = cy_pix * scale_y
+                    w_pt = rc["w"] * scale_x
+                    depth_in = w_pt * (req.scale_ratio or 96) / 72.0
+                    
+                    column_symbols.append({
+                        "cx": cx_pt,
+                        "cy": cy_pt,
+                        "rotation": rc.get("angle", 0),
+                        "symbol": "BOX" if rc.get("score", 0.0) < 0.6 else "I",
+                        "depth_in": depth_in
+                    })
+            except Exception as e:
+                print(f"[ANALYSE] Raster column CV detection failed: {e}")
+        else:
+            column_symbols = detect_column_symbols(page, scale_ratio=req.scale_ratio or 96)
 
         # 3. Grid lines — SECONDARY signal
         v_grid, h_grid = extract_grid_lines(page, page_w, page_h, plan_bounds,
@@ -5236,7 +5436,8 @@ async def analyse_pdf(req: AnalysisRequest):
         # intersection (framing-plan columns have no size label of their own).
         _col_scale = req.scale_ratio or 96
         members = emit_symbol_columns(members, column_symbols, v_grid, h_grid,
-                                      page_w, page_h, scale_ratio=_col_scale)
+                                      page_w, page_h, scale_ratio=_col_scale,
+                                      pts_per_foot=pts_per_foot, profiles=profiles)
         # COL text label columns — placed at beam convergence, not at label text.
         members = extract_col_text_columns(page, page_w, page_h, members,
                                            v_grid=v_grid, h_grid=h_grid,

@@ -63,6 +63,17 @@ export function useMembers(pageId: string | null) {
     },
   })
 
+  // Mutation: Validate page columns
+  const validateColumnsMutation = useMutation({
+    mutationFn: () => {
+      if (!pageId) throw new Error('No active page')
+      return membersApi.validateColumns(pageId)
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['members', pageId] })
+    },
+  })
+
   return {
     members,
     isLoading,
@@ -73,6 +84,7 @@ export function useMembers(pageId: string | null) {
     bulkUpdateMembers: bulkUpdateMutation.mutateAsync,
     bulkDeleteMembers: bulkDeleteMutation.mutateAsync,
     analysePage: analyseMutation.mutateAsync,
+    validateColumns: validateColumnsMutation.mutateAsync,
     isAnalysing: analyseMutation.isPending,
   }
 }

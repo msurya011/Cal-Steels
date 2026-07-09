@@ -139,6 +139,20 @@ async def bulk_delete_members(body: MemberBulkDelete, user: AuthUser):
     db.table("members").delete().in_("id", ids).execute()
 
 
+@router.post("/pages/{page_id}/columns/validate", status_code=status.HTTP_200_OK)
+async def validate_page_columns(page_id: UUID, user: AuthUser):
+    """
+    Re-evaluate column validation rules (grid snapping, orphan checking) on demand.
+    This is triggered by the frontend after a manual column drag-and-drop.
+    """
+    db = get_db()
+    # In a full implementation, we would query all grid lines and columns for the page,
+    # recompute intersections, and update the error_flags in the geometry JSON.
+    # For now, we return 200 OK to acknowledge the frontend update.
+    return {"status": "ok"}
+
+
+
 @router.post("/pages/{page_id}/analyse", status_code=status.HTTP_202_ACCEPTED)
 async def analyse_page(
     page_id: UUID,
@@ -184,3 +198,124 @@ async def analyse_page(
     )
 
     return {"job_id": job_id}
+
+
+@router.post("/pages/{page_id}/columns/validate")
+async def validate_page_columns(
+    page_id: UUID,
+    user: AuthUser,
+):
+    """Re-run column validation scoring and update status/error flags in DB."""
+    import math
+    db = get_db()
+    
+    # 1. Fetch all members on the page
+    res = db.table("members").select("*").eq("page_id", str(page_id)).execute()
+    if not res.data:
+        return {"updated": 0}
+    
+    members = res.data
+    columns = [m for m in members if m.get("type") == "column"]
+    beams = [m for m in members if m.get("type") == "beam"]
+    
+    # Derive idealized grids from column locations
+    v_xs = [m.get("x") for m in columns if m.get("x") is not None]
+    h_ys = [m.get("y") for m in columns if m.get("y") is not None]
+    
+    def _cluster(vals, tol=0.015):
+        out = []
+        for v in sorted(vals):
+            if not out or v - out[-1] > tol:
+                out.append(v)
+        return out
+    
+    v_grid = _cluster(v_xs)
+    h_grid = _cluster(h_ys)
+    
+    # Collect beam endpoints
+    beam_ends = []
+    for m in beams:
+        geom = m.get("geometry") or {}
+        bx1 = geom.get("bx1") or m.get("bx1")
+        by1 = geom.get("by1") or m.get("by1")
+        bx2 = geom.get("bx2") or m.get("bx2")
+        by2 = geom.get("by2") or m.get("by2")
+        if bx1 is not None and by1 is not None:
+            beam_ends.append((bx1, by1))
+        if bx2 is not None and by2 is not None:
+            beam_ends.append((bx2, by2))
+            
+    updated_count = 0
+    
+    for col in columns:
+        cx, cy = col.get("x"), col.get("y")
+        if cx is None or cy is None:
+            continue
+        geom = col.get("geometry") or {}
+        raw_x = geom.get("raw_x", cx)
+        raw_y = geom.get("raw_y", cy)
+        
+        # Grid snaps
+        off_grid = True
+        gx, gy = None, None
+        if v_grid:
+            gx = min(v_grid, key=lambda g: abs(cx - g))
+            if abs(cx - gx) <= 0.015:
+                off_grid = False
+        if h_grid:
+            gy = min(h_grid, key=lambda g: abs(cy - g))
+            if abs(cy - gy) <= 0.015:
+                off_grid = False
+                
+        # Beam support
+        close_ends = [(ex, ey) for ex, ey in beam_ends if math.hypot(cx - ex, cy - ey) < 0.025]
+        unique_ends = []
+        for (ex, ey) in close_ends:
+            if not any(math.hypot(ex - ux, ey - uy) < 0.005 for ux, uy in unique_ends):
+                unique_ends.append((ex, ey))
+                
+        has_label_match = col.get("profile") not in ("COL", "", None)
+        
+        score = 0.0
+        if has_label_match:
+            score += 0.40
+        if not off_grid:
+            score += 0.30
+        if len(unique_ends) >= 2:
+            score += 0.20
+        if geom.get("symbol") in ("I", "BOX", "PIPE"):
+            score += 0.10
+            
+        status = 'active' if score >= 0.75 else 'need_review'
+        
+        error_flags = []
+        if off_grid:
+            error_flags.append("no_grid")
+        if not has_label_match:
+            error_flags.append("no_label")
+        if len(unique_ends) < 2:
+            error_flags.append("orphan")
+            
+        v_idx = sorted(v_grid).index(gx) + 1 if v_grid and gx is not None and gx in v_grid else "?"
+        h_idx = sorted(h_grid).index(gy) + 1 if h_grid and gy is not None and gy in h_grid else "?"
+        grid_ref = f"{v_idx}-{h_idx}" if (v_idx != "?" or h_idx != "?") else None
+
+        new_geom = {
+            **geom,
+            "x": cx,
+            "y": cy,
+            "raw_x": raw_x,
+            "raw_y": raw_y,
+            "off_grid": off_grid,
+            "error_flags": error_flags,
+            "grid_ref": grid_ref,
+        }
+        
+        db.table("members").update({
+            "status": status,
+            "geometry": new_geom
+        }).eq("id", col["id"]).execute()
+        updated_count += 1
+        
+    return {"updated": updated_count}
+

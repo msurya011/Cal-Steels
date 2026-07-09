@@ -156,6 +156,10 @@ export const membersApi = {
       method: 'POST',
       body: JSON.stringify(options),
     }),
+  validateColumns: (pageId: string) =>
+    apiFetch(`/api/v1/pages/${pageId}/columns/validate`, {
+      method: 'POST',
+    }),
 }
 
 // ── BOM API ──────────────────────────────────────────────────────────────────
