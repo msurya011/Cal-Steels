@@ -62,6 +62,7 @@ class MemberUpdate(BaseModel):
     grade: Optional[str] = None
     rotation: Optional[float] = None
     status: Optional[str] = None
+    piecemark: Optional[str] = None
     geometry: Optional[Dict[str, Any]] = None
     length_ft: Optional[float] = None
 

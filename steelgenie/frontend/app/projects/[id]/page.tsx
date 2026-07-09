@@ -828,6 +828,7 @@ export default function TakeoffWorkspacePage() {
           onBulkUpdate={handlePropertiesBulkUpdate}
           onBulkDelete={handleBulkDelete}
           onClose={clearSelection}
+          pageTos={activePage?.tos_ft || 12.0}
         />
       ) : (
         <SheetSummary members={members} />

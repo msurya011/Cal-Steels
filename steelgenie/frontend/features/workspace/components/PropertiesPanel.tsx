@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Trash2, Check, AlertTriangle, Layers } from 'lucide-react'
+import { Trash2, Check, AlertTriangle, Layers, Copy, RotateCcw, RotateCw } from 'lucide-react'
 import { sectionsApi } from '../../../lib/api'
 import { toast } from 'sonner'
 
@@ -13,6 +13,7 @@ interface Member {
   geometry: any
   confidence?: number | null
   status?: string
+  piecemark?: string | null
 }
 
 interface PropertiesPanelProps {
@@ -23,6 +24,40 @@ interface PropertiesPanelProps {
   onBulkUpdate: (ids: string[], data: any) => Promise<void>
   onBulkDelete: (ids: string[]) => Promise<void>
   onClose: () => void
+  pageTos: number
+}
+
+// Helper to format decimal feet values into standard Ft'-In Fraction"
+function formatFtIn(ftVal: number | null | undefined): string {
+  if (ftVal === null || ftVal === undefined) return 'Not set'
+  const totalInches = ftVal * 12
+  const feet = Math.floor(ftVal)
+  const inchesDecimal = totalInches % 12
+  const inches = Math.floor(inchesDecimal)
+  const fracDecimal = inchesDecimal - inches
+  
+  // Convert fraction decimal to nearest 1/16, 1/8, 1/4, 1/2
+  const sixteenths = Math.round(fracDecimal * 16)
+  if (sixteenths === 0) {
+    return `${feet}'-${inches}"`
+  }
+  if (sixteenths === 16) {
+    const nextInches = inches + 1
+    if (nextInches === 12) {
+      return `${feet + 1}'-0"`
+    }
+    return `${feet}'-${nextInches}"`
+  }
+  
+  // Reduce fraction
+  let num = sixteenths
+  let den = 16
+  while (num % 2 === 0 && den % 2 === 0) {
+    num /= 2
+    den /= 2
+  }
+  
+  return `${feet}'-${inches} ${num}/${den}"`
 }
 
 export function PropertiesPanel({
@@ -33,10 +68,14 @@ export function PropertiesPanel({
   onBulkUpdate,
   onBulkDelete,
   onClose,
+  pageTos,
 }: PropertiesPanelProps) {
   const selectedMembers = members.filter((m) => selection.has(m.id))
   const isMulti = selectedMembers.length > 1
   const member = selectedMembers.length === 1 ? selectedMembers[0] : null
+
+  // Tab state
+  const [activeTab, setActiveTab] = useState<'summary' | 'member'>('member')
 
   // Single-select states
   const [kind, setKind] = useState('beam')
@@ -44,6 +83,16 @@ export function PropertiesPanel({
   const [length, setLength] = useState('')
   const [grade, setGrade] = useState('A992')
   const [status, setStatus] = useState('active')
+  const [rotation, setRotation] = useState(90)
+  const [piecemark, setPiecemark] = useState('')
+  
+  // Extra geometry states matching the screenshot
+  const [copes, setCopes] = useState(0)
+  const [camber, setCamber] = useState('')
+  const [studs, setStuds] = useState(0)
+  const [pourStop, setPourStop] = useState(false)
+  const [leftEnd, setLeftEnd] = useState('')
+  const [rightEnd, setRightEnd] = useState('')
 
   // Multi-select bulk states
   const [bulkKind, setBulkKind] = useState('')
@@ -67,8 +116,20 @@ export function PropertiesPanel({
       setLength(member.length_ft !== null ? member.length_ft.toString() : '')
       setGrade(member.grade || 'A992')
       setStatus(member.status || 'active')
+      setRotation(member.rotation !== undefined ? member.rotation : 90)
+      setPiecemark(member.piecemark || '')
+      
+      const geo = member.geometry || {}
+      setCopes(geo.copes || 0)
+      setCamber(geo.camber || '')
+      setStuds(geo.studs || 0)
+      setPourStop(!!geo.pour_stop)
+      setLeftEnd(geo.left_end || '')
+      setRightEnd(geo.right_end || '')
+      
       setSuggestions([])
       setShowSuggestions(false)
+      setActiveTab('member') // Auto switch to member tab on select
     } else if (isMulti) {
       // Clear bulk states
       setBulkKind('')
@@ -78,6 +139,7 @@ export function PropertiesPanel({
       setBulkStatus('')
       setSuggestions([])
       setShowSuggestions(false)
+      setActiveTab('member')
     }
   }, [member, isMulti])
 
@@ -117,8 +179,8 @@ export function PropertiesPanel({
     return (
       <div
         style={{
-          width: '280px',
-          backgroundColor: '#111827',
+          width: '320px',
+          backgroundColor: '#0F172A',
           borderLeft: '1px solid rgba(59, 130, 246, 0.1)',
           padding: '24px',
           display: 'flex',
@@ -143,14 +205,25 @@ export function PropertiesPanel({
     if (!member) return
     setSaving(true)
     try {
+      const geoUpdate = {
+        ...(member.geometry || {}),
+        copes,
+        camber,
+        studs,
+        pour_stop: pourStop,
+        left_end: leftEnd || formatFtIn(pageTos),
+        right_end: rightEnd || formatFtIn(pageTos),
+      }
       await onUpdate(member.id, {
         kind,
         section: section || null,
         grade: grade || null,
         length_ft: length ? parseFloat(length) : null,
         status,
+        rotation,
+        piecemark: piecemark || null,
+        geometry: geoUpdate,
       })
-      onClose()
     } catch {
       // error toast handled in parent
     } finally {
@@ -206,11 +279,16 @@ export function PropertiesPanel({
     }
   }
 
+  // Summary logic for selected members count
+  const beamCount = members.filter(m => m.kind === 'beam').length
+  const columnCount = members.filter(m => m.kind === 'column').length
+  const braceCount = members.filter(m => m.kind === 'vbrace' || m.kind === 'hbrace' || m.kind === 'brace').length
+
   return (
     <div
       style={{
-        width: '280px',
-        backgroundColor: '#111827',
+        width: '320px',
+        backgroundColor: '#0F172A',
         borderLeft: '1px solid rgba(59, 130, 246, 0.1)',
         display: 'flex',
         flexDirection: 'column',
@@ -219,7 +297,7 @@ export function PropertiesPanel({
         flexShrink: 0,
       }}
     >
-      {/* Header */}
+      {/* Header with Title and close button */}
       <div
         style={{
           padding: '16px',
@@ -229,18 +307,81 @@ export function PropertiesPanel({
           alignItems: 'center',
         }}
       >
-        <span style={{ fontSize: '14px', fontWeight: 700, color: '#F1F5F9' }}>
-          {isMulti ? `Bulk Edit (${selection.size})` : 'Properties'}
-        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '15px', fontWeight: 700, color: '#F1F5F9' }}>
+            {isMulti ? `Bulk Edit (${selection.size})` : 'Properties'}
+          </span>
+        </div>
         <button
           onClick={onClose}
-          style={{ background: 'none', border: 'none', color: '#64748B', cursor: 'pointer', fontSize: '18px' }}
+          style={{ background: 'none', border: 'none', color: '#64748B', cursor: 'pointer', fontSize: '20px' }}
         >
           &times;
         </button>
       </div>
 
-      {isMulti ? (
+      {/* Tabs bar: Summary vs Member */}
+      <div style={{ padding: '12px 16px', borderBottom: '1px solid rgba(59, 130, 246, 0.05)' }}>
+        <div style={{ display: 'flex', backgroundColor: '#1E293B', borderRadius: '8px', padding: '3px' }}>
+          <button
+            onClick={() => setActiveTab('summary')}
+            style={{
+              flex: 1,
+              padding: '6px',
+              borderRadius: '6px',
+              border: 'none',
+              backgroundColor: activeTab === 'summary' ? '#2563EB' : 'transparent',
+              color: activeTab === 'summary' ? '#FFFFFF' : '#94A3B8',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+              transition: 'all 0.2s',
+            }}
+          >
+            Summary
+          </button>
+          <button
+            onClick={() => setActiveTab('member')}
+            style={{
+              flex: 1,
+              padding: '6px',
+              borderRadius: '6px',
+              border: 'none',
+              backgroundColor: activeTab === 'member' ? '#2563EB' : 'transparent',
+              color: activeTab === 'member' ? '#FFFFFF' : '#94A3B8',
+              fontWeight: 600,
+              fontSize: '12px',
+              cursor: 'pointer',
+              transition: 'all 0.2s',
+            }}
+          >
+            Member
+          </button>
+        </div>
+      </div>
+
+      {activeTab === 'summary' ? (
+        // ── SUMMARY TAB ──────────────────────────────────────────────────────
+        <div style={{ flex: 1, overflowY: 'auto', padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px', color: '#F1F5F9' }}>
+          <span style={{ fontSize: '13px', fontWeight: 600, color: '#94A3B8', borderBottom: '1px solid rgba(255, 255, 255, 0.05)', paddingBottom: '6px' }}>
+            Page Statistics
+          </span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+              <span>Total Beams:</span>
+              <span style={{ fontWeight: 700, color: '#3B82F6' }}>{beamCount}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+              <span>Total Columns:</span>
+              <span style={{ fontWeight: 700, color: '#10B981' }}>{columnCount}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+              <span>Total Braces:</span>
+              <span style={{ fontWeight: 700, color: '#F59E0B' }}>{braceCount}</span>
+            </div>
+          </div>
+        </div>
+      ) : isMulti ? (
         // ── MULTI SELECTION BULK EDIT FORM ───────────────────────────────────
         <>
           <div style={{ flex: 1, overflowY: 'auto', padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -275,7 +416,7 @@ export function PropertiesPanel({
               </select>
             </div>
 
-            {/* Section Autocomplete */}
+            {/* Section Size */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', position: 'relative' }} ref={dropdownRef}>
               <label style={{ fontSize: '10px', fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
                 Section Size
@@ -358,7 +499,7 @@ export function PropertiesPanel({
               />
             </div>
 
-            {/* Grade */}
+            {/* Steel Grade */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
               <label style={{ fontSize: '10px', fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
                 Steel Grade
@@ -453,35 +594,163 @@ export function PropertiesPanel({
       ) : (
         // ── SINGLE SELECTION PROPERTIES FORM ──────────────────────────────────
         <>
-          <div style={{ flex: 1, overflowY: 'auto', padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            {/* Low AI Confidence warning */}
-            {member && member.confidence !== undefined && member.confidence !== null && member.confidence < 0.70 && (
-              <div
-                style={{
-                  padding: '10px 12px',
-                  backgroundColor: 'rgba(245, 158, 11, 0.1)',
-                  border: '1px solid rgba(245, 158, 11, 0.25)',
-                  borderRadius: '6px',
-                  color: '#F59E0B',
-                  fontSize: '11px',
-                  lineHeight: '1.4',
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  gap: '8px',
-                }}
-              >
-                <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: '1px' }} />
-                <span>
-                  <strong>Low AI Confidence ({Math.round(member.confidence * 100)}%)</strong> — Please check and confirm the correct section size and length on the sheet drawing.
-                </span>
-              </div>
-            )}
+          <div style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            
+            {/* Accordion header */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: '#94A3B8', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', borderBottom: '1px solid rgba(255, 255, 255, 0.05)', paddingBottom: '6px' }}>
+              <span>Member Properties</span>
+              <span style={{ fontSize: '10px' }}>▼</span>
+            </div>
 
-            {/* Type select */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-              <label style={{ fontSize: '10px', fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
-                Member Type
-              </label>
+            {/* Properties subheader */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontSize: '13px', fontWeight: 600, color: '#F1F5F9' }}>Properties</span>
+              <a href="#" style={{ fontSize: '11px', color: '#F59E0B', textDecoration: 'none' }}>More...</a>
+            </div>
+
+            {/* Linear Copy Button */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(30, 41, 59, 0.4)', padding: '8px 12px', borderRadius: '6px', border: '1px solid rgba(59, 130, 246, 0.05)' }}>
+              <span style={{ fontSize: '13px', color: '#94A3B8' }}>Linear Copy</span>
+              <Copy size={15} style={{ cursor: 'pointer', color: '#3B82F6' }} onClick={() => toast.info("Linear copy action triggered")} />
+            </div>
+
+            {/* Rotation toggle and input */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Rotation</label>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <input
+                  type="number"
+                  value={rotation}
+                  onChange={(e) => setRotation(parseInt(e.target.value) || 0)}
+                  style={{
+                    flex: 1,
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                    border: '1px solid rgba(59, 130, 246, 0.15)',
+                    borderRadius: '6px',
+                    color: '#F1F5F9',
+                    fontSize: '13px',
+                    outline: 'none',
+                  }}
+                />
+                <button
+                  onClick={() => setRotation((r) => (r - 90 + 360) % 360)}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                    border: '1px solid rgba(59, 130, 246, 0.15)',
+                    borderRadius: '6px',
+                    color: '#F1F5F9',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                  }}
+                >
+                  <RotateCcw size={14} />
+                </button>
+                <button
+                  onClick={() => setRotation((r) => (r + 90) % 360)}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                    border: '1px solid rgba(59, 130, 246, 0.15)',
+                    borderRadius: '6px',
+                    color: '#F1F5F9',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                  }}
+                >
+                  <RotateCw size={14} />
+                </button>
+              </div>
+            </div>
+
+            {/* Piecemark & Copes Row */}
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Piecemark</label>
+                <input
+                  value={piecemark}
+                  onChange={(e) => setPiecemark(e.target.value)}
+                  placeholder="B_76"
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                    border: '1px solid rgba(59, 130, 246, 0.15)',
+                    borderRadius: '6px',
+                    color: '#F1F5F9',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Copes</label>
+                <input
+                  type="number"
+                  value={copes}
+                  onChange={(e) => setCopes(parseInt(e.target.value) || 0)}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                    border: '1px solid rgba(59, 130, 246, 0.15)',
+                    borderRadius: '6px',
+                    color: '#F1F5F9',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Length p-p & Length f-f Row */}
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Length <sub>p-p</sub></label>
+                <input
+                  readOnly
+                  value={formatFtIn(length ? parseFloat(length) : null)}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(15, 23, 42, 0.6)',
+                    border: '1px solid rgba(255, 255, 255, 0.05)',
+                    borderRadius: '6px',
+                    color: '#94A3B8',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Length <sub>f-f</sub></label>
+                <input
+                  readOnly
+                  value={formatFtIn(length ? parseFloat(length) - 0.75 : null)} // default face-to-face offset is 3/4" (9 in)
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(15, 23, 42, 0.6)',
+                    border: '1px solid rgba(255, 255, 255, 0.05)',
+                    borderRadius: '6px',
+                    color: '#94A3B8',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Member Type select */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Member Type</label>
               <select
                 value={kind}
                 onChange={(e) => setKind(e.target.value)}
@@ -503,10 +772,10 @@ export function PropertiesPanel({
               </select>
             </div>
 
-            {/* Section Profile input */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', position: 'relative' }} ref={dropdownRef}>
-              <label style={{ fontSize: '10px', fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
-                Section Size
+            {/* Section Size Autocomplete */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', position: 'relative' }} ref={dropdownRef}>
+              <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>
+                Section Size {!section && <AlertTriangle size={12} style={{ display: 'inline', color: '#EF4444', marginLeft: '4px' }} />}
               </label>
               <input
                 value={section}
@@ -516,17 +785,22 @@ export function PropertiesPanel({
                     handleSectionChange(section, false)
                   }
                 }}
-                placeholder="e.g. W12X26"
+                placeholder="Select section size"
                 style={{
                   padding: '8px 10px',
                   backgroundColor: 'rgba(30, 41, 59, 0.8)',
-                  border: '1px solid rgba(59, 130, 246, 0.15)',
+                  border: section ? '1px solid rgba(59, 130, 246, 0.15)' : '1px solid #EF4444',
                   borderRadius: '6px',
                   color: '#F1F5F9',
                   fontSize: '13px',
                   outline: 'none',
                 }}
               />
+              {!section && (
+                <span style={{ fontSize: '11px', color: '#F59E0B', marginTop: '2px', fontWeight: 600 }}>
+                  {kind[0].toUpperCase() + kind.slice(1)} section size is empty
+                </span>
+              )}
               {showSuggestions && suggestions.length > 0 && (
                 <div
                   style={{
@@ -572,54 +846,9 @@ export function PropertiesPanel({
               )}
             </div>
 
-            {/* Length input */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-              <label style={{ fontSize: '10px', fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
-                Length (ft)
-              </label>
-              <input
-                type="number"
-                step="0.01"
-                value={length}
-                onChange={(e) => setLength(e.target.value)}
-                placeholder="Not set"
-                style={{
-                  padding: '8px 10px',
-                  backgroundColor: 'rgba(30, 41, 59, 0.8)',
-                  border: '1px solid rgba(59, 130, 246, 0.15)',
-                  borderRadius: '6px',
-                  color: '#F1F5F9',
-                  fontSize: '13px',
-                  outline: 'none',
-                }}
-              />
-            </div>
-
-            {/* Grade input */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-              <label style={{ fontSize: '10px', fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
-                Steel Grade
-              </label>
-              <input
-                value={grade}
-                onChange={(e) => setGrade(e.target.value)}
-                style={{
-                  padding: '8px 10px',
-                  backgroundColor: 'rgba(30, 41, 59, 0.8)',
-                  border: '1px solid rgba(59, 130, 246, 0.15)',
-                  borderRadius: '6px',
-                  color: '#F1F5F9',
-                  fontSize: '13px',
-                  outline: 'none',
-                }}
-              />
-            </div>
-
-            {/* Status Select */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-              <label style={{ fontSize: '10px', fontWeight: 600, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
-                Verification Status
-              </label>
+            {/* Verification Status */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Status</label>
               <select
                 value={status}
                 onChange={(e) => setStatus(e.target.value)}
@@ -633,39 +862,130 @@ export function PropertiesPanel({
                   outline: 'none',
                 }}
               >
-                <option value="active">Active (Pending Review)</option>
+                <option value="active">Not Started</option>
                 <option value="need_review">Need Review</option>
                 <option value="verified">Verified</option>
                 <option value="rejected">Rejected</option>
-                <option value="excluded">Excluded</option>
               </select>
             </div>
+
+            {/* Camber & Studs Row */}
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Camber</label>
+                <input
+                  value={camber}
+                  onChange={(e) => setCamber(e.target.value)}
+                  placeholder="Enter camber"
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                    border: '1px solid rgba(59, 130, 246, 0.15)',
+                    borderRadius: '6px',
+                    color: '#F1F5F9',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Studs</label>
+                <input
+                  type="number"
+                  value={studs}
+                  onChange={(e) => setStuds(parseInt(e.target.value) || 0)}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(30, 41, 59, 0.8)',
+                    border: '1px solid rgba(59, 130, 246, 0.15)',
+                    borderRadius: '6px',
+                    color: '#F1F5F9',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Left End & Right End Elevations Row */}
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Left End</label>
+                  <span style={{ fontSize: '11px', cursor: 'pointer' }}>🔒</span>
+                </div>
+                <input
+                  readOnly
+                  value={leftEnd || formatFtIn(pageTos)}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(15, 23, 42, 0.6)',
+                    border: '1px solid rgba(255, 255, 255, 0.05)',
+                    borderRadius: '6px',
+                    color: '#94A3B8',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Right End</label>
+                  <span style={{ fontSize: '11px', cursor: 'pointer' }}>🔒</span>
+                </div>
+                <input
+                  readOnly
+                  value={rightEnd || formatFtIn(pageTos)}
+                  style={{
+                    padding: '8px 10px',
+                    backgroundColor: 'rgba(15, 23, 42, 0.6)',
+                    border: '1px solid rgba(255, 255, 255, 0.05)',
+                    borderRadius: '6px',
+                    color: '#94A3B8',
+                    fontSize: '13px',
+                    outline: 'none',
+                    width: '100%',
+                    boxSizing: 'border-box',
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Pour Stop checkbox */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '4px' }}>
+              <input
+                type="checkbox"
+                id="pourStop"
+                checked={pourStop}
+                onChange={(e) => setPourStop(e.target.checked)}
+                style={{ cursor: 'pointer', width: '15px', height: '15px' }}
+              />
+              <label htmlFor="pourStop" style={{ fontSize: '12px', color: '#F1F5F9', cursor: 'pointer', fontWeight: 600 }}>
+                Pour Stop
+              </label>
+            </div>
+
+            {/* Connections sub-accordion */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', backgroundColor: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '6px', cursor: 'pointer', marginTop: '4px' }}>
+              <span style={{ fontSize: '12px', fontWeight: 600, color: '#F1F5F9' }}>Connections</span>
+              <span style={{ color: '#94A3B8', fontSize: '10px' }}>&gt;</span>
+            </div>
+
           </div>
 
           {/* Action panel footer */}
-          <div style={{ padding: '16px', borderTop: '1px solid rgba(59, 130, 246, 0.08)', display: 'flex', gap: '8px' }}>
-            <button
-              onClick={handleSingleDelete}
-              style={{
-                padding: '10px',
-                backgroundColor: 'transparent',
-                border: '1px solid rgba(239, 68, 68, 0.25)',
-                borderRadius: '6px',
-                color: '#EF4444',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <Trash2 size={16} />
-            </button>
-
+          <div style={{ padding: '16px', borderTop: '1px solid rgba(59, 130, 246, 0.08)', display: 'flex', flexDirection: 'column', gap: '10px' }}>
             <button
               onClick={handleSingleSave}
               disabled={saving}
               style={{
-                flex: 1,
+                width: '100%',
                 padding: '10px',
                 backgroundColor: '#3B82F6',
                 border: 'none',
@@ -674,14 +994,30 @@ export function PropertiesPanel({
                 fontWeight: 600,
                 fontSize: '13px',
                 cursor: 'pointer',
+              }}
+            >
+              {saving ? 'Saving...' : 'Save properties'}
+            </button>
+            <button
+              onClick={handleSingleDelete}
+              style={{
+                width: '100%',
+                padding: '10px',
+                backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                border: '1px solid rgba(239, 68, 68, 0.25)',
+                borderRadius: '6px',
+                color: '#EF4444',
+                fontWeight: 600,
+                fontSize: '13px',
+                cursor: 'pointer',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: '6px',
+                gap: '8px',
               }}
             >
-              <Check size={14} />
-              {saving ? 'Saving...' : 'Save'}
+              <Trash2 size={15} />
+              Delete
             </button>
           </div>
         </>
