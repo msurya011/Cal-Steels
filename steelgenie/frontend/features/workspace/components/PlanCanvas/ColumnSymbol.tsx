@@ -189,7 +189,32 @@ export function ColumnSymbol({
           strokeWidth={1.5}
           strokeDasharray="2,2"
         />
-      )}{/* Steel symbol with precise rotation */}
+      )}
+
+      {/* Validation Overlay: Snap Vector Line from Raw to Snapped */}
+      {layers.aids.columnProjections !== false && geo.raw_x !== undefined && geo.raw_y !== undefined && (Math.abs(geo.raw_x - geo.x) > 0.0001 || Math.abs(geo.raw_y - geo.y) > 0.0001) && (
+        <g style={{ pointerEvents: 'none' }}>
+          <line
+            x1={`${geo.raw_x * 100}%`}
+            y1={`${geo.raw_y * 100}%`}
+            x2={`${cx}%`}
+            y2={`${cy}%`}
+            stroke="#EF4444"
+            strokeWidth={1.2}
+            strokeDasharray="3,3"
+            opacity={0.8}
+          />
+          <circle
+            cx={`${geo.raw_x * 100}%`}
+            cy={`${geo.raw_y * 100}%`}
+            r={2}
+            fill="#EF4444"
+            opacity={0.8}
+          />
+        </g>
+      )}
+
+      {/* Steel symbol with precise rotation */}
       <g style={{ transformOrigin: 'center', transformBox: 'fill-box', transform: `rotate(${m.rotation || 0}deg)` }}>
         {symbol === 'BOX' ? (
           rectEl({ x: cx - s / 2, y: cy - s / 2, w: s, h: s }, 'box')
