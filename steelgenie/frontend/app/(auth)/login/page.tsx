@@ -20,18 +20,37 @@ export default function LoginPage() {
     setError(null)
     setSuccess(null)
     setLoading(true)
+
+    // Developer Offline Bypass Login ID
+    if (email === 'admin@calsteel.local' && password === 'adminpassword123') {
+      const mockSession = {
+        access_token: 'mock-dev-jwt-token',
+        user: {
+          id: '00000000-0000-0000-0000-000000000000',
+          email: 'admin@calsteel.local'
+        }
+      }
+      localStorage.setItem('dev_auth_session', JSON.stringify(mockSession))
+      setSuccess('Developer offline mode authenticated!')
+      setTimeout(() => {
+        router.push('/projects')
+      }, 500)
+      setLoading(false)
+      return
+    }
+
     try {
       if (tab === 'login') {
         const { error: err } = await supabase.auth.signInWithPassword({ email, password })
         if (err) throw err
-        router.push('/dashboard')
+        router.push('/projects')
       } else {
         const { error: err } = await supabase.auth.signUp({ email, password })
         if (err) throw err
         setSuccess('Account created! Signing you in…')
         const { error: err2 } = await supabase.auth.signInWithPassword({ email, password })
         if (err2) throw err2
-        router.push('/dashboard')
+        router.push('/projects')
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Something went wrong')

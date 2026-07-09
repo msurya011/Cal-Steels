@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "skills": {
+    "backend-architect": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/backend-architect/SKILL.md",
+      "computedHash": "bf1bf91a14af6a45a97393a358e7e3cd6b78b818bb881a441669a49d86801648"
+    },
+    "backend-security-coder": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/backend-security-coder/SKILL.md",
+      "computedHash": "1a3f0f299003a7ddda5ca19ac081baee21a2794469f8bf045a241b9786088b90"
+    },
+    "database-optimizer": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/database-optimizer/SKILL.md",
+      "computedHash": "db5304a3415e0790afa0048e44ab66b9cfe46573121829c3d17e35d5b8eed0cc"
+    },
+    "database-postgres": {
+      "source": "latitude-dev/latitude-llm",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/database-postgres/SKILL.md",
+      "computedHash": "3d8dd594d70d8f0a470bbfd0c804c5edf2d470567c8c54f49fc2f4a7e42b1f68"
+    },
+    "database-security": {
+      "source": "RedHatProductSecurity/prodsec-skills",
+      "sourceType": "github",
+      "skillPath": "module/skills/database-security/SKILL.md",
+      "computedHash": "3ba517427c34971cecbf030d9e302859273f37f929070582617ef8d190fd4b55"
+    },
+    "frontend-dev-guidelines": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "skillPath": "skills/frontend-dev-guidelines/SKILL.md",
+      "computedHash": "86c5e118e7c3aa0f4df5662f95898f197e1babb22f982aa2a34a1ee823f2bb98"
+    },
+    "frontend-security-coder-v3": {
+      "source": "diegosouzapw/awesome-omni-skills",
+      "sourceType": "github",
+      "skillPath": "skills/frontend-security-coder-v3/SKILL.md",
+      "computedHash": "774826e0241a5dd398ce367c1bc20e709bb91491ebbfc24b914602f541d1260c"
+    }
+  }
+}

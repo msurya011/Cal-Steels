@@ -1,0 +1,40 @@
+========================================================================
+  BRACE EXTRACTION VALIDATION SUMMARY
+========================================================================
+
+  Total candidates (HIGH+MEDIUM) : 1867
+  Pages with candidates          : 130
+
+  Breakdown by confidence:
+    HIGH   : 657
+    MEDIUM : 1210
+
+  Breakdown by page context:
+    braced_frame_elevation        : 97
+    framing_plan                  : 356
+    roof_plan                     : 399
+    foundation_plan               : 141
+    unknown                       : 874
+
+  CSV for annotation:
+    D:\Steel-ghost\steelgenie\backend\validation_candidates.csv
+
+  Overlay images:
+    D:\Steel-ghost\steelgenie\backend\validation_report
+
+  ANNOTATION INSTRUCTIONS
+  -----------------------
+  Open each PNG in validation_report/ alongside the CSV.
+  Find each candidate ID on the image.
+  Fill in the 'category' column with one of:
+
+    TP   — Real structural brace (true positive)
+    FP_J — Joist mistaken as brace
+    FP_H — Hatch geometry (fill pattern diagonal)
+    FP_R — Roof graphic / slope indicator
+    FP_O — Opening marker / stair framing diagonal
+    FP_A — Annotation geometry (north arrow, detail symbol)
+    FP_U — Unknown false positive
+
+  After annotation, run:  python _validation_score.py
+========================================================================

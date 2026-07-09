@@ -1,9 +1,11 @@
 """
 Brace Confidence Classifier — Universal Multi-Project Detector
 ---------------------------------------------------------------
-Classifies diagonal line candidates into HIGH / MEDIUM / REJECT with four
-layers of filtering:
+Classifies diagonal line candidates into HIGH / MEDIUM / REJECT with five
+layers of filtering, then enriches each accepted brace with structural metadata.
 
+DETECTION LAYERS
+----------------
   Layer 1 — Geometry
     HIGH      length 15–200 ft  AND  angle 20–70°  AND  not density-cluster
     MEDIUM    length  8–15 ft   AND  angle 20–70°  AND  not density-cluster
@@ -33,13 +35,34 @@ layers of filtering:
       schedule_legend        → HARD REJECT all candidates
       unknown                → no change
 
-Output
+  Layer 5 — Structural Node Connectivity  (roof_plan + braced_frame_elevation)
+    REJECT if neither endpoint lies within NODE_SNAP_PT of a structural node
+    (H/V beam intersection or structural label centroid).
+
+POST-CLASSIFICATION FILTERS
+----------------------------
+  annotation_xpair   — paired MEDIUM candidates forming a small mirror X
+                        (section marker / north arrow) smaller than XPAIR_MIN_BAY_FT
+  opening_annotation — candidate midpoint within OPENING_SNAP_PT of an OPENING
+                        text label (stairwell / shaft diagonal graphic)
+
+ENRICHMENT  (enrich_brace_results)
+-----------------------------------
+  config          : 'x_brace' | 'chevron' | 'single_diagonal'
+                    Determined by geometric pairing of accepted candidates in the
+                    same structural bay.
+  section_label   : nearest HSS / W-shape / angle / TS callout text, or None
+  role            : always 'lateral_unconfirmed' — estimator confirms seismic role
+                    (never auto-assign; per SteelGenie parity plan §5.3 Layer 3)
+  detection_method: 'rules' (vision_fallback wired in future Gemini integration)
+
+OUTPUT
 ------
   • Console table per PDF + per page
   • JSON: brace_classifier_results.json  (per-page counts + context labels)
   • Per-page PNG overlays: HIGH=green  MEDIUM=amber  REJECT=grey
 
-Usage
+USAGE
 -----
   python brace_classifier.py               # all PDFs in uploads/
   python brace_classifier.py --pages       # also print per-page detail
@@ -71,6 +94,71 @@ DEDUP_PT           = 15.0   # per-endpoint pt tolerance for second-pass proximit
 
 # Context hard-reject: pages of these types cannot contain structural braces
 HARD_REJECT_CONTEXTS = {"detail", "schedule_legend"}
+
+# ── Layer 5 — Structural Node Connectivity ────────────────────────────────────
+# A true structural brace must terminate at a structural node (beam/column
+# intersection).  Annotation symbols, slope arrows, and detail graphics have
+# no structural connection point at either end.
+#
+# NODE_SNAP_PT     : radius (pts) within which an endpoint is "on" a node
+# NODE_MIN_LINE_FT : minimum line length (structural feet) for a line to
+#                    contribute to the node grid.  This keeps primary structural
+#                    beams and removes sub-framing / joist connections whose
+#                    dense intersection matrix would make every diagonal look
+#                    connected.
+NODE_SNAP_PT      = 25.0   # pt radius
+NODE_MIN_LINE_FT  =  6.0   # structural feet — primary beam minimum span
+
+# Minimum structural bay span for a real X-brace (both axes).
+# An annotation X-pair (section marker, north arrow, detail callout) that forms
+# a small mirror crossing is rejected if its bounding box is smaller than this
+# in BOTH dimensions.  Real structural X-bracing always spans at least one full
+# structural bay — typically ≥ 15 ft.  8 ft is a very conservative lower bound.
+XPAIR_MIN_BAY_FT  =  8.0
+OPENING_SNAP_PT   = 150.0  # pt radius: diagonal inside an OPENING annotation is not a brace
+
+# Contexts where node connectivity is checked.
+# roof_plan only: false positive rate is highest here (slope arrows, joist web
+# patterns, hatch boundary diagonals) and real structural roof bracing is rare
+# and always clearly connected to the primary column/beam grid.
+# framing_plan / elevation / foundation_plan excluded: real brace endpoints
+# sometimes fall at beam stubs or column symbols that produce no H/V
+# intersection node, causing false negatives.  Separate per-context work needed.
+# Contexts where node connectivity is checked (Layer 5).
+# framing_plan uses a STRICT BOTH-endpoint check (both ends must be on nodes).
+# roof_plan / braced_frame_elevation use a lenient EITHER-endpoint check.
+# The distinction matters because on a framing plan the beam grid is so dense
+# that annotation diagonals often land near ONE node by accident — but a real
+# structural brace always connects TWO distinct structural points.
+NODE_CHECK_CONTEXTS      = {"roof_plan", "braced_frame_elevation", "framing_plan"}
+NODE_STRICT_BOTH_CONTEXTS = {"framing_plan"}   # require both endpoints on nodes
+
+_STRUCT_LABEL_RE = re.compile(
+    r'\b(COL\b|HSS\d|W\d{1,2}[Xx]|TS\d|MC\d|BF\s*[-–]\s*\d)',
+    re.I)
+_OPENING_REGION_RE = re.compile(r'\bOPENING\b', re.I)
+
+# ── Brace enrichment constants ────────────────────────────────────────────────
+# Maximum distance (pts) from brace midpoint to associate a section callout.
+SECTION_SNAP_PT   = 300.0
+# Endpoint proximity (pts) to decide two braces share a connection point
+# (chevron / K-brace).  Larger than NODE_SNAP_PT to account for imprecise
+# CAD endpoints near the convergence point.
+CHEVRON_SNAP_PT   =  60.0
+
+# Structural section callout patterns — HSS, W-shapes, angles, tube steel etc.
+# Matches the designation text label nearest each accepted brace.
+_SECTION_RE = re.compile(
+    r'\b(?:'
+    r'HSS\s*\d+(?:[xX×][\d/]+){1,3}'    # HSS12X8X3/8, HSS6X6X3/8
+    r'|W\s*\d{1,3}[xX×]\d+(?:\.\d+)?'   # W24X94, W16X26
+    r'|WT\s*[\d.]+[xX×][\d.]+'           # WT5X6.5
+    r'|2?L\s*\d+(?:[xX×][\d/]+){1,3}'   # L4X4X1/2, 2L5X5X3/8
+    r'|TS\s*\d+(?:[xX×][\d/]+){1,3}'    # TS4X4X3/16
+    r'|MC\s*[\d.]+[xX×][\d.]+'           # MC12X10.6
+    r')',
+    re.I
+)
 
 # ── PDFs to scan ──────────────────────────────────────────────────────────────
 SCAN_PDFS = [
@@ -352,9 +440,9 @@ def check_detail_scale(candidate: dict, scale_annotations: list,
 # (pattern, weight) pairs per context type
 _CTX_PATTERNS: dict[str, list] = {
     "braced_frame_elevation": [
-        (re.compile(r'BRACED\s+FRAME', re.I), 3),
+        (re.compile(r'BRACED\s+FRAME\s+ELEVATION', re.I), 3),  # must say ELEVATION
         (re.compile(r'BRAC(?:ED|ING)\s+(?:FRAME\s+)?ELEVATION', re.I), 3),
-        (re.compile(r'\bBF\s*[-–]\s*\d+\b', re.I), 2),
+        (re.compile(r'\bBF\s*[-–]\s*\d+\b', re.I), 1),         # reduced: plan refs use BF labels too
         (re.compile(r'BRACING\s+ELEVATION', re.I), 3),
         (re.compile(r'LATERAL\s+FRAME\s+ELEVATION', re.I), 3),
     ],
@@ -415,11 +503,27 @@ CONTEXT_MODIFIER = {
 
 def classify_page_context(page) -> tuple:
     """
-    Classify page type from the first ~3000 chars of page text.
+    Classify page type by scanning both the drawing body and the title block.
     Returns (context_type: str, score: int).
+
+    Drawing titles live in the title block (bottom ~15% of sheet) and are often
+    beyond a 3000-char body truncation.  We scan the bottom strip separately so
+    that 'LEVEL 2 FRAMING PLAN – AREA B' always outweighs stray BF-X callouts
+    that appear in the drawing body.
     """
     try:
-        text = page.get_text("text")[:3000]
+        r = page.rect
+        full_text  = page.get_text("text")
+        body_text  = full_text[:2500]
+        # PDF stream order often places title-block objects after the drawing body,
+        # so the title appears near the END of the extracted text regardless of its
+        # visual position on the sheet.  Scanning the tail catches "SECOND FLOOR
+        # FRAMING PLAN" and similar titles that body_text[:2500] misses.
+        tail_text  = full_text[-2000:] if len(full_text) > 4500 else ""
+        # Physical bottom-15 % clip for traditional bottom-right title blocks
+        title_clip = fitz.Rect(r.x0, r.y1 * 0.85, r.x1, r.y1)
+        clip_text  = page.get_text("text", clip=title_clip)
+        text = body_text + "\n" + tail_text + "\n" + clip_text
     except Exception:
         return "unknown", 0
 
@@ -429,18 +533,27 @@ def classify_page_context(page) -> tuple:
             if pat.search(text):
                 scores[ctx_type] += weight
 
+    # Deduct from braced_frame_elevation if there is strong plan-view evidence
+    if scores.get("framing_plan", 0) >= 2 or scores.get("roof_plan", 0) >= 2 or scores.get("foundation_plan", 0) >= 2:
+        scores["braced_frame_elevation"] -= 5
+
+    # Deduct from schedule_legend and detail if braced_frame_elevation is strong
+    if scores.get("braced_frame_elevation", 0) >= 3:
+        scores["schedule_legend"] -= 10
+        scores["detail"] -= 10
+
     if not scores:
         return "unknown", 0
 
     # ── Multi-frame brace schedule detection ─────────────────────────────────
-    # A placement drawing has at most 1-2 distinct BF-X labels (the frames drawn
-    # on that sheet).  A brace type schedule packs BF-1, BF-2, BF-3 … on one
-    # page to show all frame configurations.  3+ unique BF-X labels is an
-    # unambiguous signal: this is a reference schedule, not a placement drawing.
+    # A schedule page lists every BF-X type (BF-1, BF-2, BF-3 …) as its primary
+    # content.  A normal framing plan may also reference multiple BF-X callouts,
+    # so only fire schedule detection when framing_plan hasn't scored strongly
+    # (framing_plan score < 3 means no clear 'FRAMING PLAN' title was found).
     _BF_LABEL_RE = re.compile(r'BF\s*[-–]\s*\d+', re.I)
     unique_bf_labels = set(m.group().upper().replace(' ', '').replace('–', '-')
                            for m in _BF_LABEL_RE.finditer(text))
-    if len(unique_bf_labels) >= 3:
+    if len(unique_bf_labels) >= 3 and scores.get("framing_plan", 0) < 3 and scores.get("braced_frame_elevation", 0) < 3:
         return "schedule_legend", 99
 
     # Resolve ties: elevation > framing_plan > roof_plan > others
@@ -452,15 +565,278 @@ def classify_page_context(page) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CLASSIFY — combine all four layers
+#  LAYER 5 — Structural node connectivity
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_structural_nodes(page, ppf: float = 9.0) -> list:
+    """
+    Return (x, y, node_type) structural node candidates for the page.
+    node_type is 'hv' (H/V beam intersection) or 'label' (structural label centroid).
+
+    Source 1 — Grid intersections ('hv'):
+      Collect every near-horizontal (±10°) and near-vertical (±10°) line that
+      is at least NODE_MIN_LINE_FT long.  Compute pairwise intersections and
+      keep those that lie within NODE_SNAP_PT of both segments.
+      Using only LONG lines (primary structural members) prevents the dense
+      sub-framing / joist intersection matrix from creating spurious nodes.
+
+    Source 2 — Structural label centroids ('label'):
+      Text spans whose content matches COL, HSS, W-shape, BF-X, etc.
+      Used to anchor brace endpoints that fall at column symbols rather than
+      beam-beam crossings.
+    """
+    min_pt = NODE_MIN_LINE_FT * ppf       # minimum line length in page-points
+    h_segs: list = []
+    v_segs: list = []
+
+    try:
+        for d in page.get_drawings():
+            for item in d.get("items", []):
+                if item[0] != "l":
+                    continue
+                p1, p2 = item[1], item[2]
+                dx, dy = p2.x - p1.x, p2.y - p1.y
+                ln     = math.hypot(dx, dy)
+                if ln < min_pt:
+                    continue
+                ang   = abs(math.degrees(math.atan2(dy, dx))) % 180
+                ang_h = min(ang, 180 - ang)
+                if ang_h <= 10:
+                    h_segs.append((p1.x, p1.y, p2.x, p2.y))
+                elif ang_h >= 80:
+                    v_segs.append((p1.x, p1.y, p2.x, p2.y))
+    except Exception:
+        pass
+
+    nodes: list = []
+    snap = NODE_SNAP_PT
+
+    for (hx1, hy1, hx2, hy2) in h_segs:
+        for (vx1, vy1, vx2, vy2) in v_segs:
+            hxd = hx2 - hx1;  hyd = hy2 - hy1
+            vxd = vx2 - vx1;  vyd = vy2 - vy1
+            denom = hxd * vyd - hyd * vxd
+            if abs(denom) < 1e-6:
+                continue
+            dx0 = vx1 - hx1;  dy0 = vy1 - hy1
+            t = (dx0 * vyd - dy0 * vxd) / denom
+            s = (dx0 * hyd - dy0 * hxd) / denom
+            hlen = math.hypot(hxd, hyd)
+            vlen = math.hypot(vxd, vyd)
+            if hlen < 1 or vlen < 1:
+                continue
+            tol_t = snap / hlen
+            tol_s = snap / vlen
+            if (-tol_t <= t <= 1 + tol_t) and (-tol_s <= s <= 1 + tol_s):
+                nodes.append((hx1 + t * hxd, hy1 + t * hyd, 'hv'))
+
+    # Structural text label centroids (COL, HSS, BF-X, W-shapes)
+    # Used on roof_plan pages where column labels mark real structural positions.
+    try:
+        td = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        for block in td.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    t = span.get("text", "").strip()
+                    if _STRUCT_LABEL_RE.search(t):
+                        ox = span.get("origin", (0, 0))[0]
+                        oy = span.get("origin", (0, 0))[1]
+                        nodes.append((ox, oy, 'label'))
+    except Exception:
+        pass
+
+    # Deduplicate: merge nodes within NODE_SNAP_PT of each other
+    merged: list = []
+    for (nx, ny, nt) in nodes:
+        if not any(math.hypot(nx - mx, ny - my) < snap for (mx, my, _) in merged):
+            merged.append((nx, ny, nt))
+    return merged
+
+
+def _endpoints_on_nodes(cand: dict, nodes: list) -> tuple:
+    """
+    Return (p1_any, p2_any, p1_hv, p2_hv):
+      p1/p2_any — endpoint within NODE_SNAP_PT of any node (hv or label)
+      p1/p2_hv  — endpoint within NODE_SNAP_PT of an H/V intersection node only
+    """
+    p1_any = any(math.hypot(cand["x1"] - nx, cand["y1"] - ny) < NODE_SNAP_PT
+                 for nx, ny, _ in nodes)
+    p2_any = any(math.hypot(cand["x2"] - nx, cand["y2"] - ny) < NODE_SNAP_PT
+                 for nx, ny, _ in nodes)
+    p1_hv  = any(math.hypot(cand["x1"] - nx, cand["y1"] - ny) < NODE_SNAP_PT
+                 for nx, ny, nt in nodes if nt == 'hv')
+    p2_hv  = any(math.hypot(cand["x2"] - nx, cand["y2"] - ny) < NODE_SNAP_PT
+                 for nx, ny, nt in nodes if nt == 'hv')
+    return p1_any, p2_any, p1_hv, p2_hv
+
+
+def extract_opening_regions(page) -> list:
+    """
+    Return (cx, cy) of every 'OPENING' / 'OPEN' text block on the page.
+
+    In framing plans, floor openings (stairwells, elevator shafts, mechanical
+    penetrations) are conventionally marked with diagonal X-lines drawn across
+    the void.  These lines must not be classified as structural braces.
+    Any diagonal whose midpoint falls within OPENING_SNAP_PT of an OPENING
+    label is rejected by the classifier.
+    """
+    out = []
+    for b in page.get_text("blocks"):
+        if _OPENING_REGION_RE.search(b[4]):
+            out.append(((b[0] + b[2]) / 2, (b[1] + b[3]) / 2))
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BRACE ENRICHMENT — config classification + section label attachment
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _lines_cross(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2) -> bool:
+    """Return True if segment A and segment B properly intersect (cross each other)."""
+    def _cross2d(ux, uy, vx, vy):
+        return ux * vy - uy * vx
+
+    d1x, d1y = ax2 - ax1, ay2 - ay1
+    d2x, d2y = bx2 - bx1, by2 - by1
+    denom = _cross2d(d1x, d1y, d2x, d2y)
+    if abs(denom) < 1e-9:
+        return False  # parallel or collinear
+
+    dx, dy = bx1 - ax1, by1 - ay1
+    t = _cross2d(dx, dy, d2x, d2y) / denom
+    u = _cross2d(dx, dy, d1x, d1y) / denom
+    # Strict interior intersection (avoids counting endpoint-touches)
+    return 0.05 < t < 0.95 and 0.05 < u < 0.95
+
+
+def _bboxes_overlap(a: dict, b: dict, tol: float = 50.0) -> bool:
+    """Return True if the bounding boxes of two candidates overlap (same bay)."""
+    ax0, ax1 = min(a["x1"], a["x2"]), max(a["x1"], a["x2"])
+    ay0, ay1 = min(a["y1"], a["y2"]), max(a["y1"], a["y2"])
+    bx0, bx1 = min(b["x1"], b["x2"]), max(b["x1"], b["x2"])
+    by0, by1 = min(b["y1"], b["y2"]), max(b["y1"], b["y2"])
+    return not (ax1 + tol < bx0 or bx1 + tol < ax0 or
+                ay1 + tol < by0 or by1 + tol < ay0)
+
+
+def _share_endpoint(a: dict, b: dict, snap: float = CHEVRON_SNAP_PT) -> bool:
+    """Return True if any endpoint of A is within snap of any endpoint of B."""
+    for ax, ay in ((a["x1"], a["y1"]), (a["x2"], a["y2"])):
+        for bx, by in ((b["x1"], b["y1"]), (b["x2"], b["y2"])):
+            if math.hypot(ax - bx, ay - by) < snap:
+                return True
+    return False
+
+
+def _classify_configs(results: list) -> None:
+    """
+    Mutate accepted candidates in-place, adding 'config' field:
+      'x_brace'        — two braces in same bay whose line segments cross
+      'chevron'        — two braces that share a common endpoint (V/chevron/K)
+      'single_diagonal'— no partner found in the same bay
+    Priority: x_brace > chevron > single_diagonal.
+    """
+    _PRIORITY = {"x_brace": 3, "chevron": 2, "single_diagonal": 1}
+
+    def _upgrade(cfg_map, idx, new):
+        if _PRIORITY.get(new, 0) > _PRIORITY.get(cfg_map.get(idx, "single_diagonal"), 0):
+            cfg_map[idx] = new
+
+    accepted_idx = [i for i, c in enumerate(results)
+                    if c.get("confidence") in ("HIGH", "MEDIUM")]
+    cfg_map: dict[int, str] = {}
+
+    for ii, i in enumerate(accepted_idx):
+        a = results[i]
+        for jj in range(ii + 1, len(accepted_idx)):
+            j = accepted_idx[jj]
+            b = results[j]
+
+            if not _bboxes_overlap(a, b):
+                continue
+
+            if _lines_cross(a["x1"], a["y1"], a["x2"], a["y2"],
+                            b["x1"], b["y1"], b["x2"], b["y2"]):
+                _upgrade(cfg_map, i, "x_brace")
+                _upgrade(cfg_map, j, "x_brace")
+            elif _share_endpoint(a, b):
+                _upgrade(cfg_map, i, "chevron")
+                _upgrade(cfg_map, j, "chevron")
+
+    for i, c in enumerate(results):
+        if c.get("confidence") in ("HIGH", "MEDIUM"):
+            c["config"] = cfg_map.get(i, "single_diagonal")
+        else:
+            c["config"] = None
+
+
+def _attach_section_labels(results: list, page) -> None:
+    """
+    Mutate accepted candidates in-place, adding 'section_label' field.
+    Finds the nearest structural section callout (HSS, W-shape, angle, etc.)
+    within SECTION_SNAP_PT of each brace midpoint.
+    """
+    blocks = page.get_text("blocks")
+    # Pre-filter to blocks that contain a section callout
+    labeled_blocks = []
+    for b in blocks:
+        m = _SECTION_RE.search(b[4])
+        if m:
+            bx = (b[0] + b[2]) / 2
+            by = (b[1] + b[3]) / 2
+            # Normalise: collapse spaces, uppercase
+            label = re.sub(r'\s+', '', m.group()).upper()
+            labeled_blocks.append((bx, by, label))
+
+    for c in results:
+        if c.get("confidence") not in ("HIGH", "MEDIUM"):
+            c["section_label"] = None
+            continue
+        cx = (c["x1"] + c["x2"]) / 2
+        cy = (c["y1"] + c["y2"]) / 2
+        best_label = None
+        best_dist  = float("inf")
+        for bx, by, label in labeled_blocks:
+            d = math.hypot(cx - bx, cy - by)
+            if d < best_dist:
+                best_dist  = d
+                best_label = label
+        c["section_label"] = best_label if best_dist < SECTION_SNAP_PT else None
+
+
+def enrich_brace_results(results: list, page) -> list:
+    """
+    Post-classify enrichment — call immediately after classify().
+
+    Adds these fields to every result entry:
+      config           : 'x_brace' | 'chevron' | 'single_diagonal' | None (rejected)
+      section_label    : nearest structural section callout text, or None
+      role             : 'lateral_unconfirmed' — never auto-assign seismic role;
+                         surface to estimator for confirmation (per MD §5.3 Layer 3)
+      detection_method : 'rules' — 'vision_fallback' when Gemini path is wired
+
+    Mutates and returns the same list for convenience.
+    """
+    _classify_configs(results)
+    _attach_section_labels(results, page)
+    for c in results:
+        c.setdefault("role",             "lateral_unconfirmed")
+        c.setdefault("detection_method", "rules")
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLASSIFY — combine all five layers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def classify(candidates: list,
              page_context: str = "unknown",
              scale_annotations: list = None,
-             ppf: float = 9.0) -> list:
+             ppf: float = 9.0,
+             structural_nodes: list = None,
+             opening_regions: list = None) -> list:
     """
-    Apply four-layer classification to every candidate.
+    Apply five-layer classification to every candidate.
 
     Parameters
     ----------
@@ -468,6 +844,13 @@ def classify(candidates: list,
     page_context      : output of classify_page_context()[0]
     scale_annotations : output of find_scale_annotations()
     ppf               : pts-per-foot for this page
+    structural_nodes  : output of extract_structural_nodes() — optional.
+                        When provided, Layer 5 rejects candidates on
+                        framing_plan / roof_plan / foundation_plan pages
+                        whose endpoints land on no structural node.
+    opening_regions   : output of extract_opening_regions() — optional.
+                        When provided, rejects any candidate whose midpoint
+                        lies within OPENING_SNAP_PT of an OPENING text label.
 
     Added keys per candidate:
       confidence    : "HIGH" | "MEDIUM" | "REJECT"
@@ -537,8 +920,94 @@ def classify(candidates: list,
         else:
             c["reject_reason"] = None
 
+        # ── Layer 5: structural node connectivity ─────────────────────────────
+        # A valid brace must terminate at structural nodes (beam/column grid).
+        # Annotation diagonals (stair symbols, section markers, slope arrows)
+        # do not connect two distinct structural points.
+        #
+        # Strictness by context:
+        #   framing_plan          → BOTH endpoints must be on a node.
+        #     Dense beam grid means one endpoint can accidentally land near a
+        #     grid intersection.  A real brace always spans two structural pts.
+        #   roof_plan / elevation → EITHER endpoint must be on a node.
+        #     Sparser grid; single-endpoint confirmation is sufficient.
+        #   braced_frame_elevation, unknown → no check (context is itself
+        #     a strong signal that diagonals are structural).
+        if structural_nodes is not None and page_context in NODE_CHECK_CONTEXTS:
+            p1_any, p2_any, p1_hv, p2_hv = _endpoints_on_nodes(c, structural_nodes)
+            if page_context in NODE_STRICT_BOTH_CONTEXTS:
+                # STRICT: both endpoints required
+                if not p1_any or not p2_any:
+                    c["confidence"]    = "REJECT"
+                    c["reject_reason"] = f"framing_plan_node_check(p1={p1_any},p2={p2_any})"
+                    results.append(c)
+                    continue
+            else:
+                # LENIENT: at least one endpoint required
+                if not p1_any and not p2_any:
+                    c["confidence"]    = "REJECT"
+                    c["reject_reason"] = "no_structural_node"
+                    results.append(c)
+                    continue
+
+        # ── Opening annotation rejection ──────────────────────────────────────
+        # Floor openings (stairwells, elevator shafts) are drawn with diagonal
+        # X-graphic lines to indicate the void.  If the candidate midpoint lies
+        # within OPENING_SNAP_PT of any OPENING text label, reject it.
+        if opening_regions:
+            _cx = (c["x1"] + c["x2"]) / 2
+            _cy = (c["y1"] + c["y2"]) / 2
+            if any(math.hypot(_cx - ox, _cy - oy) < OPENING_SNAP_PT
+                   for ox, oy in opening_regions):
+                c["confidence"]    = "REJECT"
+                c["reject_reason"] = "opening_annotation"
+                results.append(c)
+                continue
+
         c["confidence"] = base
         results.append(c)
+
+    # ── Post-processing: annotation X-pair rejection ──────────────────────────
+    # Detect pairs of MEDIUM candidates that form a perfect mirror X-symbol:
+    #   • same center point (±NODE_SNAP_PT)
+    #   • same bounding box (same x-range and y-range — perfect mirror)
+    #   • bounding box smaller than XPAIR_MIN_BAY_FT in BOTH axes
+    # Such pairs are annotation symbols (section markers, detail callouts, north
+    # arrows) drawn as small crossing diagonals — not structural X-braces.
+    # Real structural X-braces span at least one full bay (>> XPAIR_MIN_BAY_FT).
+    if ppf > 0:
+        min_bay_pt = XPAIR_MIN_BAY_FT * ppf
+        med_idx = [i for i, c in enumerate(results)
+                   if c.get("confidence") == "MEDIUM"]
+        xpair_reject = set()
+        for ii in range(len(med_idx)):
+            i = med_idx[ii]
+            a = results[i]
+            for jj in range(ii + 1, len(med_idx)):
+                j = med_idx[jj]
+                b = results[j]
+                # Same center?
+                cxa = (a["x1"] + a["x2"]) / 2;  cya = (a["y1"] + a["y2"]) / 2
+                cxb = (b["x1"] + b["x2"]) / 2;  cyb = (b["y1"] + b["y2"]) / 2
+                if math.hypot(cxa - cxb, cya - cyb) > NODE_SNAP_PT:
+                    continue
+                # Same bounding box (perfect mirror)?
+                ax0, ax1 = min(a["x1"],a["x2"]), max(a["x1"],a["x2"])
+                ay0, ay1 = min(a["y1"],a["y2"]), max(a["y1"],a["y2"])
+                bx0, bx1 = min(b["x1"],b["x2"]), max(b["x1"],b["x2"])
+                by0, by1 = min(b["y1"],b["y2"]), max(b["y1"],b["y2"])
+                if (abs(ax0-bx0) > NODE_SNAP_PT or abs(ax1-bx1) > NODE_SNAP_PT
+                        or abs(ay0-by0) > NODE_SNAP_PT or abs(ay1-by1) > NODE_SNAP_PT):
+                    continue
+                # Bounding box smaller than minimum structural bay in both axes?
+                bbox_w = ax1 - ax0
+                bbox_h = ay1 - ay0
+                if bbox_w < min_bay_pt and bbox_h < min_bay_pt:
+                    xpair_reject.add(i)
+                    xpair_reject.add(j)
+        for idx in xpair_reject:
+            results[idx]["confidence"]    = "REJECT"
+            results[idx]["reject_reason"] = "annotation_xpair"
 
     return results
 
@@ -707,12 +1176,14 @@ def main():
             try:
                 # Extract
                 candidates       = extract_diagonals(page, ppf)
-                # Context detection
                 ctx, ctx_score   = classify_page_context(page)
-                # Scale annotation detection
                 scale_anns       = find_scale_annotations(page)
-                # Classify with all layers
-                classified       = classify(candidates, ctx, scale_anns, ppf)
+                nodes            = (extract_structural_nodes(page, ppf)
+                                    if ctx in NODE_CHECK_CONTEXTS
+                                    else None)
+                openings         = extract_opening_regions(page)
+                classified       = classify(candidates, ctx, scale_anns, ppf, nodes, openings)
+                classified       = enrich_brace_results(classified, page)
                 m                = page_metrics(classified, ctx)
                 pdf_page_results[pg] = m
                 pdf_high += m["high"]

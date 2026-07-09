@@ -209,11 +209,11 @@ def main_run():
         d = ""
         for k in ("beams", "columns"):
             if k in b and b[k] != m[k]:
-                d += f" {k}:{b[k]}→{m[k]}"
+                d += f" {k}:{b[k]}->{m[k]}"
         flags = ""
-        if m["floating"]:  flags += f" ⚠{m['floating']}float"
-        if m["duplicate"]: flags += f" ⚠{m['duplicate']}dup"
-        if m["overshoot"]: flags += f" ⚠{m['overshoot']}oversht"
+        if m["floating"]:  flags += f" !{m['floating']}float"
+        if m["duplicate"]: flags += f" !{m['duplicate']}dup"
+        if m["overshoot"]: flags += f" !{m['overshoot']}oversht"
         g = gt.get(c["name"], {})
         rec = ""
         if "beams" in g and g["beams"]:
@@ -224,7 +224,7 @@ def main_run():
 
     if save:
         json.dump(results, open(BASELINE, "w"), indent=2)
-        print(f"\n[baseline saved → {os.path.basename(BASELINE)}]")
+        print(f"\n[baseline saved -> {os.path.basename(BASELINE)}]")
     else:
         print(f"\n(run with --save to set this as the regression baseline)")
 

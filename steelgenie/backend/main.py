@@ -1,3 +1,10 @@
+import sys as _sys
+for _s in (_sys.stdout, _sys.stderr):
+    try:
+        _s.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import fitz
 import re
 import math
@@ -28,6 +35,9 @@ try:
         find_scale_annotations   as _brace_find_scales,
         classify                 as _brace_classify,
         scale_to_pts_per_foot    as _brace_ppf,
+        extract_structural_nodes as _brace_extract_nodes,
+        extract_opening_regions  as _brace_extract_openings,
+        enrich_brace_results     as _brace_enrich,
     )
     _BRACE_EXTRACTION_AVAILABLE = True
     print("[INIT] brace_classifier loaded")
@@ -1593,28 +1603,49 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
 
 
 # ── Column symbol detection (I/H cross-section marks in vector drawings) ──────
-def detect_column_symbols(page):
+def detect_column_symbols(page, scale_ratio: float = 96):
     """
     Detect the small I-section / W-section plan-view symbols drawn in the PDF.
 
-    In structural steel framing plans, each column position is marked with a
-    small I or H shaped symbol (two short horizontal lines joined by a vertical
-    web line) representing the W-beam cross-section viewed from above.
+    All distance thresholds are derived from real-world inches using the sheet's
+    scale_ratio so they remain correct across 1/8", 1/4", 1/2" and detail scales.
+
+    Conversion: PDF_pt = real_inches * 72 / scale_ratio
+      1/8"=1' (scale_ratio=96)  → 0.75 pt per real inch
+      1/4"=1' (scale_ratio=48)  → 1.50 pt per real inch
+      1/2"=1' (scale_ratio=24)  → 3.00 pt per real inch
 
     Strategy:
-      1. Collect all drawing paths whose bounding box is small (5–50 PDF pts).
-      2. For each small path, inspect its line segments for both horizontal AND
-         vertical components — the defining characteristic of an I/H shape.
-      3. Also accept rectangular paths (some CAD exports draw the column symbol
-         as a filled or outlined small rectangle with flanges).
-      4. Cluster nearby hits and deduplicate.
+      1. Collect all drawing paths whose bounding box is within the expected
+         column-symbol size range (derived from scale).
+      2. For each path, inspect segments for I/H pattern (flanges + web).
+      3. Accept solid-black rectangles (some CAD exports use a filled box).
+      4. Cluster nearby hits with a scale-aware DBSCAN radius; return the
+         union-bbox centre of each cluster (not the average of sub-path centres
+         — asymmetric sub-path counts cannot drift the centre).
     """
     try:
         drawings = page.get_drawings()
     except Exception:
         return []
 
-    raw = []   # (cx, cy) candidates
+    # ── Scale-aware thresholds ────────────────────────────────────────────────
+    # All in real-world INCHES; multiplied by _ipt to get PDF points.
+    _ipt = 72.0 / max(scale_ratio, 1)   # pt per real inch
+
+    # Column symbol bbox limits in real inches:
+    #   min = 3" (smallest standard section: W8 flange ≈ 8")
+    #   max = 48" (largest practical section + drafting pen width)
+    SYM_MIN_PT = max(3, 3.0 * _ipt)
+    SYM_MAX_PT = 48.0 * _ipt
+
+    # DBSCAN eps: governs chaining of sub-paths within the SAME symbol.
+    # Must be (a) large enough to step between adjacent sub-paths of a large
+    # column symbol and (b) small enough to never bridge two distinct columns.
+    # Minimum bay spacing ~10ft; symbol sub-path step ~1-2".  6" real is safe.
+    EPS = max(4, 6.0 * _ipt)
+
+    raw = []   # (cx, cy, rect_tuple) candidates
 
     def _ang_diff(a, b):
         """Smallest angle between two undirected lines (0–90°)."""
@@ -1640,13 +1671,21 @@ def detect_column_symbols(page):
             continue
         w, h = rect.width, rect.height
 
-        # Column symbol bounding box: small in both axes
-        # Too large = beam line or wall; too small = arrowhead or dimension tick
-        if not (4 < w < 50 and 4 < h < 50):
+        # Column symbol bounding box: within scale-derived size range.
+        # SYM_MIN_PT: minimum meaningful column symbol dimension (≥3" real).
+        # SYM_MAX_PT: maximum (largest W/HSS section at this scale).
+        if not (SYM_MIN_PT < w < SYM_MAX_PT and SYM_MIN_PT < h < SYM_MAX_PT):
             continue
 
+        # Store the overall DRAWING bounding box alongside the centre.
+        # We accumulate rects per cluster and recompute the centre from
+        # the union bbox — this avoids the sub-path averaging drift that
+        # pulls the column position left/right when one flange has more
+        # sub-paths than the other.
         cx = (rect.x0 + rect.x1) / 2
         cy = (rect.y0 + rect.y1) / 2
+        # keep the full rect so clustering can take the union bbox
+        _raw_rect = (rect.x0, rect.y0, rect.x1, rect.y1)
 
         # ── Check drawing fill colour up-front ───────────────────────────────
         # Column plan marks are solid BLACK fills.
@@ -1717,26 +1756,18 @@ def detect_column_symbols(page):
         # where the old strict horizontal/vertical test missed columns, leaving
         # beams with no centre to snap to.
         if not has_curve and _has_IH_pattern(seg_angles):
-            raw.append((cx, cy))
+            raw.append((cx, cy, _raw_rect))
             continue
 
-        # ── Accept small FILLED rectangle (some CAD exports use a solid box) ──
-        # Previously accepted ANY 4-line outlined rectangle, which caught
-        # connection plates, stiffener boxes, joist seats and dimension ticks —
-        # all legitimate drawing elements that are NOT column symbols.
-        # Now require near-black fill (brightness < 0.25): only solid black
-        # plan marks qualify.  Un-filled or lightly-shaded boxes are skipped.
+        # ── Accept small FILLED rectangle (solid black plan mark only) ────────
         if (not has_curve and n_lines == 4 and 0.5 < aspect < 2.0
                 and w < 28 and h < 28 and drawing_brightness < 0.25):
-            raw.append((cx, cy))
+            raw.append((cx, cy, _raw_rect))
             continue
 
         # ── Accept small CIRCLED I/H symbol ───────────────────────────────────
-        # Many CAD drawings ring the column I/H mark with a small circle.
-        # Grid bubbles are large (>45pt); section-cut bubbles rarely have both
-        # H and V lines inside them. Limit to bbox 10–45pt to stay specific.
         if has_curve and _has_IH_pattern(seg_angles) and 10 < w < 45 and 10 < h < 45:
-            raw.append((cx, cy))
+            raw.append((cx, cy, _raw_rect))
 
     # Deduplicate using EXPANDING cluster (DBSCAN-style, eps=15pt).
     #
@@ -1760,25 +1791,31 @@ def detect_column_symbols(page):
     for i in range(len(raw)):
         if used[i]:
             continue
-        # Seed the cluster with point i
         cluster_idx = [i]
         used[i] = True
-        # Expand: keep sweeping until no new neighbours are added
         queue = [i]
         while queue:
             cur_idx = queue.pop()
-            cx_cur, cy_cur = raw[cur_idx]
+            cx_cur, cy_cur = raw[cur_idx][0], raw[cur_idx][1]
             for j in range(len(raw)):
                 if not used[j]:
                     if math.hypot(cx_cur - raw[j][0], cy_cur - raw[j][1]) < EPS:
                         used[j] = True
                         cluster_idx.append(j)
                         queue.append(j)
-        xs = [raw[k][0] for k in cluster_idx]
-        ys = [raw[k][1] for k in cluster_idx]
+
+        # Use the UNION bounding box of all sub-paths in the cluster, then
+        # take its centre.  This is exact regardless of how many sub-rects
+        # each flange or web was split into — asymmetric sub-path counts
+        # cannot drift the centre any more.
+        rects = [raw[k][2] for k in cluster_idx]
+        u_x0 = min(r[0] for r in rects)
+        u_y0 = min(r[1] for r in rects)
+        u_x1 = max(r[2] for r in rects)
+        u_y1 = max(r[3] for r in rects)
         symbols.append({
-            "cx": sum(xs) / len(xs),
-            "cy": sum(ys) / len(ys),
+            "cx": (u_x0 + u_x1) / 2,
+            "cy": (u_y0 + u_y1) / 2,
         })
 
     print(f"[SYMBOLS] Column symbols detected: {len(symbols)}")
@@ -3324,7 +3361,14 @@ def dedup_overlapping_beams(members, page_w, page_h, pts_per_foot):
                 drop.add(id(beams[j]) if La >= Lb else id(beams[i]))
                 if id(beams[i]) in drop:
                     break
-            # both labeled → leave both (real adjacent beams)
+            else:
+                # both labeled.  If they are extremely close (dist < 0.8 ft) and
+                # overlap significantly, it's a double-read/duplicate detection.
+                # Keep the longer one.
+                if abs((bx1 - ax1) * px + (by1 - ay1) * py) < 0.8 * ppf:
+                    drop.add(id(beams[j]) if La >= Lb else id(beams[i]))
+                    if id(beams[i]) in drop:
+                        break
     if drop:
         print(f"[DEDUP] removed {len(drop)} duplicate overlapping beam overlay(s)")
     return [m for m in members if id(m) not in drop]
@@ -3931,7 +3975,7 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
 
 
 def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
-                        page_w, page_h):
+                        page_w, page_h, scale_ratio: float = 96):
     """Emit a COLUMN member for each detected column symbol that sits at a grid
     intersection and isn't already represented by a column member.
 
@@ -3943,52 +3987,305 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     """
     if not column_symbols:
         return members
-    FRAME = 48.0         # a beam endpoint this close ⇒ a beam frames into it
-    SNAP  = 30.0         # snap marker to grid line if within this (precise centre)
+
+    # ── Scale-aware thresholds ────────────────────────────────────────────────
+    # All derived from real-world INCHES so they remain correct across sheets
+    # plotted at different scales in the same drawing set.
+    #
+    # Conversion: PDF_pt = real_inches * 72 / scale_ratio
+    #   1/8"=1'  (scale_ratio=96) → 0.75 pt/in
+    #   1/4"=1'  (scale_ratio=48) → 1.50 pt/in
+    #   1/2"=1'  (scale_ratio=24) → 3.00 pt/in
+    _ipt = 72.0 / max(scale_ratio, 1)
+
+    # Beam endpoint search radius: column half-depth (≤12" for W24) +
+    # drafting tolerance (≤12").  24" real covers every standard section
+    # without reaching into adjacent bays (minimum bay ≥ 10ft = 120").
+    FRAME_IN  = 24.0
+    FRAME_PT  = FRAME_IN * _ipt
+
+    # Deduplication radius between the sub-paths of the same beam endpoint.
+    # Two endpoints within 4" real = same physical beam tip.
+    END_EQ_IN = 4.0
+    END_EQ_PT = END_EQ_IN * _ipt
+
+    # Minimum distinct beam endpoints confirming a column:
+    # real columns always have ≥ 2 framing beams; details/annotations ≤ 1.
+    MIN_BEAMS = 2
+
+    # Grid snap: only snap to the idealised grid intersection when the symbol
+    # centre is within this tolerance.  6" real = half a typical column depth,
+    # which covers drafting offset without force-snapping clearly off-grid columns.
+    SNAP_IN = 6.0
+    SNAP_PT = SNAP_IN * _ipt
+
+    # Dedup: don't emit a second column within this of one already placed.
+    DEDUP_IN = 6.0
+    DEDUP_PT = DEDUP_IN * _ipt
+
     existing = [(m["x"] * page_w, m["y"] * page_h)
                 for m in members if m.get("type") == "column"]
-    # Beam endpoints — a real column is WHERE BEAMS MEET; a stray text / CMU /
-    # dimension / label mark has no beam framing into it (its nearest beam end is
-    # a full bay away).  This is the reliable filter that rejects false symbols.
+
     beam_ends = []
     for m in members:
         if m.get("type") == "beam" and m.get("bx1") is not None:
             beam_ends.append((m["bx1"] * page_w, m["by1"] * page_h))
             beam_ends.append((m["bx2"] * page_w, m["by2"] * page_h))
-    # A real column is WHERE BEAMS MEET.  Requiring a beam to frame into the
-    # symbol guarantees every COL marker is a genuine column (no stray text /
-    # CMU / dimension / base-plate mark).  (Foundation sheets with no framing
-    # beams will undercount until they get a dedicated mode — but they will show
-    # ZERO false columns, which is the requirement.)
-    added = []
+
+    added: list[tuple[float, float]] = []
+    rejected = 0
     for s in column_symbols:
-        cx, cy = s["cx"], s["cy"]
-        # FILTER: a beam must frame into this symbol — else it is not a column.
-        if not any(math.hypot(cx - ex, cy - ey) < FRAME for ex, ey in beam_ends):
+        cx, cy = s["cx"], s["cy"]   # union-bbox centre (raw)
+
+        # Count distinct beam endpoints framing into this symbol.
+        close_ends = [(ex, ey) for ex, ey in beam_ends
+                      if math.hypot(cx - ex, cy - ey) < FRAME_PT]
+        unique_ends: list = []
+        for (ex, ey) in close_ends:
+            if not any(math.hypot(ex - ux, ey - uy) < END_EQ_PT
+                       for ux, uy in unique_ends):
+                unique_ends.append((ex, ey))
+
+        if len(unique_ends) < MIN_BEAMS:
+            rejected += 1
+            continue   # stray annotation / connection detail — not a column
+
+        # ── Placement: raw centre → try grid snap ────────────────────────────
+        # Store BOTH the raw (drawn) centre and the idealised grid position so
+        # downstream QA can compare them.
+        #
+        # Off-grid path: if the nearest grid intersection is farther than SNAP
+        # this is a genuinely off-grid column (transfer column, irregular edge,
+        # raked wall). Keep raw coordinate; tag off_grid=True.  Do NOT discard.
+        raw_x, raw_y = cx, cy
+        off_grid = True
+        snap_x, snap_y = raw_x, raw_y
+
+        if v_grid:
+            gx = min(v_grid, key=lambda g: abs(cx - g))
+            if abs(cx - gx) <= SNAP_PT:
+                snap_x = gx
+                off_grid = False
+        if h_grid:
+            gy = min(h_grid, key=lambda g: abs(cy - g))
+            if abs(cy - gy) <= SNAP_PT:
+                snap_y = gy
+                off_grid = False
+
+        # Final position: snapped when on-grid, raw otherwise
+        px, py = snap_x, snap_y
+
+        # Dedup using the FINAL position
+        if any(math.hypot(px - ex, py - ey) < DEDUP_PT
+               for ex, ey in existing + added):
             continue
-        # PLACE at the column centre: snap to the nearby grid line(s) when close
-        # (precise), otherwise keep the symbol's own centre.
-        gx = min(v_grid, key=lambda g: abs(cx - g)) if v_grid else cx
-        gy = min(h_grid, key=lambda g: abs(cy - g)) if h_grid else cy
-        px = gx if abs(cx - gx) <= SNAP else cx
-        py = gy if abs(cy - gy) <= SNAP else cy
-        # not already a column here
-        if any(math.hypot(px - ex, py - ey) < 40 for ex, ey in existing + added):
-            continue
+
         added.append((px, py))
         members.append({
             "profile": "COL", "type": "column", "length_ft": 0.0,
             "beam_dir": None,
             "bx1": None, "by1": None, "bx2": None, "by2": None,
-            "x": round(px / page_w, 4), "y": round(py / page_h, 4),
+            # Placed (final) position
+            "x":  round(px / page_w, 4), "y":  round(py / page_h, 4),
             "lx": round(px / page_w, 4), "ly": round(py / page_h, 4),
             "sx": round(px / page_w, 4), "sy": round(py / page_h, 4),
+            # Raw bbox-centre position (QA field)
+            "raw_x": round(raw_x / page_w, 4),
+            "raw_y": round(raw_y / page_h, 4),
+            "off_grid": off_grid,
             "w": 0.018, "h": 0.018,
             "color": MEMBER_COLORS["column"], "confirmed": True,
             "is_column": True, "size_unknown": True,
         })
+
+    print(f"[COLUMNS] emitted {len(added)} symbol columns "
+          f"(rejected {rejected} fp — < {MIN_BEAMS} beam endpoints; "
+          f"scale_ratio={scale_ratio}  FRAME={FRAME_IN}\" real  SNAP={SNAP_IN}\" real)")
+    return members
+
+
+def extract_col_text_columns(page, page_w, page_h, members,
+                              v_grid=None, h_grid=None, scale_ratio: float = 96):
+    """
+    Emit columns from 'COL' text labels — placed at the BEAM CONVERGENCE POINT
+    nearest to the label, never at the text label origin itself.
+
+    All distance thresholds derived from real-world inches (same conversion as
+    emit_symbol_columns) so they stay correct across sheets at different scales.
+
+    Algorithm per label:
+      1. Find beam-endpoint cluster within SEARCH_PT of the label centre.
+         A cluster = ≥ MIN_BEAMS beam endpoints within CLUSTER_PT of each other.
+      2. Place column at the cluster CENTROID — the exact beam convergence point.
+      3. Store raw convergence point AND attempt grid snap within GRID_SNAP_PT.
+         If grid snap succeeds → use snapped position (off_grid=False).
+         If not → keep raw convergence point (off_grid=True).  Do NOT discard.
+      4. If no beam cluster: try grid snap near label as fallback.
+      5. If neither: discard — never place at bare label position.
+    """
+    _COL_LABEL_RE = re.compile(r'^\s*COL\.?\s*$', re.I)
+
+    # ── Scale-aware thresholds ────────────────────────────────────────────────
+    _ipt = 72.0 / max(scale_ratio, 1)
+
+    # Search radius from COL label to beam endpoint cluster.
+    # Labels are typically offset 6-18" from the column; 20" covers generous
+    # title-block font placement without reaching unrelated elements.
+    SEARCH_PT   = 20.0 * _ipt
+
+    # Radius within which beam endpoints belong to the SAME convergence cluster.
+    # 4" real covers all typical beam-end drafting imprecision.
+    CLUSTER_PT  = 4.0 * _ipt
+
+    MIN_BEAMS   = 2
+
+    # Grid snap tolerance and dedup — same logic as emit_symbol_columns.
+    GRID_SNAP_PT = 6.0 * _ipt
+    DEDUP_PT     = 6.0 * _ipt
+
+    # Collect beam endpoints
+    beam_ends: list[tuple[float, float]] = []
+    for m in members:
+        if m.get("type") == "beam" and m.get("bx1") is not None:
+            beam_ends.append((m["bx1"] * page_w, m["by1"] * page_h))
+            beam_ends.append((m["bx2"] * page_w, m["by2"] * page_h))
+
+    # Existing column positions (already detected)
+    existing = [
+        (m["x"] * page_w, m["y"] * page_h)
+        for m in members if m.get("type") == "column"
+    ]
+
+    def _find_convergence(lx: float, ly: float):
+        """
+        Return (cx, cy) of the strongest beam-endpoint cluster within
+        SEARCH_PT of (lx, ly), or None.
+        Best cluster = most endpoints; ties broken by proximity to label.
+        """
+        nearby = [(ex, ey) for ex, ey in beam_ends
+                  if math.hypot(ex - lx, ey - ly) < SEARCH_PT]
+        if not nearby:
+            return None
+
+        # Cluster nearby endpoints
+        clusters: list[list[tuple[float, float]]] = []
+        for pt in nearby:
+            placed = False
+            for cl in clusters:
+                if math.hypot(pt[0] - cl[0][0], pt[1] - cl[0][1]) < CLUSTER_PT:
+                    cl.append(pt)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([pt])
+
+        # Keep clusters with enough beams, sort by count desc then proximity asc
+        valid = [cl for cl in clusters if len(cl) >= MIN_BEAMS]
+        if not valid:
+            return None
+        valid.sort(key=lambda cl: (
+            -len(cl),
+            math.hypot(sum(p[0] for p in cl)/len(cl) - lx,
+                       sum(p[1] for p in cl)/len(cl) - ly)
+        ))
+        best = valid[0]
+        return sum(p[0] for p in best) / len(best), sum(p[1] for p in best) / len(best)
+
+    def _find_grid_intersection(lx: float, ly: float):
+        """
+        Return (gx, gy) of the nearest v_grid × h_grid crossing within
+        GRID_SNAP_PT of (lx, ly), or None.
+        """
+        if not v_grid or not h_grid:
+            return None
+        gx = min(v_grid, key=lambda x: abs(x - lx))
+        gy = min(h_grid, key=lambda y: abs(y - ly))
+        if math.hypot(gx - lx, gy - ly) < GRID_SNAP_PT:
+            return gx, gy
+        return None
+
+    # Read text spans
+    added: list[tuple[float, float]] = []
+    try:
+        td = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+    except Exception:
+        return members
+
+    for block in td.get("blocks", []):
+        bx0, by0, bx1, by1 = block.get("bbox", (0, 0, 0, 0))
+        label_cx = (bx0 + bx1) / 2
+        label_cy = (by0 + by1) / 2
+
+        # Check if any span in this block matches "COL"
+        block_text = " ".join(
+            span.get("text", "").strip()
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+        ).strip()
+        if not _COL_LABEL_RE.match(block_text):
+            continue
+
+        # Step 1: find beam convergence near label (raw position)
+        conv = _find_convergence(label_cx, label_cy)
+
+        # Step 2: fallback — grid intersection near the label itself
+        grid_near_label = _find_grid_intersection(label_cx, label_cy)
+
+        if conv is None and grid_near_label is None:
+            print(f"[COLUMNS] COL label at ({label_cx:.0f},{label_cy:.0f}) "
+                  f"discarded — no beam convergence or grid intersection found")
+            continue
+
+        # Raw position = beam convergence centroid (most accurate when present)
+        raw_x, raw_y = conv if conv is not None else grid_near_label
+
+        # ── Grid snap: keep raw + snapped separately ─────────────────────────
+        # Only snap when the grid intersection is VERY close to the convergence
+        # point (within GRID_SNAP_PT real).  If farther → the column is
+        # genuinely off-grid; keep raw coordinate and tag off_grid=True.
+        off_grid = True
+        snap_x, snap_y = raw_x, raw_y
+
+        if v_grid:
+            gx = min(v_grid, key=lambda g: abs(raw_x - g))
+            if abs(raw_x - gx) <= GRID_SNAP_PT:
+                snap_x = gx
+                off_grid = False
+        if h_grid:
+            gy = min(h_grid, key=lambda g: abs(raw_y - g))
+            if abs(raw_y - gy) <= GRID_SNAP_PT:
+                snap_y = gy
+                off_grid = False
+
+        px, py = snap_x, snap_y   # final placed position
+
+        # Dedup using final position
+        if any(math.hypot(px - ex, py - ey) < DEDUP_PT
+               for ex, ey in existing + added):
+            continue
+
+        added.append((px, py))
+        members.append({
+            "profile": "COL", "type": "column", "length_ft": 0.0,
+            "beam_dir": None,
+            "bx1": None, "by1": None, "bx2": None, "by2": None,
+            # Final (placed) position
+            "x":  round(px / page_w, 4), "y":  round(py / page_h, 4),
+            "lx": round(px / page_w, 4), "ly": round(py / page_h, 4),
+            "sx": round(px / page_w, 4), "sy": round(py / page_h, 4),
+            # Raw convergence position (QA field)
+            "raw_x": round(raw_x / page_w, 4),
+            "raw_y": round(raw_y / page_h, 4),
+            "off_grid": off_grid,
+            "w": 0.018, "h": 0.018,
+            "color": MEMBER_COLORS["column"], "confirmed": True,
+            "is_column": True, "size_unknown": True,
+            "source": "col_text_convergence",
+        })
+
     if added:
-        print(f"[COLUMNS] emitted {len(added)} symbol columns at grid intersections")
+        print(f"[COLUMNS] emitted {len(added)} COL-text columns "
+              f"(scale_ratio={scale_ratio}  SEARCH={20.0}\" real  SNAP={6.0}\" real)")
     return members
 
 
@@ -4150,6 +4447,111 @@ def trim_beam_overshoot(members, page_w, page_h, pts_per_foot,
     return members
 
 
+def align_beam_centerlines_2d(members, page_w, page_h, pts_per_foot):
+    """Align horizontal and vertical beams to a consensus centerline.
+
+    Nearly collinear beams are aligned to the same X (vertical) or Y (horizontal) coordinate.
+    This corrects drawing/OCR offset issues so they snap correctly to supports.
+    """
+    if not members:
+        return members
+    ppf = pts_per_foot if pts_per_foot > 0 else 9.0
+
+    beams = []
+    other = []
+    for m in members:
+        if m.get("type") == "beam" and m.get("bx1") is not None:
+            beams.append(m)
+        else:
+            other.append(m)
+
+    # Classify as horizontal/vertical
+    h_beams = []
+    v_beams = []
+    skewed = []
+
+    for m in beams:
+        x1, y1 = m["bx1"] * page_w, m["by1"] * page_h
+        x2, y2 = m["bx2"] * page_w, m["by2"] * page_h
+        dx, dy = x2 - x1, y2 - y1
+        L = math.hypot(dx, dy)
+        if L < 1.0:
+            skewed.append(m)
+            continue
+        ux, uy = dx / L, dy / L
+        if abs(ux) >= 0.98: # horizontal-ish
+            h_beams.append((m, x1, y1, x2, y2, L, ux, uy))
+        elif abs(uy) >= 0.98: # vertical-ish
+            v_beams.append((m, x1, y1, x2, y2, L, ux, uy))
+        else:
+            skewed.append(m)
+
+    # Helper to check collinearity of 2D lines
+    def are_collinear_2d(x1, y1, x2, y2, L1, ux1, uy1,
+                         b_x1, b_y1, b_x2, b_y2, L2, ux2, uy2):
+        dot = abs(ux1 * ux2 + uy1 * uy2)
+        if dot < 0.999: # angle tolerance ~2.5 deg (cos(2.5) = 0.999)
+            return False
+        # Perp distance: perpendicular to line 1
+        px, py = -uy1, ux1
+        dist = abs((b_x1 - x1) * px + (b_y1 - y1) * py)
+        if dist > 1.5 * ppf: # 1.5 ft tolerance
+            return False
+        return True
+
+    # Group collinear
+    def group_collinear(beam_tuples):
+        groups = []
+        used = set()
+        for i, b1 in enumerate(beam_tuples):
+            if i in used: continue
+            group = [b1]
+            used.add(i)
+            for j, b2 in enumerate(beam_tuples):
+                if j in used: continue
+                if are_collinear_2d(b1[1], b1[2], b1[3], b1[4], b1[5], b1[6], b1[7],
+                                    b2[1], b2[2], b2[3], b2[4], b2[5], b2[6], b2[7]):
+                    group.append(b2)
+                    used.add(j)
+            groups.append(group)
+        return groups
+
+    h_groups = group_collinear(h_beams)
+    v_groups = group_collinear(v_beams)
+
+    # Align horizontal groups
+    h_aligned = 0
+    for group in h_groups:
+        if len(group) < 2: continue
+        total_l = sum(b[5] for b in group)
+        weighted_y = sum((b[2] + b[4]) / 2.0 * b[5] for b in group)
+        consensus_y = weighted_y / total_l
+        for b, x1, y1, x2, y2, L, ux, uy in group:
+            b["by1"] = round(consensus_y / page_h, 4)
+            b["by2"] = round(consensus_y / page_h, 4)
+            b["y"] = round(consensus_y / page_h, 4)
+            h_aligned += 1
+
+    # Align vertical groups
+    v_aligned = 0
+    for group in v_groups:
+        if len(group) < 2: continue
+        total_l = sum(b[5] for b in group)
+        weighted_x = sum((b[1] + b[3]) / 2.0 * b[5] for b in group)
+        consensus_x = weighted_x / total_l
+        for b, x1, y1, x2, y2, L, ux, uy in group:
+            b["bx1"] = round(consensus_x / page_w, 4)
+            b["bx2"] = round(consensus_x / page_w, 4)
+            b["x"] = round(consensus_x / page_w, 4)
+            v_aligned += 1
+
+    if h_aligned or v_aligned:
+        print(f"[ALIGN] aligned {h_aligned} horizontal and {v_aligned} vertical beam centerlines")
+
+    res_beams = [b[0] for b in h_beams] + [b[0] for b in v_beams] + skewed
+    return res_beams + other
+
+
 def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
                                page_w, page_h, pts_per_foot):
     """UNIVERSAL endpoint rule: a beam runs SUPPORT-to-SUPPORT.
@@ -4179,7 +4581,7 @@ def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
     IN_WIN   = 14.0 * ppf     # trim overshoot up to ~14 ft inward to a support
     OUT_WIN  = 4.0  * ppf     # extend a short end only up to ~4 ft to a support
     MIN_SPAN = 3.0  * ppf     # never trim a beam shorter than a real minimum span
-    PERP_DOT = 0.30           # |cos| < 0.30  → >72°  → perpendicular-ish
+    PERP_DOT = 0.55           # |cos| < 0.55  → >56°  → perpendicular-ish
     cols_x   = sorted(col_x or [])
     cols_y   = sorted(col_y or [])
 
@@ -4412,8 +4814,21 @@ class AnalysisRequest(BaseModel):
     page_index:       int   = 0
     scale_ratio:      float = None
     ocr_dpi:          int   = 400
+    detect_braces:    bool  = True    # run brace classifier layer
     detect_unlabeled: bool  = False   # off by default — enable to show (beam?) candidates
-    detect_braces:    bool  = False   # off by default — enable to overlay brace extraction
+
+FLOOR_HEIGHT_FT = 14.0   # default storey height used for auto-elevation from page index
+
+class ModelRequest(BaseModel):
+    filename:           str
+    page_index:         int            = 0
+    scale_ratio:        float          = None
+    detect_unlabeled:   bool           = False
+    # When None, floor_elevation_ft is auto-derived from page_index:
+    #   floor_elevation_ft = (page_index + 1) * FLOOR_HEIGHT_FT
+    # Set explicitly to override (e.g. floor_elevation_ft=20.0 for a 20ft storey).
+    floor_elevation_ft: float | None   = None
+    detect_braces:      bool           = False
 
 class SaveProjectRequest(BaseModel):
     name:        str
@@ -4586,7 +5001,8 @@ async def analyse_pdf(req: AnalysisRequest):
         plan_bounds = find_plan_boundary(page, page_w, page_h, text_dict=text_dict)
 
         # 2. Detect column symbols (I/H shapes in vector paths) — skip for raster
-        column_symbols = [] if is_raster else detect_column_symbols(page)
+        column_symbols = [] if is_raster else detect_column_symbols(
+            page, scale_ratio=req.scale_ratio or 96)
 
         # 3. Grid lines — SECONDARY signal
         v_grid, h_grid = extract_grid_lines(page, page_w, page_h, plan_bounds,
@@ -4818,8 +5234,13 @@ async def analyse_pdf(req: AnalysisRequest):
 
         # Count columns: emit a column member for each column symbol at a grid
         # intersection (framing-plan columns have no size label of their own).
+        _col_scale = req.scale_ratio or 96
         members = emit_symbol_columns(members, column_symbols, v_grid, h_grid,
-                                      page_w, page_h)
+                                      page_w, page_h, scale_ratio=_col_scale)
+        # COL text label columns — placed at beam convergence, not at label text.
+        members = extract_col_text_columns(page, page_w, page_h, members,
+                                           v_grid=v_grid, h_grid=h_grid,
+                                           scale_ratio=_col_scale)
 
         # Unlabeled beams: geometry-detected candidates with no section callout.
         # Gated by detect_unlabeled flag (default OFF) so the UI stays clean
@@ -4839,6 +5260,7 @@ async def analyse_pdf(req: AnalysisRequest):
         # — and stop there.  Trims overshoot and closes short gaps along the axis.
         # Runs after unlabeled detection so candidates terminate like real girders.
         if not is_raster:
+            members = align_beam_centerlines_2d(members, page_w, page_h, pts_per_foot)
             _ccx2, _ccy2 = clean_column_lines(v_grid, h_grid, column_symbols)
             members = snap_beam_ends_to_supports(
                 members, _all_struct_lns, _ccx2, _ccy2,
@@ -4865,20 +5287,45 @@ async def analyse_pdf(req: AnalysisRequest):
                     _b_candidates  = _brace_extract_diagonals(page, _bppf)
                     _b_ctx, _      = _brace_classify_context(page)
                     _b_scales      = _brace_find_scales(page)
-                    _b_classified  = _brace_classify(_b_candidates, _b_ctx, _b_scales, _bppf)
+                    # Node extraction now runs for framing_plan too (strict both-
+                    # endpoint check in brace_classifier.py Layer 5).
+                    from brace_classifier import NODE_CHECK_CONTEXTS as _NODE_CTX
+                    _b_nodes       = (
+                        _brace_extract_nodes(page, _bppf)
+                        if _b_ctx in _NODE_CTX
+                        else None
+                    )
+                    _b_openings    = _brace_extract_openings(page)
+                    _b_classified  = _brace_classify(_b_candidates, _b_ctx, _b_scales, _bppf, _b_nodes, _b_openings)
+                    _b_classified  = _brace_enrich(_b_classified, page)
+
+                    # Post-enrichment gate: reject diagonals labelled with a
+                    # W-section profile.  A W-beam label next to a diagonal line
+                    # means the line is a sloped/skewed beam, NOT a structural
+                    # brace.  Real braces use HSS / angle (L) / TS / double-L.
+                    _W_SECTION_RE = re.compile(r'^W\s*\d{1,3}\s*[Xx]\s*\d', re.I)
+                    for _bc in _b_classified:
+                        if (_bc.get("confidence") in ("HIGH", "MEDIUM")
+                                and _bc.get("section_label")
+                                and _W_SECTION_RE.match(_bc["section_label"])):
+                            _bc["confidence"]    = "REJECT"
+                            _bc["reject_reason"] = f"w_section_label:{_bc['section_label']}"
 
                     _b_high   = [c for c in _b_classified if c["confidence"] == "HIGH"]
                     _b_medium = [c for c in _b_classified if c["confidence"] == "MEDIUM"]
 
                     for _bc in (_b_high + _b_medium):
                         members.append({
-                            "type":       "brace",
-                            "profile":    None,
-                            "label":      None,
-                            "confidence": _bc["confidence"],
-                            "context":    _bc.get("page_context", _b_ctx),
-                            "length_ft":  _bc["length_ft"],
-                            "angle_deg":  _bc["angle_from_h"],
+                            "type":             "brace",
+                            "profile":          _bc.get("section_label"),
+                            "label":            None,
+                            "config":           _bc.get("config", "single_diagonal"),
+                            "role":             _bc.get("role", "lateral_unconfirmed"),
+                            "detection_method": _bc.get("detection_method", "rules"),
+                            "confidence":       _bc["confidence"],
+                            "context":          _bc.get("page_context", _b_ctx),
+                            "length_ft":        _bc["length_ft"],
+                            "angle_deg":        _bc["angle_from_h"],
                             # Normalised fractional coords (0–1) matching beam format
                             "bx1":  round(_bc["x1"] / page_w, 4),
                             "by1":  round(_bc["y1"] / page_h, 4),
@@ -5017,6 +5464,72 @@ async def get_saved_projects():
         ]
     except Exception:
         return []
+
+
+@app.post("/model")
+async def build_model(req: ModelRequest):
+    """
+    Run full extraction and return a standardized structural model JSON.
+    Always enables brace extraction regardless of the BRACE_EXTRACTION env flag.
+    Response schema: { schema_version, source, page, floor_elevation_ft, units,
+                       page_dims, nodes, members, connectivity, validation, gap_analysis }
+    """
+    from structural_schema import build_structural_model as _build_model
+
+    # Run analysis with braces always on
+    analysis_req = AnalysisRequest(
+        filename         = req.filename,
+        page_index       = req.page_index,
+        scale_ratio      = req.scale_ratio,
+        detect_braces    = True,
+        detect_unlabeled = req.detect_unlabeled,
+    )
+    analysis = await analyse_pdf(analysis_req)
+    members  = analysis["members"]
+
+    # Get page dimensions (same logic as /analyse)
+    tmp_path = os.path.join(UPLOAD_DIR, req.filename)
+    ext      = os.path.splitext(req.filename)[1].lower()
+    if ext in _IMAGE_EXTS:
+        _pil = PILImage.open(tmp_path)
+        page_w, page_h = float(_pil.width), float(_pil.height)
+        _pil.close()
+    else:
+        _doc  = fitz.open(tmp_path)
+        _page = _doc[req.page_index]
+        if _page.rotation in (90, 270):
+            page_w, page_h = _page.mediabox.width, _page.mediabox.height
+        else:
+            page_w, page_h = _page.rect.width, _page.rect.height
+        _doc.close()
+
+    # Fix 1: derive per-page floor elevation from page index when not explicit.
+    # page_index=0 → floor at 1×FLOOR_HEIGHT_FT, base at 0
+    # page_index=1 → floor at 2×FLOOR_HEIGHT_FT, base at 1×FLOOR_HEIGHT_FT
+    if req.floor_elevation_ft is not None:
+        floor_elev = req.floor_elevation_ft
+        base_elev  = max(0.0, floor_elev - FLOOR_HEIGHT_FT)
+    else:
+        floor_elev = (req.page_index + 1) * FLOOR_HEIGHT_FT
+        base_elev  = req.page_index * FLOOR_HEIGHT_FT
+
+    print(f"[MODEL] page={req.page_index}  floor_elev={floor_elev}ft  base_elev={base_elev}ft")
+
+    model = _build_model(
+        members            = members,
+        page_width_pts     = page_w,
+        page_height_pts    = page_h,
+        scale_ratio        = req.scale_ratio or 96,
+        source             = req.filename,
+        page               = req.page_index,
+        floor_elevation_ft = floor_elev,
+        base_elevation_ft  = base_elev,
+    )
+
+    model["analysis_summary"] = analysis.get("summary", {})
+    model["analysis_method"]  = analysis.get("method", "unknown")
+    model["elapsed"]          = analysis.get("elapsed", 0)
+    return model
 
 
 if __name__ == "__main__":

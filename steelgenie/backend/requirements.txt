@@ -1,0 +1,13 @@
+fastapi>=0.115.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+supabase>=2.30.0
+PyMuPDF>=1.24.0
+python-multipart>=0.0.9
+uvicorn>=0.30.0
+watchfiles>=0.21.0
+easyocr>=1.7.0
+pdf2image>=1.17.0
+pillow>=10.0.0
+opencv-python>=4.9.0
+numpy>=1.24.0
