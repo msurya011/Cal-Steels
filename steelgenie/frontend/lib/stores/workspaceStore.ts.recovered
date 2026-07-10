@@ -72,7 +72,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'All',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -93,7 +93,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'Steel only',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
     aids: {
       markers: false,
       rulers: false,
@@ -114,7 +114,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'QA pass',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -135,7 +135,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'Braces check',
     classVisibility: { beam: false, column: false, vbrace: true, hbrace: true, joist: false, unlabelled: false },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -177,7 +177,7 @@ const getInitialLayers = (): LayersState => {
   return {
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1.0, column: 1.0, vbrace: 1.0, hbrace: 1.0, joist: 1.0, unlabelled: 1.0 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
     planVisible: true,
     aids: {
       markers: true,
@@ -384,7 +384,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
       const defaultLayers = {
         classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
         classOpacity: { beam: 1.0, column: 1.0, vbrace: 1.0, hbrace: 1.0, joist: 1.0, unlabelled: 1.0 },
-        classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+        classColors: { column: '#3B82F6', beam: '#EC4899', vbrace: '#F59E0B', hbrace: '#06B6D4', joist: '#8B5CF6', unlabelled: '#64748B' },
         planVisible: true,
         aids: {
           markers: true,

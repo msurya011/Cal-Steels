@@ -48,31 +48,82 @@ async def get_bom(
     project_id: UUID,
     user: AuthUser,
     category: Optional[str] = Query(None),
+    piecemark: Optional[str] = Query(None),
+    section_type: Optional[str] = Query(None),
     section: Optional[str] = Query(None),
     grade: Optional[str] = Query(None),
+    labor_code: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    sequence: Optional[int] = Query(None),
     is_main: Optional[bool] = Query(None),
-    limit: int = Query(200, le=1000),
+    sheet: Optional[str] = Query(None, description="Filter to a single drawing/sheet — a project can span multiple uploaded drawings"),
+    search: Optional[str] = Query(None, description="Matches piecemark, section, or category"),
+    limit: int = Query(200, le=5000),
     offset: int = Query(0, ge=0),
 ):
     db = get_db()
     q = db.table("bom_items").select("*").eq("project_id", str(project_id)).order("piecemark")
     if category:
         q = q.eq("category", category)
+    if piecemark:
+        q = q.ilike("piecemark", f"%{piecemark}%")
+    if section_type:
+        q = q.eq("section_type", section_type)
     if section:
         q = q.ilike("section", f"%{section}%")
     if grade:
         q = q.eq("grade", grade)
+    if labor_code:
+        q = q.eq("labor_code", labor_code)
+    if status_filter:
+        q = q.eq("status", status_filter)
+    if sequence is not None:
+        q = q.eq("sequence", sequence)
     if is_main is not None:
         q = q.eq("is_main", is_main)
+    if sheet:
+        q = q.eq("sheet", sheet)
+    if search:
+        q = q.ilike("piecemark", f"%{search}%")
     q = q.range(offset, offset + limit - 1)
     resp = q.execute()
     return resp.data or []
 
 
-@router.get("/projects/{project_id}/bom/summary", response_model=BomSummary)
-async def get_bom_summary(project_id: UUID, user: AuthUser):
+@router.get("/projects/{project_id}/bom/facets")
+async def get_bom_facets(project_id: UUID, user: AuthUser):
+    """Distinct values per filterable column, for populating the BOM filter sidebar."""
     db = get_db()
-    resp = db.table("bom_items").select("category,weight_lbs,qty").eq("project_id", str(project_id)).execute()
+    resp = db.table("bom_items").select("*").eq("project_id", str(project_id)).execute()
+    items = resp.data or []
+
+    def _distinct(field: str):
+        return sorted({str(r[field]) for r in items if r.get(field) not in (None, "")})
+
+    return {
+        "category": _distinct("category"),
+        "piecemark": _distinct("piecemark"),
+        "section_type": _distinct("section_type"),
+        "section": _distinct("section"),
+        "grade": _distinct("grade"),
+        "labor_code": _distinct("labor_code"),
+        "status": _distinct("status"),
+        "sequence": _distinct("sequence"),
+        "sheet": _distinct("sheet"),
+    }
+
+
+@router.get("/projects/{project_id}/bom/summary", response_model=BomSummary)
+async def get_bom_summary(
+    project_id: UUID, 
+    user: AuthUser,
+    sheet: Optional[str] = Query(None, description="Filter to a single drawing/sheet")
+):
+    db = get_db()
+    q = db.table("bom_items").select("category,weight_lbs,qty").eq("project_id", str(project_id))
+    if sheet:
+        q = q.eq("sheet", sheet)
+    resp = q.execute()
     items = resp.data or []
 
     total_lbs = sum((r.get("weight_lbs") or 0) * (r.get("qty") or 1) for r in items)

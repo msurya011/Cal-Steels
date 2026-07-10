@@ -19,6 +19,9 @@ DEFAULT_CONFIG = {
     "beam_end_reaction": {
         "mode": "udl",
         "udl_percent": 50,
+        # Assumed uniform design load (kips/ft) used by the UDL reaction model
+        # until plan-reaction OCR is implemented — see engineering/reactions.py.
+        "default_udl_klf": 1.5,
     },
     "seismic": {
         "moment_frame": "non_seismic",

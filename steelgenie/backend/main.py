@@ -1187,6 +1187,13 @@ def detect_beam_directions(page, profiles: list, plan_bounds: tuple) -> dict:
 
     h_lines: list[tuple[float, float]] = []
     v_lines: list[tuple[float, float]] = []
+    # Lines that are neither clearly H nor clearly V — a genuinely skewed/
+    # angled beam (e.g. in a rotated wing of the building). Previously these
+    # were dropped entirely, so a profile label sitting on a true diagonal
+    # beam had no candidate line in range and silently defaulted to "H",
+    # which downstream gets snapped onto the horizontal grid and rendered as
+    # a straight line — visibly wrong against the angled drawing underneath.
+    d_lines: list[tuple[float, float, float]] = []  # (lx, ly, angle_deg)
 
     try:
         for d in page.get_drawings():
@@ -1208,25 +1215,36 @@ def detect_beam_directions(page, profiles: list, plan_bounds: tuple) -> dict:
                         h_lines.append((lx, ly))
                     elif dy > dx * DIR_RATIO:
                         v_lines.append((lx, ly))
+                    else:
+                        angle = math.degrees(math.atan2(p2.y - p1.y, p2.x - p1.x))
+                        d_lines.append((lx, ly, angle))
                 except Exception:
                     continue
     except Exception:
         pass
 
-    print(f"[BEAM_DIR] H-lines: {len(h_lines)}  V-lines: {len(v_lines)}")
+    print(f"[BEAM_DIR] H-lines: {len(h_lines)}  V-lines: {len(v_lines)}  D-lines: {len(d_lines)}")
 
     directions: dict[int, str] = {}
+    angles: dict[int, float] = {}
     for p_idx, p in enumerate(profiles):
         pcx, pcy = p["cx"], p["cy"]
         d_h = min((math.hypot(pcx - lx, pcy - ly) for lx, ly in h_lines),
                   default=float("inf"))
         d_v = min((math.hypot(pcx - lx, pcy - ly) for lx, ly in v_lines),
                   default=float("inf"))
+        nearest_d = min(d_lines, key=lambda t: math.hypot(pcx - t[0], pcy - t[1]), default=None)
+        d_d = math.hypot(pcx - nearest_d[0], pcy - nearest_d[1]) if nearest_d else float("inf")
 
-        if d_h <= SEARCH_R or d_v <= SEARCH_R:
-            directions[p_idx] = "H" if d_h <= d_v else "V"
+        best = min(d_h, d_v, d_d)
+        if best <= SEARCH_R:
+            if best == d_d:
+                directions[p_idx] = "D"
+                angles[p_idx] = nearest_d[2]
+            else:
+                directions[p_idx] = "H" if d_h <= d_v else "V"
         else:
-            directions[p_idx] = "H"  # default — horizontal beam
+            directions[p_idx] = "H"  # default — horizontal beam, no line found at all
 
     return directions
 
@@ -4093,10 +4111,17 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                 for m in members if m.get("type") == "column"]
 
     beam_ends = []
+    beam_end_dirs: dict[tuple[float, float], str] = {}
     for m in members:
         if m.get("type") == "beam" and m.get("bx1") is not None:
-            beam_ends.append((m["bx1"] * page_w, m["by1"] * page_h))
-            beam_ends.append((m["bx2"] * page_w, m["by2"] * page_h))
+            e1 = (m["bx1"] * page_w, m["by1"] * page_h)
+            e2 = (m["bx2"] * page_w, m["by2"] * page_h)
+            beam_ends.append(e1)
+            beam_ends.append(e2)
+            bdir = m.get("beam_dir")
+            if bdir:
+                beam_end_dirs[e1] = bdir
+                beam_end_dirs[e2] = bdir
 
     added: list[tuple[float, float]] = []
     rejected = 0
@@ -4202,6 +4227,12 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
         })
 
     # ── Emit Suggested Ghost Columns ──────────────────────────────────────────
+    # A real column is where beams frame in from PERPENDICULAR directions (a
+    # girder crossed by joists/beams) — not just any 2+ nearby endpoints.
+    # Without that direction check, a run of closely-spaced parallel joists
+    # landing on one continuous girder (completely normal framing) triggers a
+    # ghost column at nearly every joist, flooding the plan with false
+    # "Column?" marks. Require both H- and V-running beams in the cluster.
     if v_grid and h_grid:
         for gx in v_grid:
             for gy in h_grid:
@@ -4213,7 +4244,10 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                                for ux, uy in unique_ends):
                         unique_ends.append((ex, ey))
 
-                if len(unique_ends) >= 2:
+                _dirs = {beam_end_dirs.get(pt) for pt in unique_ends} - {None}
+                _orthogonal = ({"H", "V"} <= _dirs) if _dirs else True
+
+                if len(unique_ends) >= 2 and _orthogonal:
                     has_col = False
                     for m in members:
                         if m.get("type") == "column":

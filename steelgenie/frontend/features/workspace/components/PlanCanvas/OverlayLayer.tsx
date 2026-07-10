@@ -45,7 +45,11 @@ export function OverlayLayer({
   onMemberDragEnd,
 }: OverlayLayerProps) {
   const store = useWorkspaceStore()
-  const { layers, selection, hiddenIds, isolation, zoomTarget } = store
+  const { layers, selection, hiddenIds, isolation, zoomTarget, zoomLevel } = store
+  // Labels are always shown, SteelGenie-style — now that they're plain rotated
+  // text (no chip/bubble background) they're light enough not to clutter dense
+  // sheets even at full-plan zoom-out, matching the reference framing plans.
+  const showChips = true
 
   // Helper to compose label text dynamically
   const getLabelText = (m: Member) => {
@@ -94,7 +98,13 @@ export function OverlayLayer({
         </filter>
       </defs>
 
-      {members.map((m) => {
+      {/* Columns sit exactly where beam lines converge — if a column happened
+          to be earlier in the members array than the beams crossing it, SVG's
+          paint-order-by-document-order would bury the column marker under
+          the beam lines drawn on top of it, making it invisible even though
+          it's rendering correctly. Force columns to always paint last (on
+          top) so every column marker is guaranteed visible. */}
+      {[...members].sort((a, b) => (a.kind === 'column' ? 1 : 0) - (b.kind === 'column' ? 1 : 0)).map((m) => {
         const renderProps = getMemberRenderProps({ layers, hiddenIds, isolation }, m)
         if (!renderProps.visible) return null
 
@@ -220,20 +230,42 @@ export function OverlayLayer({
                   filter: filterStyle,
                 }}
               />
-              {/* Label */}
-              {getLabelText(m) && (
-                <text
-                  x={`${(x1 + x2) / 2}%`}
-                  y={`${(y1 + y2) / 2 - 1.5}%`}
-                  fill={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : (layers.colorMode === 'kind' ? '#EC4899' : color)}
-                  fontSize="9px"
-                  fontWeight="bold"
-                  textAnchor="middle"
-                  style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
-                >
-                  {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${getLabelText(m)}` : getLabelText(m)}
-                </text>
-              )}
+              {/* Label — plain text rotated along the beam, SteelGenie-style (no chip background) */}
+              {(showChips || isHovered || isSelected || isZoomTarget) && getLabelText(m) && (() => {
+                const labelText = isLowConf && layers.colorMode === 'kind' ? `⚠ ${getLabelText(m)}` : getLabelText(m)!
+                const midX = (x1 + x2) / 2
+                const midY = (y1 + y2) / 2
+                // Prefer the backend-computed true angle; fall back to the on-screen
+                // line angle (approximate — % space isn't square, but close enough
+                // for near-horizontal/vertical members which dominate framing plans).
+                let angle = geo.angle_deg ?? (Math.atan2(y2 - y1, x2 - x1) * 180) / Math.PI
+                // Keep text upright/readable — never render upside-down.
+                if (angle > 90) angle -= 180
+                if (angle < -90) angle += 180
+                const labelColor = isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color
+                return (
+                  <text
+                    x={`${midX}%`}
+                    y={`${midY - 1.1}%`}
+                    fill={labelColor}
+                    fontSize="7px"
+                    fontWeight="700"
+                    textAnchor="middle"
+                    style={{
+                      userSelect: 'none',
+                      paintOrder: 'stroke',
+                      stroke: '#0B1220',
+                      strokeWidth: 2.2,
+                      pointerEvents: 'none',
+                      transformBox: 'fill-box',
+                      transformOrigin: 'center',
+                      transform: `rotate(${angle}deg)`,
+                    }}
+                  >
+                    {labelText}
+                  </text>
+                )
+              })()}
             </g>
           )
         }
@@ -241,6 +273,11 @@ export function OverlayLayer({
         // 3. Brace rendering
         const bx = geo.x * 100
         const by = geo.y * 100
+        const bgx1 = geo.bx1 !== undefined && geo.bx1 !== null ? geo.bx1 * 100 : null
+        const bgy1 = geo.by1 !== undefined && geo.by1 !== null ? geo.by1 * 100 : null
+        const bgx2 = geo.bx2 !== undefined && geo.bx2 !== null ? geo.bx2 * 100 : null
+        const bgy2 = geo.by2 !== undefined && geo.by2 !== null ? geo.by2 * 100 : null
+        const hasBraceLine = bgx1 !== null && bgy1 !== null && bgx2 !== null && bgy2 !== null
 
         return (
           <g
@@ -288,7 +325,22 @@ export function OverlayLayer({
               />
             )}
 
-            {/* Base Brace circle */}
+            {/* Diagonal brace line, when true endpoint geometry is available */}
+            {hasBraceLine && (
+              <line
+                x1={`${bgx1}%`}
+                y1={`${bgy1}%`}
+                x2={`${bgx2}%`}
+                y2={`${bgy2}%`}
+                fill="none"
+                stroke={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color}
+                strokeWidth={isHovered ? 3.0 : 1.8}
+                className={isZoomTarget ? 'pulsing-member' : ''}
+                style={{ transition: 'all 0.1s ease', filter: filterStyle }}
+              />
+            )}
+
+            {/* Base Brace node marker */}
             <circle
               cx={`${bx}%`}
               cy={`${by}%`}
@@ -302,19 +354,38 @@ export function OverlayLayer({
                 filter: filterStyle,
               }}
             />
-            {getLabelText(m) && (
-              <text
-                x={`${bx}%`}
-                y={`${by - 6}%`}
-                fill={isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : (layers.colorMode === 'kind' ? '#F59E0B' : color)}
-                fontSize="9px"
-                fontWeight="bold"
-                textAnchor="middle"
-                style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 2 }}
-              >
-                {isLowConf && layers.colorMode === 'kind' ? `⚠️ ${getLabelText(m)}` : getLabelText(m)}
-              </text>
-            )}
+            {/* Label — plain text, no chip background, SteelGenie-style */}
+            {(showChips || isHovered || isSelected || isZoomTarget) && getLabelText(m) && (() => {
+              const labelText = isLowConf && layers.colorMode === 'kind' ? `⚠ ${getLabelText(m)}` : getLabelText(m)!
+              const labelColor = isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color
+              const midX = hasBraceLine ? (bgx1! + bgx2!) / 2 : bx
+              const midY = hasBraceLine ? (bgy1! + bgy2!) / 2 : by
+              let angle = geo.angle_deg ?? (hasBraceLine ? (Math.atan2(bgy2! - bgy1!, bgx2! - bgx1!) * 180) / Math.PI : 0)
+              if (angle > 90) angle -= 180
+              if (angle < -90) angle += 180
+              return (
+                <text
+                  x={`${midX}%`}
+                  y={`${midY - 1.4}%`}
+                  fill={labelColor}
+                  fontSize="7px"
+                  fontWeight="700"
+                  textAnchor="middle"
+                  style={{
+                    userSelect: 'none',
+                    paintOrder: 'stroke',
+                    stroke: '#0B1220',
+                    strokeWidth: 2.2,
+                    pointerEvents: 'none',
+                    transformBox: 'fill-box',
+                    transformOrigin: 'center',
+                    transform: `rotate(${angle}deg)`,
+                  }}
+                >
+                  {labelText}
+                </text>
+              )
+            })()}
           </g>
         )
       })}

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Trash2, Check, AlertTriangle, Layers, Copy, RotateCcw, RotateCw } from 'lucide-react'
+import { Trash2, Check, AlertTriangle, Layers, Copy, RotateCcw, RotateCw, ChevronDown, ChevronRight, Lock, Unlock, Info } from 'lucide-react'
 import { sectionsApi } from '../../../lib/api'
 import { toast } from 'sonner'
 
@@ -94,6 +94,16 @@ export function PropertiesPanel({
   const [leftEnd, setLeftEnd] = useState('')
   const [rightEnd, setRightEnd] = useState('')
 
+  // Connections sub-panel — Left/Right end connection design, matching the
+  // reference product's Connections accordion. Editable overrides; shear
+  // force stays locked (computed) unless the user explicitly unlocks it.
+  const [connectionsOpen, setConnectionsOpen] = useState(false)
+  const emptyConn = () => ({ type: 'Simple', detail: 'Clip Angle', shear: '', locked: true, advOpen: false, welded: false, force: true, maximize: false })
+  const [leftConn, setLeftConn] = useState(emptyConn())
+  const [rightConn, setRightConn] = useState(emptyConn())
+  const updateLeftConn = (patch: Partial<ReturnType<typeof emptyConn>>) => setLeftConn((c) => ({ ...c, ...patch }))
+  const updateRightConn = (patch: Partial<ReturnType<typeof emptyConn>>) => setRightConn((c) => ({ ...c, ...patch }))
+
   // Multi-select bulk states
   const [bulkKind, setBulkKind] = useState('')
   const [bulkSection, setBulkSection] = useState('')
@@ -126,7 +136,12 @@ export function PropertiesPanel({
       setPourStop(!!geo.pour_stop)
       setLeftEnd(geo.left_end || '')
       setRightEnd(geo.right_end || '')
-      
+
+      const conns = geo.connections || {}
+      setLeftConn({ ...emptyConn(), ...(conns.left || {}) })
+      setRightConn({ ...emptyConn(), ...(conns.right || {}) })
+      setConnectionsOpen(false)
+
       setSuggestions([])
       setShowSuggestions(false)
       setActiveTab('member') // Auto switch to member tab on select
@@ -189,6 +204,7 @@ export function PropertiesPanel({
         pour_stop: updatedGeo.hasOwnProperty('pour_stop') ? updatedGeo.pour_stop : pourStop,
         left_end: updatedGeo.hasOwnProperty('left_end') ? updatedGeo.left_end : (leftEnd || formatFtIn(pageTos)),
         right_end: updatedGeo.hasOwnProperty('right_end') ? updatedGeo.right_end : (rightEnd || formatFtIn(pageTos)),
+        connections: updatedGeo.hasOwnProperty('connections') ? updatedGeo.connections : { left: leftConn, right: rightConn },
       }
       
       await onUpdate(member.id, {
@@ -293,6 +309,119 @@ export function PropertiesPanel({
         setSaving(false)
       }
     }
+  }
+
+  // Renders one side (Left/Right) of the Connections accordion: type/detail
+  // selects, a locked shear-force readout (unlock to override manually), and
+  // a nested "Additional Options" accordion with Welded/Force/Maximize
+  // Connection toggles — matching the reference product's connection editor.
+  const selStyle: React.CSSProperties = {
+    padding: '7px 9px', backgroundColor: 'rgba(30, 41, 59, 0.8)',
+    border: '1px solid rgba(59, 130, 246, 0.15)', borderRadius: '6px',
+    color: '#F1F5F9', fontSize: '12px', outline: 'none', width: '100%', boxSizing: 'border-box',
+  }
+  const connLabelStyle: React.CSSProperties = { fontSize: '10px', fontWeight: 600, color: '#94A3B8', marginBottom: '4px', display: 'block' }
+
+  function renderConnectionSide(
+    title: string,
+    conn: ReturnType<typeof emptyConn>,
+    update: (patch: Partial<ReturnType<typeof emptyConn>>) => void
+  ) {
+    const commit = (patch: Partial<ReturnType<typeof emptyConn>>) => {
+      const next = { ...conn, ...patch }
+      update(patch)
+      const geo = { left: title === 'Left Connection' ? next : leftConn, right: title === 'Right Connection' ? next : rightConn }
+      autoSave({ geometry: { connections: geo } })
+    }
+    return (
+      <div style={{ border: '1px solid rgba(255,255,255,0.06)', borderRadius: '6px', padding: '10px', backgroundColor: 'rgba(255,255,255,0.015)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ width: '7px', height: '7px', borderRadius: '50%', backgroundColor: '#3B82F6', display: 'inline-block' }} />
+            <span style={{ fontSize: '12px', fontWeight: 700, color: '#F1F5F9' }}>{title}</span>
+          </div>
+          <a
+            href="#"
+            onClick={(e) => { e.preventDefault(); toast.info(`${title}: ${conn.type} / ${conn.detail}${conn.shear ? ` — ${conn.shear} lb shear` : ''}`) }}
+            style={{ fontSize: '11px', color: '#F59E0B', textDecoration: 'none' }}
+          >
+            Details
+          </a>
+        </div>
+
+        <div style={{ marginBottom: '10px' }}>
+          <label style={connLabelStyle}>Connection Type</label>
+          <select value={conn.type} onChange={(e) => commit({ type: e.target.value })} style={selStyle}>
+            <option value="Simple">Simple</option>
+            <option value="Moment">Moment</option>
+            <option value="Bearing">Bearing</option>
+          </select>
+        </div>
+
+        <div style={{ marginBottom: '10px' }}>
+          <label style={connLabelStyle}>Connection Detail</label>
+          <select value={conn.detail} onChange={(e) => commit({ detail: e.target.value })} style={selStyle}>
+            <option value="Clip Angle">Clip Angle</option>
+            <option value="Shear Tab">Shear Tab</option>
+            <option value="Seated">Seated</option>
+            <option value="Single Plate">Single Plate</option>
+            <option value="Welded Flange">Welded Flange</option>
+          </select>
+        </div>
+
+        <div style={{ marginBottom: '10px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+            <label style={{ ...connLabelStyle, marginBottom: 0 }}>Shear Force</label>
+            <span
+              onClick={() => commit({ locked: !conn.locked })}
+              style={{ cursor: 'pointer', color: conn.locked ? '#64748B' : '#F59E0B', display: 'flex' }}
+              title={conn.locked ? 'Locked — computed from beam reaction. Click to override.' : 'Unlocked — editing manually.'}
+            >
+              {conn.locked ? <Lock size={12} /> : <Unlock size={12} />}
+            </span>
+          </div>
+          <input
+            type="number"
+            readOnly={conn.locked}
+            value={conn.shear}
+            onChange={(e) => update({ shear: e.target.value })}
+            onBlur={() => commit({ shear: conn.shear })}
+            placeholder="Auto"
+            style={{ ...selStyle, backgroundColor: conn.locked ? 'rgba(15, 23, 42, 0.6)' : selStyle.backgroundColor, color: conn.locked ? '#94A3B8' : '#F1F5F9' }}
+          />
+        </div>
+
+        {/* Additional Options nested accordion */}
+        <div
+          onClick={() => commit({ advOpen: !conn.advOpen })}
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '7px 9px', backgroundColor: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '6px', cursor: 'pointer' }}
+        >
+          <span style={{ fontSize: '11px', fontWeight: 600, color: '#F1F5F9' }}>Additional Options</span>
+          {conn.advOpen ? <ChevronDown size={13} color="#94A3B8" /> : <ChevronRight size={13} color="#94A3B8" />}
+        </div>
+
+        {conn.advOpen && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '8px', paddingLeft: '2px' }}>
+            {([
+              ['welded', 'Welded', 'Weld the connection instead of bolting it.'],
+              ['force', 'Force', 'Force this connection to carry the full computed reaction.'],
+              ['maximize', 'Maximize Connection', 'Size the connection to the maximum the section allows.'],
+            ] as const).map(([key, label, tip]) => (
+              <label key={key} style={{ display: 'flex', alignItems: 'center', gap: '7px', fontSize: '12px', color: '#F1F5F9', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={(conn as any)[key]}
+                  onChange={(e) => commit({ [key]: e.target.checked } as any)}
+                  style={{ cursor: 'pointer', width: '14px', height: '14px' }}
+                />
+                {label}
+                <Info size={11} color="#475569" title={tip} />
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+    )
   }
 
   // Summary logic for selected members count
@@ -1018,10 +1147,20 @@ export function PropertiesPanel({
             </div>
 
             {/* Connections sub-accordion */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', backgroundColor: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '6px', cursor: 'pointer', marginTop: '4px' }}>
+            <div
+              onClick={() => setConnectionsOpen((o) => !o)}
+              style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', backgroundColor: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '6px', cursor: 'pointer', marginTop: '4px' }}
+            >
               <span style={{ fontSize: '12px', fontWeight: 600, color: '#F1F5F9' }}>Connections</span>
-              <span style={{ color: '#94A3B8', fontSize: '10px' }}>&gt;</span>
+              {connectionsOpen ? <ChevronDown size={14} color="#94A3B8" /> : <ChevronRight size={14} color="#94A3B8" />}
             </div>
+
+            {connectionsOpen && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', paddingLeft: '2px' }}>
+                {renderConnectionSide('Left Connection', leftConn, updateLeftConn)}
+                {renderConnectionSide('Right Connection', rightConn, updateRightConn)}
+              </div>
+            )}
 
           </div>
 

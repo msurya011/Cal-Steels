@@ -14,6 +14,8 @@ from app.api.v1.events import router as events_router
 from app.api.v1.sections import router as sections_router
 from app.api.v1.exports import router as exports_router
 from app.api.v1.layer_presets import router as layer_presets_router
+from app.api.v1.build import router as build_router
+from app.api.v1.schedulers import router as schedulers_router
 
 api_router = APIRouter(prefix="/api/v1")
 
@@ -30,3 +32,5 @@ api_router.include_router(events_router)
 api_router.include_router(sections_router)
 api_router.include_router(exports_router)
 api_router.include_router(layer_presets_router)
+api_router.include_router(build_router)
+api_router.include_router(schedulers_router)

@@ -5,7 +5,7 @@ import { useRouter, usePathname, useParams } from 'next/navigation'
 import { useAuth } from '../../../features/auth/hooks/useAuth'
 import { projectsApi } from '../../../lib/api'
 import { Spinner } from '../../../components/ui/Spinner'
-import { ArrowLeft, Play, BarChart3, Box, Settings, CheckSquare } from 'lucide-react'
+import { ArrowLeft, Play, BarChart3, Box, Settings, CheckSquare, Layers, GitBranch } from 'lucide-react'
 import { toast } from 'sonner'
 
 export default function WorkspaceLayout({ children }: { children: React.ReactNode }) {
@@ -36,6 +36,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
     if (pathname?.endsWith('/bom')) return 'bom'
     if (pathname?.endsWith('/3d')) return '3d'
     if (pathname?.endsWith('/config')) return 'config'
+    if (pathname?.endsWith('/columns')) return 'columns'
+    if (pathname?.endsWith('/braces')) return 'braces'
     return 'takeoff'
   }
 
@@ -112,6 +114,8 @@ export default function WorkspaceLayout({ children }: { children: React.ReactNod
         <div style={{ display: 'flex', gap: '4px', backgroundColor: 'rgba(255,255,255,0.06)', padding: '4px', borderRadius: '22px' }}>
           {[
             { id: 'takeoff', label: 'Takeoff', icon: <Play size={14} /> },
+            { id: 'columns', label: 'Columns', icon: <Layers size={14} /> },
+            { id: 'braces', label: 'Braces', icon: <GitBranch size={14} /> },
             { id: 'bom', label: 'BOM Grid', icon: <BarChart3 size={14} /> },
             { id: '3d', label: '3D Model', icon: <Box size={14} /> },
             { id: 'config', label: 'Config', icon: <Settings size={14} /> },

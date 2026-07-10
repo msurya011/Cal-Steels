@@ -168,7 +168,11 @@ export const bomApi = {
     const qs = new URLSearchParams(params).toString()
     return apiFetch(`/api/v1/projects/${projectId}/bom${qs ? '?' + qs : ''}`)
   },
-  summary: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/bom/summary`),
+  summary: (projectId: string, params: Record<string, any> = {}) => {
+    const qs = new URLSearchParams(params).toString()
+    return apiFetch(`/api/v1/projects/${projectId}/bom/summary${qs ? '?' + qs : ''}`)
+  },
+  facets: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/bom/facets`),
   generate: (projectId: string) =>
     apiFetch(`/api/v1/projects/${projectId}/bom/generate`, {
       method: 'POST',
@@ -181,6 +185,26 @@ export const bomApi = {
 // ── JOBS API ─────────────────────────────────────────────────────────────────
 export const jobsApi = {
   get: (jobId: string) => apiFetch(`/api/v1/jobs/${jobId}`),
+}
+
+// ── BUILD API ────────────────────────────────────────────────────────────────
+export const buildApi = {
+  trigger: (projectId: string, pageIds?: string[]) =>
+    apiFetch(`/api/v1/projects/${projectId}/build`, {
+      method: 'POST',
+      body: JSON.stringify({ page_ids: pageIds || null }),
+    }),
+  latest: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/builds/latest`),
+}
+
+// ── SCHEDULERS API (Columns / Braces) ────────────────────────────────────────
+export const schedulersApi = {
+  columnGroups: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/column-groups`),
+  updateColumnGroup: (groupId: string, data: any) =>
+    apiFetch(`/api/v1/column-groups/${groupId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  bracedFrames: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/braced-frames`),
+  updateBracedFrame: (frameId: string, data: any) =>
+    apiFetch(`/api/v1/braced-frames/${frameId}`, { method: 'PATCH', body: JSON.stringify(data) }),
 }
 
 // ── MODEL API ────────────────────────────────────────────────────────────────
@@ -199,6 +223,8 @@ export const configApi = {
       method: 'PUT',
       body: JSON.stringify({ payload }),
     }),
+  reset: (projectId: string) =>
+    apiFetch(`/api/v1/projects/${projectId}/configuration/reset`, { method: 'POST' }),
 }
 
 // ── NOTIFICATIONS API ────────────────────────────────────────────────────────

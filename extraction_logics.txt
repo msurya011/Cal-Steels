@@ -1,0 +1,491 @@
+After reviewing your code "detection_cv.py", I would not replace your detection pipeline. It already has a solid foundation.
+
+Instead, I would upgrade it into a hybrid AI pipeline where:
+
+OpenCV + Vector Extraction = Geometry detection (your current strength)
+LLM (Groq) = Structural reasoning
+Graph Engine = Relationship understanding
+Confidence Scoring = Self-correction
+
+This is exactly how production AI systems are designed.
+
+Current Pipeline
+PDF
+ │
+ ▼
+OCR
+ │
+ ▼
+OpenCV
+ │
+ ▼
+Hough Lines
+ │
+ ▼
+Nearest Label
+ │
+ ▼
+Output
+
+Accuracy
+
+60-70%
+Proposed Pipeline (Target: 95%+)
+                    PDF
+                     │
+                     ▼
+             Vector Extraction
+                     │
+          ┌──────────┴───────────┐
+          ▼                      ▼
+      OCR Agent             Geometry Agent
+          │                      │
+          └──────────┬───────────┘
+                     ▼
+          Structural Graph Builder
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+    Rule Based           AI Relationship Model
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+              Groq LLM Agent
+                     │
+                     ▼
+          Confidence Verification
+                     │
+                     ▼
+              Interactive Viewer
+
+Notice
+
+Your OpenCV stays.
+
+Upgrade 1
+
+Instead of
+
+best_distance = float("inf")
+
+for line in beam_lines:
+    ...
+
+Create candidates.
+
+Example
+
+beam_candidates = [
+{
+    "beam_id":15,
+    "distance":12,
+    "angle":2,
+    "intersection":True
+},
+{
+    "beam_id":17,
+    "distance":25,
+    "angle":5,
+    "intersection":False
+}
+]
+
+Don't assign immediately.
+
+Pass all candidates.
+
+Upgrade 2
+
+Instead of
+
+if distance < LABEL_R:
+
+Calculate
+
+score =
+0.35*distance
++
+0.20*orientation
++
+0.25*intersection
++
+0.20*OCR confidence
+
+Now every beam gets
+
+Beam 15
+
+0.91
+
+Beam 16
+
+0.88
+
+Beam 17
+
+0.76
+
+Already accuracy increases.
+
+Upgrade 3
+
+Now send only difficult cases to Groq.
+
+Example prompt
+
+You are a structural engineer.
+
+Beam Candidates
+
+Beam A
+
+Length : 24'
+
+Horizontal
+
+Nearest Label
+
+W24X55
+
+Distance 18
+
+---------
+
+Beam B
+
+Length : 22'
+
+Vertical
+
+Nearest Label
+
+GRID 5
+
+Distance 20
+
+Which beam should receive the label W24X55?
+
+Return JSON only.
+
+Groq returns
+
+{
+ "beam":"Beam A",
+ "confidence":0.97
+}
+
+Now the LLM is reasoning instead of detecting.
+
+Upgrade 4
+
+Build a Graph
+
+Instead of
+
+beam = {
+"x1":...
+}
+
+Store
+
+beam = {
+
+"id":15,
+
+"start":[120,340],
+
+"end":[550,340],
+
+"connected_columns":[4,5],
+
+"nearby_labels":[2,7],
+
+"nearby_dimensions":[3],
+
+"ocr_confidence":0.94
+}
+
+This graph becomes your knowledge base.
+
+Upgrade 5
+
+Every beam gets confidence.
+
+Beam 1
+
+99%
+
+Beam 2
+
+91%
+
+Beam 3
+
+64%
+
+Beam 4
+
+58%
+
+Anything
+
+<80%
+
+send to AI.
+
+This saves Groq tokens.
+
+Upgrade 6
+
+Instead of
+
+Nearest Label
+
+Create
+
+Beam
+
+↓
+
+Nearby Labels
+
+↓
+
+Nearby Dimensions
+
+↓
+
+Nearby Columns
+
+↓
+
+Nearby Connections
+
+↓
+
+Relationship Score
+
+This alone fixes many failures.
+
+Upgrade 7
+
+Context Window
+
+Instead of asking Groq about one beam,
+
+ask about
+
+Grid A-3
+
+Everything inside
+
+Beam
+
+Column
+
+Labels
+
+Dimensions
+
+Connections
+
+LLMs reason much better with local context.
+
+Upgrade 8
+
+Self Verification
+
+After assigning labels
+
+Ask Groq
+
+These are the detected beams.
+
+Do any labels look inconsistent?
+
+Return corrections.
+
+Example
+
+Beam 15
+
+W24X55
+
+Length
+
+3'
+
+↓
+
+Impossible
+
+↓
+
+Suggest W10X22
+
+Very powerful.
+
+Upgrade 9
+
+Connection Detection
+
+Instead of
+
+Intersection
+
+Create
+
+Node
+
+↓
+
+Beam
+
+↓
+
+Column
+
+↓
+
+Plate
+
+↓
+
+Connection Type
+
+Your entire drawing becomes a graph.
+
+Upgrade 10
+
+Instead of only
+
+Beam
+
+detect
+
+Beam
+
+Column
+
+Brace
+
+Plate
+
+Angle
+
+Channel
+
+Pipe
+
+Base Plate
+
+Bolt Group
+
+Connection
+
+Dimension
+
+Grid Bubble
+
+Section Bubble
+
+Leader
+
+Elevation Marker
+
+Now the AI has more context.
+
+Biggest Improvement
+
+I would completely replace
+
+if distance < LABEL_R:
+
+with
+
+beam_score = (
+distance_score
++
+angle_score
++
+connection_score
++
+intersection_score
++
+ocr_score
++
+vector_score
+)
+
+This is probably the biggest improvement you can make.
+
+Even Bigger Improvement
+
+Eventually I'd replace
+
+Nearest Beam
+
+with a Graph Neural Network (GNN).
+
+Imagine
+
+Beam
+
+↓
+
+Connected Column
+
+↓
+
+Nearby Label
+
+↓
+
+Nearby Dimension
+
+↓
+
+Nearby Beam
+
+↓
+
+Graph Neural Network
+
+↓
+
+Correct Beam Assignment
+
+This is exactly the kind of problem GNNs are designed for.
+
+If I were leading this project
+
+I would organize it into these modules:
+
+steel_ai/
+│
+├── pdf_parser.py
+├── vector_extractor.py
+├── ocr_agent.py
+├── geometry_detector.py
+├── beam_detector.py        (your Hough code)
+├── column_detector.py      (template + contour)
+├── graph_builder.py        ⭐ NEW
+├── relationship_engine.py  ⭐ NEW
+├── confidence_engine.py    ⭐ NEW
+├── llm_agent.py            ⭐ NEW (Groq)
+├── verifier.py             ⭐ NEW
+├── material_counter.py
+├── bom_generator.py
+└── viewer.py
+My strongest recommendation
+
+Don't use the LLM to detect objects. Your OpenCV and vector pipeline are already better suited for that. Use the LLM where it excels: reasoning about ambiguous cases.
+
+I'd make the system hierarchical:
+
+Deterministic geometry (your existing code) handles ~90% of the drawing.
+Confidence engine flags uncertain detections.
+Groq LLM resolves only those uncertain cases using the surrounding structural context.
+Graph verification performs a final consistency check (e.g., every beam should connect to valid structural elements, labels should match expected member types).
+
+That architecture is scalable, cost-effective on the Groq free tier, and capable of reaching the production-level accuracy you're aiming for.

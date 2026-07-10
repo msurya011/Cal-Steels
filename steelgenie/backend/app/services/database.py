@@ -37,7 +37,9 @@ def _load_db() -> dict:
         "sections": [],
         "configurations": [],
         "notifications": [],
-        "layer_presets": []
+        "layer_presets": [],
+        "column_groups": [],
+        "braced_frames": []
     }
     if not os.path.exists(_DB_FILE):
         db = default_db

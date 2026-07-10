@@ -1,10 +1,12 @@
 'use client'
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useParams } from 'next/navigation'
-import { bomApi } from '../../../../lib/api'
+import { bomApi, buildApi, jobsApi, drawingsApi } from '../../../../lib/api'
+import { useWorkspaceStore } from '../../../../lib/stores/workspaceStore'
+import { useWorkspace } from '../../../../features/workspace/hooks/useWorkspace'
 import { Spinner } from '../../../../components/ui/Spinner'
-import { Download, Play, RefreshCw } from 'lucide-react'
+import { Download, RefreshCw, Search, SlidersHorizontal, X, Columns, Upload, ChevronDown, ChevronUp } from 'lucide-react'
 import { toast } from 'sonner'
 
 interface BomItem {
@@ -12,11 +14,23 @@ interface BomItem {
   piecemark: string | null
   category: string | null
   qty: number
+  section_type: string | null
   section: string | null
   length_in: number | null
   grade: string | null
+  labor_code: string | null
   weight_lbs: number | null
+  camber: number
+  cope: number
+  holes: number
+  weld_studs: number
+  status: string | null
+  sequence: number | null
   is_main: boolean
+  sheet: string | null
+  comment: string | null
+  dcr_left: number | null
+  dcr_right: number | null
 }
 
 interface BomSummary {
@@ -26,264 +40,832 @@ interface BomSummary {
   by_category: Record<string, number>
 }
 
+interface BomFacets {
+  category: string[]
+  piecemark: string[]
+  section_type: string[]
+  section: string[]
+  grade: string[]
+  labor_code: string[]
+  status: string[]
+  sequence: string[]
+  sheet: string[]
+}
+
+const EMPTY_FACETS: BomFacets = {
+  category: [], piecemark: [], section_type: [], section: [], grade: [], labor_code: [], status: [], sequence: [], sheet: [],
+}
+
+type Filters = {
+  category: string
+  section_type: string
+  section: string
+  grade: string
+  labor_code: string
+  status: string
+  sequence: string
+  is_main: string // '', 'true', 'false'
+  sheet: string
+}
+
+const EMPTY_FILTERS: Filters = {
+  category: '', section_type: '', section: '', grade: '', labor_code: '', status: '', sequence: '', is_main: '', sheet: '',
+}
+
+function FilterSelect({ label, value, options, onChange, theme = 'dark' }: { label: string; value: string; options: string[]; onChange: (v: string) => void; theme?: 'light' | 'dark' }) {
+  const isLight = theme === 'light'
+  return (
+    <div style={{ marginBottom: '14px' }}>
+      <label style={{ display: 'block', fontSize: '11px', color: '#64748B', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.3px' }}>
+        {label}
+      </label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          width: '100%', padding: '7px 10px',
+          backgroundColor: isLight ? '#F8FAFC' : '#1F2937',
+          border: isLight ? '1px solid #E2E8F0' : '1px solid rgba(59, 130, 246, 0.15)',
+          borderRadius: '6px',
+          color: isLight ? '#334155' : '#F1F5F9',
+          fontSize: '12px', outline: 'none',
+        }}
+      >
+        <option value="">All</option>
+        {options.map((o) => (
+          <option key={o} value={o}>{o}</option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
+function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      onClick={(e) => {
+        e.stopPropagation()
+        onChange(!checked)
+      }}
+      style={{
+        width: '38px',
+        height: '20px',
+        borderRadius: '10px',
+        backgroundColor: checked ? '#00A389' : '#94A3B8',
+        position: 'relative',
+        cursor: 'pointer',
+        border: 'none',
+        outline: 'none',
+        transition: 'background-color 0.2s ease',
+        padding: 0,
+        flexShrink: 0,
+      }}
+    >
+      <div
+        style={{
+          width: '14px',
+          height: '14px',
+          borderRadius: '50%',
+          backgroundColor: '#FFFFFF',
+          position: 'absolute',
+          top: '3px',
+          left: checked ? '21px' : '3px',
+          transition: 'left 0.2s ease',
+        }}
+      />
+    </button>
+  )
+}
+
+const formatStatus = (status: string | null) => {
+  if (!status) return 'Not Started'
+  return status
+    .split('_')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+}
+
 export default function BomPage() {
   const params = useParams()
   const projectId = params?.id as string
 
+  const { currentPageId } = useWorkspaceStore()
+  const { drawings, pages } = useWorkspace(projectId)
+
+  const activePage = useMemo(() => pages.find((p: any) => p.id === currentPageId), [pages, currentPageId])
+  const activeDrawing = useMemo(() => activePage ? drawings.find((d: any) => d.id === activePage.drawing_id) : null, [drawings, activePage])
+  
+  const activeSheetName = useMemo(() => {
+    if (!activePage) return ''
+    return `${activeDrawing?.filename || 'Drawing'} — Page ${activePage.idx + 1}`
+  }, [activePage, activeDrawing])
+
   const [items, setItems] = useState<BomItem[]>([])
   const [summary, setSummary] = useState<BomSummary | null>(null)
+  const [facets, setFacets] = useState<BomFacets>(EMPTY_FACETS)
   const [loading, setLoading] = useState(true)
   const [generating, setGenerating] = useState(false)
-  const [categoryFilter, setCategoryFilter] = useState('')
+  const [buildMsg, setBuildMsg] = useState('')
+  const [buildWarnings, setBuildWarnings] = useState<string[]>([])
+  const [showWarnings, setShowWarnings] = useState(true)
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
+  const [search, setSearch] = useState('')
+  const [showFilters, setShowFilters] = useState(false)
+  const [isStale, setIsStale] = useState(false)
 
-  const loadBom = async () => {
+  const [showFieldsDropdown, setShowFieldsDropdown] = useState(false)
+  const [showExportDropdown, setShowExportDropdown] = useState(false)
+
+  const fieldsRef = useRef<HTMLDivElement>(null)
+  const exportRef = useRef<HTMLDivElement>(null)
+
+  const [lastPageId, setLastPageId] = useState<string | null>(null)
+
+  const [visibleFields, setVisibleFields] = useState<Record<string, boolean>>({
+    is_main: true,
+    category: true,
+    piecemark: true,
+    sub_number: false,
+    qty: true,
+    section_type: true,
+    section: true,
+    length_in: true,
+    grade: true,
+    labor_code: true,
+    weight_lbs: true,
+    camber: true,
+    cope: true,
+    holes: true,
+    weld_studs: true,
+    status: true,
+    sequence: true,
+    comment: true,
+    sheet: true,
+    dcr_left: true,
+    dcr_right: true,
+  })
+
+  useEffect(() => {
+    if (activeSheetName && currentPageId !== lastPageId) {
+      setFilters((f) => ({ ...f, sheet: activeSheetName }))
+      setLastPageId(currentPageId)
+    }
+  }, [activeSheetName, currentPageId, lastPageId])
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (fieldsRef.current && !fieldsRef.current.contains(event.target as Node)) {
+        setShowFieldsDropdown(false)
+      }
+      if (exportRef.current && !exportRef.current.contains(event.target as Node)) {
+        setShowExportDropdown(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
+  const setFilter = (key: keyof Filters, value: string) => setFilters((f) => ({ ...f, [key]: value }))
+
+  const checkStale = useCallback(async () => {
+    try {
+      const latest = await buildApi.latest(projectId)
+      const builtAt = latest?.job?.finished_at || latest?.job?.updated_at
+      if (!builtAt) {
+        setIsStale(false)
+        return
+      }
+      const builtMs = new Date(builtAt).getTime()
+      const drawings = await drawingsApi.list(projectId)
+      const pagesLists = await Promise.all((drawings || []).map((d: any) => drawingsApi.listPages(d.id)))
+      const anyNewer = pagesLists.flat().some((p: any) => p?.updated_at && new Date(p.updated_at).getTime() > builtMs)
+      setIsStale(anyNewer)
+    } catch {
+      setIsStale(false)
+    }
+  }, [projectId])
+
+  const loadBom = useCallback(async () => {
     setLoading(true)
     try {
-      const filters = categoryFilter ? { category: categoryFilter } : {}
-      const data = await bomApi.list(projectId, filters)
-      const sumData = await bomApi.summary(projectId)
-      setItems(data)
-      setSummary(sumData)
-    } catch {
-      toast.error('Failed to load Bill of Materials')
+      const query: Record<string, any> = {}
+      if (filters.category) query.category = filters.category
+      if (filters.section_type) query.section_type = filters.section_type
+      if (filters.section) query.section = filters.section
+      if (filters.grade) query.grade = filters.grade
+      if (filters.labor_code) query.labor_code = filters.labor_code
+      if (filters.status) query.status = filters.status
+      if (filters.sequence) query.sequence = filters.sequence
+      if (filters.is_main) query.is_main = filters.is_main
+      if (filters.sheet) query.sheet = filters.sheet
+      if (search) query.search = search
+
+      const summaryQuery: Record<string, any> = {}
+      if (filters.sheet) summaryQuery.sheet = filters.sheet
+
+      const [dataRes, sumRes, facetRes] = await Promise.allSettled([
+        bomApi.list(projectId, query),
+        bomApi.summary(projectId, summaryQuery),
+        bomApi.facets(projectId),
+      ])
+
+      if (dataRes.status === 'fulfilled') {
+        setItems(dataRes.value)
+      } else {
+        setItems([])
+        console.error('BOM list failed:', dataRes.reason)
+      }
+      if (sumRes.status === 'fulfilled') {
+        setSummary(sumRes.value)
+      } else {
+        console.error('BOM summary failed:', sumRes.reason)
+      }
+      if (facetRes.status === 'fulfilled') {
+        setFacets(facetRes.value)
+      } else {
+        console.error('BOM facets failed:', facetRes.reason)
+      }
+
+      if (dataRes.status === 'rejected' && sumRes.status === 'rejected' && facetRes.status === 'rejected') {
+        toast.error('Failed to load Bill of Materials — is the backend running the latest code? Try restarting it.')
+      } else if (facetRes.status === 'rejected') {
+        toast.error('Filters unavailable (backend may need a restart to pick up the /bom/facets endpoint) — BOM rows still loaded.')
+      }
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to load Bill of Materials')
     } finally {
       setLoading(false)
     }
-  }
+  }, [projectId, filters, search])
 
   useEffect(() => {
-    if (projectId) {
-      loadBom()
-    }
-  }, [projectId, categoryFilter])
+    if (projectId) loadBom()
+  }, [projectId, loadBom])
+
+  useEffect(() => {
+    if (projectId) checkStale()
+  }, [projectId, checkStale])
 
   const handleGenerate = async () => {
     setGenerating(true)
-    toast.info('Generating BOM items from plan drawing members...')
+    setBuildMsg('Requesting build…')
+    setBuildWarnings([])
     try {
-      const res = await bomApi.generate(projectId)
-      toast.success(`BOM successfully generated: ${res.generated} items derived`)
+      const { job_id } = await buildApi.trigger(projectId)
+      for (;;) {
+        const job = await jobsApi.get(job_id)
+        setBuildMsg(`${job.message || 'Building…'} (${job.progress ?? 0}%)`)
+        if (job.status === 'done') {
+          const warnings: string[] = job.result?.warnings || []
+          setBuildWarnings(warnings)
+          setShowWarnings(true)
+          if (warnings.length > 0) {
+            toast.warning(`${job.message || 'Build complete'} — ${warnings.length} warning(s), see details below.`)
+          } else {
+            toast.success(job.message || 'Build complete')
+          }
+          break
+        }
+        if (job.status === 'failed') {
+          throw new Error(job.error || 'Build failed')
+        }
+        await new Promise((r) => setTimeout(r, 1500))
+      }
       loadBom()
+      checkStale()
     } catch (err: any) {
-      toast.error(err.message || 'BOM generation failed')
+      toast.error(err.message || 'Build failed')
     } finally {
       setGenerating(false)
+      setBuildMsg('')
     }
   }
 
-  const handleDownloadCsv = () => {
-    const url = bomApi.getExportUrl(projectId)
-    window.open(url, '_blank')
+  const handleDownloadCsv = () => window.open(bomApi.getExportUrl(projectId), '_blank')
+  const handleDownloadKiss = () => window.open(bomApi.getKissExportUrl(projectId), '_blank')
+  const handleDownloadEpm = () => window.open(bomApi.getEpmExportUrl(projectId), '_blank')
+
+  const getFormatLength = useCallback((lenIn: number | null) => {
+    if (lenIn === null || lenIn === undefined) return '-'
+    const feet = Math.floor(lenIn / 12)
+    const remainingInches = lenIn % 12
+    const wholeInches = Math.floor(remainingInches)
+    const fractionalPart = remainingInches - wholeInches
+
+    let fractionStr = ''
+    const sixteenths = Math.round(fractionalPart * 16)
+    if (sixteenths > 0 && sixteenths < 16) {
+      const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b))
+      const common = gcd(sixteenths, 16)
+      const num = sixteenths / common
+      const den = 16 / common
+      fractionStr = ` ${num}/${den}`
+    } else if (sixteenths === 16) {
+      return `${feet}'-${wholeInches + 1}"`
+    }
+
+    if (feet === 0 && wholeInches === 0 && !fractionStr) return '0"'
+    return `${feet}'-${wholeInches}${fractionStr}"`
+  }, [])
+
+  const activeFilterCount = useMemo(
+    () => Object.values(filters).filter(Boolean).length + (search ? 1 : 0),
+    [filters, search]
+  )
+
+  const clearFilters = () => {
+    setFilters(EMPTY_FILTERS)
+    setSearch('')
   }
 
-  const handleDownloadKiss = () => {
-    const url = bomApi.getKissExportUrl(projectId)
-    window.open(url, '_blank')
+  const handleHideAll = () => {
+    setVisibleFields((prev) => {
+      const next = { ...prev }
+      Object.keys(next).forEach((key) => {
+        next[key] = false
+      })
+      return next
+    })
   }
 
-  const handleDownloadEpm = () => {
-    const url = bomApi.getEpmExportUrl(projectId)
-    window.open(url, '_blank')
+  const handleShowAll = () => {
+    setVisibleFields((prev) => {
+      const next = { ...prev }
+      Object.keys(next).forEach((key) => {
+        next[key] = true
+      })
+      return next
+    })
   }
 
-  const getFormatLength = (lenIn: number | null) => {
-    if (lenIn === null) return '-'
-    const ft = Math.floor(lenIn / 12)
-    const inch = Math.round(lenIn % 12)
-    return `${ft}'-${inch}"`
-  }
+  const columns = useMemo(() => [
+    { id: 'is_main', label: 'MAIN', dropdownLabel: 'Main', render: (item: BomItem) => item.is_main ? '1' : '0' },
+    { id: 'category', label: 'CATEGORY', dropdownLabel: 'Category', render: (item: BomItem) => item.category || '-' },
+    { id: 'piecemark', label: 'PIECEMARK', dropdownLabel: 'Piecemark', render: (item: BomItem) => item.piecemark || '-', isPiecemark: true },
+    { id: 'sub_number', label: 'SUB NUMBER', dropdownLabel: 'Sub Number', render: (item: BomItem) => '-' },
+    { id: 'qty', label: 'QTY', dropdownLabel: 'Qty', render: (item: BomItem) => item.qty },
+    { id: 'section_type', label: 'SECTION TYPE', dropdownLabel: 'Section Type', render: (item: BomItem) => item.section_type || '-' },
+    { id: 'section', label: 'SECTION', dropdownLabel: 'Section', render: (item: BomItem) => item.section || '-', isSection: true },
+    { id: 'length_in', label: 'LENGTH', dropdownLabel: 'Length', render: (item: BomItem) => getFormatLength(item.length_in) },
+    { id: 'grade', label: 'GRADE', dropdownLabel: 'Grade', render: (item: BomItem) => item.grade || '-' },
+    { id: 'labor_code', label: 'LABOR CODE', dropdownLabel: 'Labor Code', render: (item: BomItem) => item.labor_code || '-' },
+    { id: 'weight_lbs', label: 'WEIGHT-LBS', dropdownLabel: 'Weight', render: (item: BomItem) => item.weight_lbs !== null ? item.weight_lbs.toLocaleString() : '-' },
+    { id: 'camber', label: 'CAMBER', dropdownLabel: 'Camber', render: (item: BomItem) => item.camber || 0 },
+    { id: 'cope', label: 'COPE', dropdownLabel: 'Cope', render: (item: BomItem) => item.cope || 0 },
+    { id: 'holes', label: 'HOLE', dropdownLabel: 'Hole', render: (item: BomItem) => item.holes || 0 },
+    { id: 'weld_studs', label: 'WELD STUD', dropdownLabel: 'Weld Stud', render: (item: BomItem) => item.weld_studs || 0 },
+    { id: 'status', label: 'STATUS', dropdownLabel: 'Status', render: (item: BomItem) => formatStatus(item.status) },
+    { id: 'sequence', label: 'SEQUENCE', dropdownLabel: 'Sequence', render: (item: BomItem) => item.sequence ?? '-' },
+    { id: 'comment', label: 'COMMENT', dropdownLabel: 'Comment', render: (item: BomItem) => item.comment || '-' },
+    { id: 'sheet', label: 'SHEET', dropdownLabel: 'Sheet', render: (item: BomItem) => item.sheet || '-' },
+    { id: 'dcr_left', label: 'DCR LEFT', dropdownLabel: 'DCR Left', render: (item: BomItem) => item.dcr_left ?? '-' },
+    { id: 'dcr_right', label: 'DCR RIGHT', dropdownLabel: 'DCR Right', render: (item: BomItem) => item.dcr_right ?? '-' },
+  ], [getFormatLength])
+
+  const activeColumns = useMemo(() => {
+    return columns.filter((col) => visibleFields[col.id])
+  }, [columns, visibleFields])
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '24px', boxSizing: 'border-box', overflowY: 'auto' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '24px', boxSizing: 'border-box', overflow: 'hidden', backgroundColor: '#F8FAFC' }}>
+      <style dangerouslySetInnerHTML={{ __html: `
+        .custom-fields-scroll::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-fields-scroll::-webkit-scrollbar-track {
+          background: #f1f5f9;
+        }
+        .custom-fields-scroll::-webkit-scrollbar-thumb {
+          background: #cbd5e1;
+          border-radius: 3px;
+        }
+        .custom-fields-scroll::-webkit-scrollbar-thumb:hover {
+          background: #94a3b8;
+        }
+      `}} />
+
       {/* Top action row */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '12px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
         <div>
-          <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 700, color: '#F1F5F9' }}>
-            Bill of Materials
-          </h1>
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 700, color: '#0F172A' }}>Bill of Materials</h1>
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                minWidth: '24px',
+                height: '24px',
+                borderRadius: '12px',
+                backgroundColor: '#7B99B9',
+                color: '#FFFFFF',
+                fontSize: '13px',
+                fontWeight: 600,
+                marginLeft: '8px',
+                padding: '0 6px',
+              }}
+            >
+              {items.length}
+            </span>
+          </div>
           <p style={{ margin: '4px 0 0', fontSize: '13px', color: '#64748B' }}>
-            AISC main-member takeoff derived from canvas sheet overlays
+            Piecemarked takeoff — main members plus connection material, generated by the build engine
           </p>
         </div>
 
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           <button
             onClick={handleGenerate}
             disabled={generating}
             style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '8px 16px',
-              backgroundColor: generating ? 'rgba(59, 130, 246, 0.15)' : 'rgba(59, 130, 246, 0.1)',
-              border: '1px solid rgba(59, 130, 246, 0.25)',
-              borderRadius: '6px',
-              color: generating ? '#475569' : '#60A5FA',
-              fontSize: '13px',
-              fontWeight: 600,
+              display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px',
+              backgroundColor: '#FFFFFF',
+              border: '1px solid #CBD5E1', borderRadius: '6px',
+              color: '#3B82F6', fontSize: '13px', fontWeight: 600,
               cursor: generating ? 'not-allowed' : 'pointer',
+              transition: 'all 0.15s ease',
+            }}
+            onMouseEnter={(e) => {
+              if (!generating) e.currentTarget.style.backgroundColor = '#F8FAFC'
+            }}
+            onMouseLeave={(e) => {
+              if (!generating) e.currentTarget.style.backgroundColor = '#FFFFFF'
             }}
           >
-            <RefreshCw size={14} />
-            {generating ? 'Deriving...' : 'Derive from Takeoff'}
+            <RefreshCw size={14} className={generating ? 'animate-spin' : ''} />
+            {generating ? buildMsg || 'Building...' : 'Build Project'}
           </button>
 
-          <button
-            onClick={handleDownloadCsv}
-            disabled={items.length === 0}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '8px 14px',
-              backgroundColor: items.length === 0 ? 'rgba(255,255,255,0.02)' : '#1E293B',
-              border: '1px solid rgba(59, 130, 246, 0.15)',
-              borderRadius: '6px',
-              color: items.length === 0 ? '#475569' : '#F1F5F9',
-              fontSize: '13px',
-              fontWeight: 600,
-              cursor: items.length === 0 ? 'not-allowed' : 'pointer',
-            }}
-          >
-            <Download size={14} /> CSV
-          </button>
+          <div ref={fieldsRef} style={{ position: 'relative' }}>
+            <button
+              onClick={() => {
+                setShowFieldsDropdown(!showFieldsDropdown)
+                setShowExportDropdown(false)
+              }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px',
+                backgroundColor: '#FFFFFF',
+                border: showFieldsDropdown ? '1.5px solid #000000' : '1px solid #CBD5E1',
+                borderRadius: '6px',
+                color: '#334155', fontSize: '13px', fontWeight: 600,
+                cursor: 'pointer',
+                boxShadow: showFieldsDropdown ? '0 0 0 1px #000000' : 'none',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              <Columns size={14} />
+              Fields
+            </button>
+            {showFieldsDropdown && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 'calc(100% + 6px)',
+                  right: 0,
+                  width: '280px',
+                  backgroundColor: '#FFFFFF',
+                  border: '1px solid #E2E8F0',
+                  borderRadius: '8px',
+                  boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
+                  padding: '14px 16px',
+                  zIndex: 100,
+                  display: 'flex',
+                  flexDirection: 'column',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                  <span style={{ fontSize: '13px', fontWeight: 600, color: '#334155' }}>Field Visibility</span>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      onClick={handleHideAll}
+                      style={{ background: 'none', border: 'none', color: '#94A3B8', fontSize: '12px', fontWeight: 500, cursor: 'pointer', padding: 0 }}
+                    >
+                      Hide All
+                    </button>
+                    <span style={{ color: '#E2E8F0', fontSize: '12px' }}>|</span>
+                    <button
+                      onClick={handleShowAll}
+                      style={{ background: 'none', border: 'none', color: '#3B82F6', fontSize: '12px', fontWeight: 500, cursor: 'pointer', padding: 0 }}
+                    >
+                      Show All
+                    </button>
+                  </div>
+                </div>
+                <div
+                  style={{
+                    maxHeight: '320px',
+                    overflowY: 'auto',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '4px',
+                    paddingRight: '4px',
+                  }}
+                  className="custom-fields-scroll"
+                >
+                  {columns.map((col) => (
+                    <div
+                      key={col.id}
+                      onClick={() => setVisibleFields((prev) => ({ ...prev, [col.id]: !prev[col.id] }))}
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        padding: '6px 0',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <span style={{ fontSize: '13px', color: '#475569', userSelect: 'none' }}>
+                        {col.dropdownLabel}
+                      </span>
+                      <ToggleSwitch
+                        checked={visibleFields[col.id]}
+                        onChange={(val) => setVisibleFields((prev) => ({ ...prev, [col.id]: val }))}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
 
-          <button
-            onClick={handleDownloadEpm}
-            disabled={items.length === 0}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '8px 14px',
-              backgroundColor: items.length === 0 ? 'rgba(255,255,255,0.02)' : '#1E293B',
-              border: '1px solid rgba(59, 130, 246, 0.15)',
-              borderRadius: '6px',
-              color: items.length === 0 ? '#475569' : '#F1F5F9',
-              fontSize: '13px',
-              fontWeight: 600,
-              cursor: items.length === 0 ? 'not-allowed' : 'pointer',
-            }}
-          >
-            <Download size={14} /> Tekla EPM
-          </button>
-
-          <button
-            onClick={handleDownloadKiss}
-            disabled={items.length === 0}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '8px 14px',
-              backgroundColor: items.length === 0 ? 'rgba(255,255,255,0.02)' : '#3B82F6',
-              border: 'none',
-              borderRadius: '6px',
-              color: items.length === 0 ? '#475569' : '#FFFFFF',
-              fontSize: '13px',
-              fontWeight: 600,
-              cursor: items.length === 0 ? 'not-allowed' : 'pointer',
-            }}
-          >
-            <Download size={14} /> KISS (.kss)
-          </button>
+          <div ref={exportRef} style={{ position: 'relative' }}>
+            <button
+              onClick={() => {
+                setShowExportDropdown(!showExportDropdown)
+                setShowFieldsDropdown(false)
+              }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 14px',
+                backgroundColor: '#FFFFFF',
+                border: showExportDropdown ? '1.5px solid #000000' : '1px solid #CBD5E1',
+                borderRadius: '6px',
+                color: '#334155', fontSize: '13px', fontWeight: 600,
+                cursor: 'pointer',
+                boxShadow: showExportDropdown ? '0 0 0 1px #000000' : 'none',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              <Upload size={14} />
+              Export
+              {showExportDropdown ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            </button>
+            {showExportDropdown && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 'calc(100% + 6px)',
+                  left: 0,
+                  width: '190px',
+                  backgroundColor: '#FFFFFF',
+                  border: '1px solid #E2E8F0',
+                  borderRadius: '8px',
+                  boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05)',
+                  padding: '4px 0',
+                  zIndex: 100,
+                  display: 'flex',
+                  flexDirection: 'column',
+                }}
+              >
+                <button
+                  onClick={() => {
+                    handleDownloadEpm()
+                    setShowExportDropdown(false)
+                  }}
+                  disabled={items.length === 0}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 14px',
+                    backgroundColor: 'transparent', border: 'none', outline: 'none',
+                    color: items.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
+                    cursor: items.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
+                    transition: 'background-color 0.2s',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (items.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = 'transparent'
+                  }}
+                >
+                  <Upload size={14} />
+                  Tekla EPM Excel
+                </button>
+                <button
+                  onClick={() => {
+                    handleDownloadCsv()
+                    setShowExportDropdown(false)
+                  }}
+                  disabled={items.length === 0}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 14px',
+                    backgroundColor: 'transparent', border: 'none', outline: 'none',
+                    color: items.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
+                    cursor: items.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
+                    transition: 'background-color 0.2s',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (items.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = 'transparent'
+                  }}
+                >
+                  <Upload size={14} />
+                  Export Bill of Material
+                </button>
+                <button
+                  onClick={() => {
+                    handleDownloadKiss()
+                    setShowExportDropdown(false)
+                  }}
+                  disabled={items.length === 0}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 14px',
+                    backgroundColor: 'transparent', border: 'none', outline: 'none',
+                    color: items.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
+                    cursor: items.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
+                    transition: 'background-color 0.2s',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (items.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = 'transparent'
+                  }}
+                >
+                  <Upload size={14} />
+                  Export KISS File
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
+      {/* Stale-build banner */}
+      {isStale && (
+        <div style={{ marginBottom: '16px', backgroundColor: '#EFF6FF', border: '1px solid #BFDBFE', borderRadius: '8px', padding: '12px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+          <span style={{ fontSize: '12px', color: '#1E40AF', fontWeight: 500 }}>
+            One or more drawings were extracted after the last build — this BOM doesn't include that yet.
+          </span>
+          <button
+            onClick={handleGenerate}
+            disabled={generating}
+            style={{ background: 'none', border: 'none', color: '#2563EB', fontSize: '12px', fontWeight: 700, cursor: generating ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}
+          >
+            Rebuild now
+          </button>
+        </div>
+      )}
+
+      {/* Build warnings */}
+      {buildWarnings.length > 0 && showWarnings && (
+        <div style={{ marginBottom: '16px', backgroundColor: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: '8px', padding: '12px 16px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px' }}>
+            <div style={{ fontSize: '12px', fontWeight: 700, color: '#B45309', marginBottom: '6px' }}>
+              {buildWarnings.length} item(s) were left out of this BOM
+            </div>
+            <button onClick={() => setShowWarnings(false)} style={{ background: 'none', border: 'none', color: '#B45309', cursor: 'pointer', padding: 0 }}>
+              <X size={13} />
+            </button>
+          </div>
+          <ul style={{ margin: 0, paddingLeft: '18px', fontSize: '12px', color: '#D97706', lineHeight: 1.6 }}>
+            {buildWarnings.map((w, i) => (
+              <li key={i}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {/* Summary dashboard */}
       {summary && (
-        <div style={{ display: 'flex', gap: '16px', marginBottom: '24px', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: '16px', marginBottom: '16px', flexWrap: 'wrap' }}>
           {[
             { label: 'Total Weight (tons)', value: summary.total_weight_tons.toFixed(2) },
-            { label: 'Derivation items count', value: summary.total_items },
-            { label: 'Beams count', value: summary.by_category?.['Beams'] || 0 },
-            { label: 'Columns count', value: summary.by_category?.['Columns'] || 0 },
+            { label: 'BOM Items', value: summary.total_items },
+            { label: 'Beams', value: summary.by_category?.['Beams'] || 0 },
+            { label: 'Columns', value: summary.by_category?.['Columns'] || 0 },
+            { label: 'Braces', value: (summary.by_category?.['Vertical Braces'] || 0) + (summary.by_category?.['Horizontal Braces'] || 0) },
+            { label: 'Bolts', value: summary.by_category?.['Bolts'] || 0 },
+            { label: 'Weld Studs', value: summary.by_category?.['Weld Studs'] || 0 },
           ].map((stat, i) => (
-            <div
-              key={i}
-              style={{
-                flex: '1 1 180px',
-                backgroundColor: '#111827',
-                border: '1px solid rgba(59, 130, 246, 0.08)',
-                borderRadius: '8px',
-                padding: '16px',
-              }}
-            >
-              <div style={{ fontSize: '20px', fontWeight: 700, color: '#F1F5F9' }}>{stat.value}</div>
-              <div style={{ fontSize: '11px', color: '#64748B', marginTop: '2px', textTransform: 'uppercase' }}>{stat.label}</div>
+            <div key={i} style={{ flex: '1 1 140px', backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '12px 16px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+              <div style={{ fontSize: '18px', fontWeight: 700, color: '#0F172A' }}>{stat.value}</div>
+              <div style={{ fontSize: '10px', color: '#64748B', marginTop: '2px', textTransform: 'uppercase', letterSpacing: '0.4px' }}>{stat.label}</div>
             </div>
           ))}
         </div>
       )}
 
-      {/* Filter and Grid table view */}
-      <div style={{ flex: 1, backgroundColor: '#111827', border: '1px solid rgba(59, 130, 246, 0.08)', borderRadius: '8px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '12px 16px', borderBottom: '1px solid rgba(59, 130, 246, 0.08)', display: 'flex', gap: '8px' }}>
-          <select
-            value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value)}
-            style={{
-              padding: '6px 12px',
-              backgroundColor: '#1F2937',
-              border: '1px solid rgba(59, 130, 246, 0.15)',
-              borderRadius: '6px',
-              color: '#F1F5F9',
-              fontSize: '12px',
-              outline: 'none',
-            }}
-          >
-            <option value="">All Categories</option>
-            <option value="Beams">Beams</option>
-            <option value="Columns">Columns</option>
-            <option value="Vertical Braces">Vertical Braces</option>
-            <option value="Horizontal Braces">Horizontal Braces</option>
-            <option value="Joists">Joists</option>
-          </select>
-        </div>
+      {/* Body: filter sidebar + grid */}
+      <div style={{ flex: 1, display: 'flex', gap: '16px', minHeight: 0 }}>
+        {showFilters && (
+          <div style={{ width: '220px', flexShrink: 0, backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '16px', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+              <span style={{ fontSize: '12px', fontWeight: 700, color: '#0F172A', textTransform: 'uppercase', letterSpacing: '0.4px' }}>Filters</span>
+              {activeFilterCount > 0 && (
+                <button onClick={clearFilters} style={{ background: 'none', border: 'none', color: '#3B82F6', fontSize: '11px', cursor: 'pointer', padding: 0 }}>
+                  Clear ({activeFilterCount})
+                </button>
+              )}
+            </div>
 
-        <div style={{ flex: 1, overflow: 'auto' }}>
-          {loading ? (
-            <div style={{ display: 'flex', height: '200px', alignItems: 'center', justifyContent: 'center' }}>
-              <Spinner size="md" />
+            <div style={{ position: 'relative', marginBottom: '16px' }}>
+              <Search size={13} style={{ position: 'absolute', left: '10px', top: '9px', color: '#94A3B8' }} />
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search piecemark…"
+                style={{
+                  width: '100%', boxSizing: 'border-box', padding: '7px 10px 7px 30px', backgroundColor: '#F8FAFC',
+                  border: '1px solid #E2E8F0', borderRadius: '6px', color: '#0F172A', fontSize: '12px', outline: 'none',
+                }}
+              />
             </div>
-          ) : items.length === 0 ? (
-            <div style={{ display: 'flex', height: '200px', alignItems: 'center', justifyContent: 'center', color: '#475569', fontSize: '13px', flexDirection: 'column', gap: '8px' }}>
-              <span>No BOM rows derived yet.</span>
-              <span style={{ fontSize: '12px' }}>Click "Derive from Takeoff" above to build the AISC shape sheet list.</span>
-            </div>
-          ) : (
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13px' }}>
-              <thead>
-                <tr style={{ borderBottom: '1px solid rgba(59, 130, 246, 0.08)', color: '#94A3B8', fontWeight: 600 }}>
-                  <th style={{ padding: '12px 16px' }}>Piecemark</th>
-                  <th style={{ padding: '12px 16px' }}>Category</th>
-                  <th style={{ padding: '12px 16px' }}>Qty</th>
-                  <th style={{ padding: '12px 16px' }}>Section</th>
-                  <th style={{ padding: '12px 16px' }}>Length</th>
-                  <th style={{ padding: '12px 16px' }}>Grade</th>
-                  <th style={{ padding: '12px 16px' }}>Weight (lbs)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((item) => (
-                  <tr
-                    key={item.id}
-                    style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.03)', color: '#F1F5F9' }}
-                    onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.01)')}
-                    onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                  >
-                    <td style={{ padding: '12px 16px', fontWeight: 700, color: '#3B82F6' }}>{item.piecemark || '-'}</td>
-                    <td style={{ padding: '12px 16px' }}>{item.category}</td>
-                    <td style={{ padding: '12px 16px' }}>{item.qty}</td>
-                    <td style={{ padding: '12px 16px', fontWeight: 600 }}>{item.section}</td>
-                    <td style={{ padding: '12px 16px' }}>{getFormatLength(item.length_in)}</td>
-                    <td style={{ padding: '12px 16px' }}>{item.grade}</td>
-                    <td style={{ padding: '12px 16px' }}>{item.weight_lbs !== null ? item.weight_lbs.toLocaleString() : '-'}</td>
+
+            <FilterSelect label="Drawing / Sheet" value={filters.sheet} options={facets.sheet} onChange={(v) => setFilter('sheet', v)} theme="light" />
+            <FilterSelect label="Category" value={filters.category} options={facets.category} onChange={(v) => setFilter('category', v)} theme="light" />
+            <FilterSelect label="Section Type" value={filters.section_type} options={facets.section_type} onChange={(v) => setFilter('section_type', v)} theme="light" />
+            <FilterSelect label="Section" value={filters.section} options={facets.section} onChange={(v) => setFilter('section', v)} theme="light" />
+            <FilterSelect label="Grade" value={filters.grade} options={facets.grade} onChange={(v) => setFilter('grade', v)} theme="light" />
+            <FilterSelect label="Labor Code" value={filters.labor_code} options={facets.labor_code} onChange={(v) => setFilter('labor_code', v)} theme="light" />
+            <FilterSelect label="Status" value={filters.status} options={facets.status} onChange={(v) => setFilter('status', v)} theme="light" />
+            <FilterSelect label="Sequence" value={filters.sequence} options={facets.sequence} onChange={(v) => setFilter('sequence', v)} theme="light" />
+            <FilterSelect label="Main / Accessory" value={filters.is_main} options={['true', 'false']} onChange={(v) => setFilter('is_main', v)} theme="light" />
+          </div>
+        )}
+
+        <div style={{ flex: 1, backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', overflow: 'hidden', display: 'flex', flexDirection: 'column', minWidth: 0, boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+          <div style={{ padding: '10px 16px', borderBottom: '1px solid #E2E8F0', display: 'flex', alignItems: 'center', gap: '10px', backgroundColor: '#FFFFFF' }}>
+            <button
+              onClick={() => setShowFilters((s) => !s)}
+              style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'none', border: 'none', color: '#64748B', fontSize: '12px', cursor: 'pointer', padding: '4px 6px' }}
+            >
+              <SlidersHorizontal size={13} /> {showFilters ? 'Hide filters' : 'Show filters'}
+            </button>
+            <span style={{ fontSize: '12px', color: '#94A3B8' }}>Showing {items.length} item{items.length === 1 ? '' : 's'}</span>
+          </div>
+
+          <div style={{ flex: 1, overflow: 'auto' }}>
+            {loading ? (
+              <div style={{ display: 'flex', height: '200px', alignItems: 'center', justifyContent: 'center' }}>
+                <Spinner size="md" />
+              </div>
+            ) : items.length === 0 ? (
+              <div style={{ display: 'flex', height: '200px', alignItems: 'center', justifyContent: 'center', color: '#64748B', fontSize: '13px', flexDirection: 'column', gap: '8px' }}>
+                <span>No BOM rows match the current filters.</span>
+                <span style={{ fontSize: '12px' }}>
+                  {activeFilterCount > 0 ? (
+                    <button onClick={clearFilters} style={{ color: '#3B82F6', background: 'none', border: 'none', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                      <X size={11} /> Clear filters
+                    </button>
+                  ) : (
+                    'Click "Build Project" above to design connections and generate the BOM.'
+                  )}
+                </span>
+              </div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '12px' }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid #E2E8F0', color: '#64748B', fontWeight: 600, position: 'sticky', top: 0, backgroundColor: '#F8FAFC' }}>
+                    {activeColumns.map((col) => (
+                      <th key={col.id} style={{ padding: '12px 16px', fontSize: '11px', letterSpacing: '0.5px' }}>
+                        {col.label}
+                      </th>
+                    ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+                </thead>
+                <tbody>
+                  {items.map((item) => (
+                    <tr
+                      key={item.id}
+                      style={{ borderBottom: '1px solid #E2E8F0', color: '#334155' }}
+                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#F8FAFC')}
+                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                    >
+                      {activeColumns.map((col) => {
+                        const cellValue = col.render(item)
+                        
+                        let cellStyle: React.CSSProperties = { padding: '12px 16px' }
+                        if (col.isPiecemark) {
+                          cellStyle = { ...cellStyle, fontWeight: 700, color: '#3B82F6' }
+                        } else if (col.isSection) {
+                          cellStyle = { ...cellStyle, fontWeight: 600, color: '#0F172A' }
+                        } else if (col.id === 'status') {
+                          cellStyle = { ...cellStyle, color: '#64748B' }
+                        }
+                        
+                        return (
+                          <td key={col.id} style={cellStyle}>
+                            {cellValue}
+                          </td>
+                        )
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
         </div>
       </div>
     </div>

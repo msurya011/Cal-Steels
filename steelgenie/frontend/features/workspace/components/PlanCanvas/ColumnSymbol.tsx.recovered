@@ -94,9 +94,6 @@ export function ColumnSymbol({
   }
 
   const { selectedRatio, imageNaturalWidth } = useWorkspaceStore()
-  // Labels always shown, SteelGenie-style — plain text is light enough not to
-  // need progressive zoom disclosure now that the chip background is gone.
-  const showChip = true
 
   // Symbol sizing based on true physical depth and scale ratio
   const depthIn = geo.depth_in ?? 10
@@ -147,7 +144,12 @@ export function ColumnSymbol({
   )
 
   const labelText = isSuggested ? 'Column?' : getLabelText(m)
-
+  
+  // Diagonal pointer line
+  const labelDist = s + 1.5
+  const labelX = cx + labelDist
+  const labelY = cy - labelDist
+  
   return (
     <g
       ref={groupRef}
@@ -212,28 +214,6 @@ export function ColumnSymbol({
         </g>
       )}
 
-      {/* Always-on visibility halo — a solid colored disc behind the symbol,
-          in the SAME color as the column's status, so it reads as "there is
-          definitely a column here" even when the outline symbol itself is a
-          thin dashed line (need-review columns) that's easy to lose in a
-          dense drawing. This is rendered on top of beam lines by the parent
-          (columns are painted last), so it's never buried at a convergence
-          point. Deliberately more opaque than before — the whole point is
-          that a first-time viewer should spot every column at a glance. */}
-      {!isSuggested && (
-        <circle
-          cx={`${cx}%`}
-          cy={`${cy}%`}
-          r={Math.max(s * 0.9, 1.6)}
-          fill={stroke}
-          fillOpacity={0.32}
-          stroke={stroke}
-          strokeOpacity={0.7}
-          strokeWidth={1}
-          style={{ pointerEvents: 'none' }}
-        />
-      )}
-
       {/* Steel symbol with precise rotation */}
       <g style={{ transformOrigin: 'center', transformBox: 'fill-box', transform: `rotate(${m.rotation || 0}deg)` }}>
         {symbol === 'BOX' ? (
@@ -266,47 +246,32 @@ export function ColumnSymbol({
         </text>
       )}
 
-      {/* Node marker — bold solid square centered exactly on the column's grid
-          point (cx/cy = the snapped grid-line intersection), so it reads
-          clearly as "the column sits here on the line" even at a glance. */}
-      {!isSuggested && (
-        <rect
-          x={`${cx - 0.55}%`}
-          y={`${cy - 0.55}%`}
-          width="1.1%"
-          height="1.1%"
-          fill={stroke}
-          stroke="#0B1220"
-          strokeWidth={1.4}
-          style={{ pointerEvents: 'none' }}
-        />
-      )}
-
-      {/* Label — plain text, no chip background, SteelGenie-style */}
-      {showChip && labelText && (() => {
-        const text = `${hasError && !isSuggested ? '⚠ ' : ''}${labelText}`
-        const labelColor = isSuggested ? '#94A3B8' : hasError ? '#EF4444' : isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : '#10B981'
-        const labelY = cy - s / 2 - 2.2
-        return (
+      {/* Text label with leader line */}
+      {labelText && (
+        <g style={{ pointerEvents: 'none' }}>
+          {/* Diagonal Leader Line */}
+          <line
+            x1={`${cx}%`} y1={`${cy}%`}
+            x2={`${labelX}%`} y2={`${labelY}%`}
+            stroke="#090D1A"
+            strokeWidth={0.5}
+            opacity={0.6}
+          />
           <text
-            x={`${cx}%`}
-            y={`${labelY}%`}
-            fill={labelColor}
-            fontSize="7px"
-            fontWeight="700"
-            textAnchor="middle"
-            style={{
-              userSelect: 'none',
-              paintOrder: 'stroke',
-              stroke: '#0B1220',
-              strokeWidth: 2.2,
-              pointerEvents: 'none',
-            }}
+            x={`${labelX + 0.2}%`}
+            y={`${labelY - 0.2}%`}
+            fill={isSuggested ? '#94A3B8' : isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : '#F1F5F9'}
+            fontSize="5px"
+            fontWeight="bold"
+            textAnchor="start"
+            transform={`rotate(-45, ${labelX}, ${labelY})`}
+            style={{ userSelect: 'none', paintOrder: 'stroke', stroke: '#090D1A', strokeWidth: 1.5 }}
           >
-            {text}
+            {hasError && !isSuggested && '⚠️ '}
+            {labelText}
           </text>
-        )
-      })()}
+        </g>
+      )}
     </g>
   )
 }

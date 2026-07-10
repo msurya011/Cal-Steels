@@ -1,68 +1,62 @@
 {
   "emerus_areaA": {
-    "beams": 133,
-    "columns": 36,
+    "beams": 205,
+    "columns": 50,
     "joists": 0,
-    "braces": 4,
-    "floating": 28,
-    "phantom": 0,
+    "floating": 39,
+    "phantom": 18,
     "overshoot": 0,
-    "duplicate": 3,
+    "duplicate": 6,
     "elapsed_s": 1.1
   },
   "areaB_skewed": {
-    "beams": 116,
-    "columns": 0,
+    "beams": 173,
+    "columns": 42,
     "joists": 0,
-    "braces": 0,
-    "floating": 15,
-    "phantom": 0,
+    "floating": 22,
+    "phantom": 15,
     "overshoot": 0,
-    "duplicate": 0,
-    "elapsed_s": 0.7
+    "duplicate": 5,
+    "elapsed_s": 0.6
   },
   "level2_framing": {
-    "beams": 150,
-    "columns": 32,
+    "beams": 262,
+    "columns": 36,
     "joists": 0,
-    "braces": 0,
-    "floating": 16,
-    "phantom": 1,
+    "floating": 31,
+    "phantom": 3,
     "overshoot": 0,
-    "duplicate": 1,
-    "elapsed_s": 0.4
+    "duplicate": 6,
+    "elapsed_s": 0.5
   },
   "snaps_skewed": {
-    "beams": 279,
-    "columns": 78,
+    "beams": 388,
+    "columns": 42,
     "joists": 0,
-    "braces": 0,
-    "floating": 105,
-    "phantom": 27,
+    "floating": 145,
+    "phantom": 41,
     "overshoot": 0,
-    "duplicate": 10,
+    "duplicate": 45,
     "elapsed_s": 1.0
   },
   "roof_p41": {
-    "beams": 242,
-    "columns": 62,
+    "beams": 434,
+    "columns": 47,
     "joists": 0,
-    "braces": 0,
-    "floating": 68,
-    "phantom": 0,
+    "floating": 140,
+    "phantom": 9,
     "overshoot": 0,
-    "duplicate": 2,
-    "elapsed_s": 13.9
+    "duplicate": 24,
+    "elapsed_s": 14.2
   },
   "deflection_p14": {
     "beams": 200,
     "columns": 0,
     "joists": 0,
-    "braces": 0,
     "floating": 200,
     "phantom": 0,
-    "overshoot": 4,
+    "overshoot": 5,
     "duplicate": 0,
-    "elapsed_s": 0.8
+    "elapsed_s": 0.9
   }
 }

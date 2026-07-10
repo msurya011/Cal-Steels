@@ -190,6 +190,15 @@ async def run_analyse(
             "color": m.get("color"),
             "unlabeled": m.get("unlabeled", False),
             "overridden": m.get("overridden", False),
+            # Propagate the CV engine's confirmation flag so the frontend can
+            # visually distinguish ghost/guessed columns (placed wherever beam
+            # ends merely converge, profile unknown) from real, confidently
+            # matched ones. Previously dropped here, so every ghost column
+            # rendered identically to a confirmed one — flooding plans with
+            # solid black column squares that were really just low-confidence
+            # guesses.
+            "suggested": m.get("confirmed") is False,
+            "size_unknown": m.get("size_unknown", False),
         }
 
         member_rows.append({
@@ -251,16 +260,27 @@ def _postprocess_columns(
     and blend that into confidence/status + error flags. Then, at clusters of
     converging beam endpoints with NO detected column, emit ghost 'suggested'
     columns for the review queue.
+
+    A real column is the geometric signature of beams framing in from
+    PERPENDICULAR directions (a girder + joists/beams crossing it). Densely
+    spaced parallel joists all terminating near the same point along a
+    continuous girder is NOT a column — it's just tight joist spacing — but
+    without direction-diversity that pattern easily clears a raw endpoint-count
+    threshold, which is what was flooding plans with false "Column?" ghosts at
+    nearly every joist landing point. Requiring both H- and V-running beams in
+    the convergence cluster filters that out.
     """
-    # Gather beam endpoints
+    # Gather beam endpoints, tagged with the beam's running direction so we
+    # can require perpendicular (orthogonal) convergence, not just proximity.
     endpoints: List[tuple] = []
     for r in member_rows:
         if r["kind"] != "beam":
             continue
         g = r["geometry"]
+        bdir = g.get("beam_dir")
         for (px, py) in ((g.get("bx1"), g.get("by1")), (g.get("bx2"), g.get("by2"))):
             if px is not None and py is not None:
-                endpoints.append((float(px), float(py)))
+                endpoints.append((float(px), float(py), bdir))
 
     columns = [r for r in member_rows if r["kind"] == "column"]
 
@@ -269,7 +289,7 @@ def _postprocess_columns(
         g = col["geometry"]
         cx, cy = float(g.get("x", 0)), float(g.get("y", 0))
         support = sum(
-            1 for (px, py) in endpoints
+            1 for (px, py, _bdir) in endpoints
             if abs(px - cx) < endpoint_tol and abs(py - cy) < endpoint_tol
         )
         flags: List[str] = []
@@ -290,17 +310,26 @@ def _postprocess_columns(
         if conf < 0.75 or flags:
             col["status"] = "need_review"
 
-    # 2) Suggest missing columns at beam-end convergence points
+    # 2) Suggest missing columns at beam-end convergence points.
+    # Require the cluster to contain endpoints from BOTH H- and V-running
+    # beams — the actual geometric signature of a column (a girder crossed by
+    # perpendicular framing) — so a tight run of parallel joists landing near
+    # each other on one continuous girder never gets mistaken for one.
     if endpoints:
         clusters: Dict[tuple, List[tuple]] = {}
-        for (px, py) in endpoints:
+        for (px, py, bdir) in endpoints:
             key = (round(px / cluster_tol), round(py / cluster_tol))
-            clusters.setdefault(key, []).append((px, py))
+            clusters.setdefault(key, []).append((px, py, bdir))
 
         col_pts = [(float(c["geometry"].get("x", 0)), float(c["geometry"].get("y", 0))) for c in columns]
         suggested = 0
         for pts in clusters.values():
             if suggested >= max_suggestions or len(pts) < min_converging:
+                continue
+            dirs = {d for (_x, _y, d) in pts if d}
+            # Skip if we have direction data and it's not actually orthogonal
+            # convergence — this is the fix for the false "Column?" flood.
+            if dirs and not ({"H", "V"} <= dirs):
                 continue
             mx = sum(p[0] for p in pts) / len(pts)
             my = sum(p[1] for p in pts) / len(pts)
