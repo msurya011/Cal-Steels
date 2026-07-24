@@ -17,6 +17,7 @@ interface Page {
   tos_ft: number | null
   status: string
   thumb_url: string | null
+  is_foundation_plan?: boolean | null
 }
 
 interface PageRailProps {
@@ -40,7 +41,7 @@ export function PageRail({
   extractingPageId,
   extractProgress,
 }: PageRailProps) {
-  const { currentPageId, setCurrentPage, setScale } = useWorkspaceStore()
+  const { currentPageId, setCurrentPage, setScale, dirtyPageIds } = useWorkspaceStore()
   const [uploading, setUploading] = useState(false)
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -67,6 +68,7 @@ export function PageRail({
   }
 
   const handleSelectPage = (page: Page) => {
+    console.log('[PageRail] handleSelectPage called for page:', page.id, 'index:', page.idx)
     setCurrentPage(page.id, page.idx)
     setScale(page.scale_label, page.scale_num)
   }
@@ -159,13 +161,15 @@ export function PageRail({
             <span style={{ fontSize: '11px', marginTop: '4px' }}>Upload a PDF drawing above to start</span>
           </div>
         ) : (
-          pages.map((page) => (
+          pages.map((page, i) => (
             <PageCard
               key={page.id}
               page={page}
+              displayNumber={i + 1}
               isActive={currentPageId === page.id}
               isExtracting={extractingPageId === page.id}
               extractProgress={extractingPageId === page.id ? extractProgress : null}
+              isDirty={dirtyPageIds.has(page.id)}
               onClick={() => handleSelectPage(page)}
               onUpdatePage={onUpdatePage}
               onExtract={onExtract}

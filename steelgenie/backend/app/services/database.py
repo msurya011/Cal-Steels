@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Any
@@ -18,14 +19,93 @@ logger = logging.getLogger(__name__)
 
 _client: Optional[Any] = None
 
+# Guards every read-modify-write cycle against this mock DB (load -> mutate
+# -> save), process-wide. Originally _save_db() alone had an atomic-rename
+# write (temp file + os.replace), which is enough to stop a SINGLE writer
+# from ever leaving a half-written file on disk -- but it does nothing once
+# there are multiple concurrent writers, which became a real scenario this
+# session (register_floor() now runs on background executor threads from
+# several endpoints/jobs, sometimes overlapping). Two threads both writing
+# to the SAME fixed tmp path ("local_db.json.tmp") at once can interleave
+# their writes at the OS level (both file descriptors point at the same
+# inode), producing a file that's neither writer's clean output -- exactly
+# the "valid JSON followed by extra garbage data" corruption seen in
+# practice. Separately, _db_cache is a single shared dict mutated in place;
+# without a lock spanning the full load->mutate->save cycle, two threads'
+# writes can also just clobber/lose each other's changes even if the file
+# itself stays syntactically valid ("lost update"). A single re-entrant
+# lock around every mutating operation's full cycle fixes both.
+_db_lock = threading.RLock()
+
 # Local database file path
 _DB_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "local_db.json"
 )
 
+# In-process cache of the parsed DB, keyed off the file's mtime. Every single
+# .execute() call in MockQueryBuilder used to call _load_db(), which did a
+# fresh json.load() of the WHOLE file every time -- fine when this file was
+# small, but it has since grown to tens of thousands of records (members,
+# grids, bom_items...). Endpoints that chain many .execute() calls in a loop
+# (floor clustering, page registration, model assembly -- easily 50-100+
+# calls in one request) were re-parsing the entire multi-MB file on every
+# single one of those calls, synchronously blocking the event loop long
+# enough that the frontend saw the request as permanently hung rather than
+# just slow. Caching the parsed dict and only re-reading when the file has
+# actually changed on disk (checked via mtime, so external edits -- e.g. a
+# human hand-editing local_db.json while the server runs -- still get
+# picked up) turns most calls into an in-memory lookup instead.
+_db_cache: Optional[dict] = None
+_db_cache_mtime: Optional[float] = None
+
+# Lazy (table, field) -> {value: [rows]} index for the single-eq-filter case,
+# which is the overwhelming majority of queries in this codebase
+# (.eq("page_id", ...), .eq("floor_id", ...), .eq("id", ...), etc). Without
+# this, every one of those calls did a full O(table_size) Python-level scan
+# via _matches() -- and code paths like register_floor()/
+# cluster_pages_into_floors() call .eq(...).execute() dozens of times in
+# nested per-page, per-floor loops against tables (members, grids, pages)
+# that hold every project's data, not just the one being viewed. That's
+# O(floors x pages x table_size), which is what turned "load a project" into
+# a multi-second-to-indefinite hang as the tables grew. Invalidated (cleared)
+# any time the underlying data can have changed -- see _load_db()/_save_db().
+_index_cache: dict[tuple[str, str], dict[str, list[dict]]] = {}
+
+
+def _invalidate_indexes() -> None:
+    _index_cache.clear()
+
+
+def _candidates(table_name: str, items: list[dict], filters: list[tuple[str, str, Any]]) -> list[dict]:
+    """Return the rows to check for a query, using the (table, field) index
+    when the query is a single eq() filter (the common case), otherwise the
+    full table so the caller's normal per-item _matches() scan still runs."""
+    if len(filters) == 1 and filters[0][1] == "eq":
+        field, _op, val = filters[0]
+        idx_key = (table_name, field)
+        index = _index_cache.get(idx_key)
+        if index is None:
+            index = {}
+            for item in items:
+                iv = str(item.get(field)) if item.get(field) is not None else "null"
+                index.setdefault(iv, []).append(item)
+            _index_cache[idx_key] = index
+        return index.get(val, [])
+    return items
+
 
 def _load_db() -> dict:
+    global _db_cache, _db_cache_mtime
+
+    if os.path.exists(_DB_FILE):
+        try:
+            mtime = os.path.getmtime(_DB_FILE)
+        except OSError:
+            mtime = None
+        if _db_cache is not None and mtime is not None and mtime == _db_cache_mtime:
+            return _db_cache
+
     default_db = {
         "users": [],
         "projects": [],
@@ -39,7 +119,12 @@ def _load_db() -> dict:
         "notifications": [],
         "layer_presets": [],
         "column_groups": [],
-        "braced_frames": []
+        "braced_frames": [],
+        "floors": [],
+        "grids": [],
+        "match_lines": [],
+        "page_floor_links": [],
+        "page_registrations": []
     }
     if not os.path.exists(_DB_FILE):
         db = default_db
@@ -47,8 +132,47 @@ def _load_db() -> dict:
         try:
             with open(_DB_FILE, "r") as f:
                 db = json.load(f)
-        except Exception:
-            db = default_db
+            _db_cache_mtime = os.path.getmtime(_DB_FILE)
+        except Exception as e:
+            # IMPORTANT: do not silently discard the file's contents here.
+            # This used to be `except Exception: db = default_db`, which
+            # means any corruption of local_db.json (e.g. trailing NUL
+            # bytes from an editor/OS write glitch -- confirmed to happen
+            # in this project) made every request quietly fall back to an
+            # empty in-memory DB. The very next write then persisted that
+            # empty DB back to disk, permanently erasing every real
+            # project/member/floor that existed before the corruption.
+            # Recover from the one corruption pattern we know how to fix
+            # safely (trailing NUL padding after otherwise-valid JSON)
+            # before ever falling back to an empty database, and log loudly
+            # either way so this isn't invisible next time.
+            recovered = False
+            try:
+                with open(_DB_FILE, "rb") as f:
+                    raw = f.read()
+                stripped = raw.rstrip(b"\x00")
+                if stripped and stripped != raw:
+                    db = json.loads(stripped.decode("utf-8"))
+                    with open(_DB_FILE, "wb") as f:
+                        f.write(stripped)
+                    _db_cache_mtime = os.path.getmtime(_DB_FILE)
+                    recovered = True
+                    logger.warning(
+                        "local_db.json had %d trailing NUL byte(s) after valid JSON -- "
+                        "stripped and recovered %d project(s) instead of resetting to empty.",
+                        len(raw) - len(stripped), len(db.get("projects", [])),
+                    )
+            except Exception:
+                recovered = False
+            if not recovered:
+                logger.error(
+                    "local_db.json is corrupt and could not be auto-recovered (%s). "
+                    "Falling back to an empty in-memory DB -- if this gets saved, any "
+                    "existing data in the file will be lost. Back up local_db.json now "
+                    "and inspect it before making further requests.", e,
+                )
+                db = default_db
+                _db_cache_mtime = None
 
     # Ensure all tables exist
     for key, val in default_db.items():
@@ -74,13 +198,56 @@ def _load_db() -> dict:
         db["sections"] = seeds
         _save_db(db)
 
+    _db_cache = db
+    _invalidate_indexes()
     return db
 
 
 def _save_db(data: dict) -> None:
+    global _db_cache, _db_cache_mtime
     try:
-        with open(_DB_FILE, "w") as f:
+        # Write atomically: dump to a temp file in the same directory, then
+        # os.replace() over the real path. A plain open(_DB_FILE, "w") +
+        # json.dump() writes in place -- if the process is interrupted mid-
+        # dump (dev-server hot-reload firing mid-request, a crash, or two
+        # requests racing to write at once), local_db.json is left truncated
+        # and every subsequent read of the ENTIRE database fails, not just
+        # the one row being written. This happened for real: a request that
+        # looped over hundreds of members calling .update().execute() once
+        # each got cut off partway through and corrupted the whole file.
+        # os.replace() is atomic on both POSIX and Windows, so readers only
+        # ever see the fully-old or fully-new file, never a half-written one
+        # -- AS LONG AS every writer uses its own tmp file. A fixed shared
+        # name here meant two concurrent writers (now a real scenario, e.g.
+        # register_floor() on background executor threads, or a dev-server
+        # hot-reload starting a new process before the old one's write
+        # finished) could both have the same inode open at once, and their
+        # write() calls interleave at the OS level -- producing a tmp file
+        # that's neither writer's clean output, which os.replace() then
+        # atomically installs as the "valid" database. _db_lock (see above)
+        # already serializes writers within this one process; making the
+        # path unique per-writer closes the remaining cross-process gap too.
+        tmp_path = f"{_DB_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _DB_FILE)
+        # Keep the cache in lockstep with what we just wrote, so the very
+        # next _load_db() call (e.g. the next chained .execute() in the same
+        # request) reuses this in-memory copy instead of re-reading the file
+        # we just finished writing.
+        _db_cache = data
+        try:
+            _db_cache_mtime = os.path.getmtime(_DB_FILE)
+        except OSError:
+            _db_cache_mtime = None
+        # A write can add/remove/change rows in any table, so any index built
+        # against the pre-write data is potentially stale. Rebuilding an
+        # index is O(table_size) done once on next use -- still vastly
+        # cheaper than the O(table_size) scan we were doing on every single
+        # query before this cache existed.
+        _invalidate_indexes()
     except Exception as exc:
         logger.error("Failed to write local offline DB: %s", exc)
 
@@ -100,48 +267,39 @@ class MockQueryBuilder:
         return self
 
     def insert(self, data: Any) -> MockQueryBuilder:
-        db = _load_db()
-        rows = data if isinstance(data, list) else [data]
-        inserted = []
-        for row in rows:
-            row = dict(row)
-            if "id" not in row:
-                row["id"] = str(uuid.uuid4())
-            row["created_at"] = datetime.now(timezone.utc).isoformat()
-            row["updated_at"] = datetime.now(timezone.utc).isoformat()
-            db.setdefault(self.table_name, []).append(row)
-            inserted.append(row)
-        _save_db(db)
+        with _db_lock:
+            db = _load_db()
+            rows = data if isinstance(data, list) else [data]
+            inserted = []
+            for row in rows:
+                row = dict(row)
+                if "id" not in row:
+                    row["id"] = str(uuid.uuid4())
+                row["created_at"] = datetime.now(timezone.utc).isoformat()
+                row["updated_at"] = datetime.now(timezone.utc).isoformat()
+                db.setdefault(self.table_name, []).append(row)
+                inserted.append(row)
+            _save_db(db)
         self._result = inserted
         return self
 
     def update(self, data: Any) -> MockQueryBuilder:
-        db = _load_db()
-        items = db.setdefault(self.table_name, [])
-        updated = []
-        for item in items:
-            if self._matches(item):
-                for k, v in data.items():
-                    item[k] = v
-                item["updated_at"] = datetime.now(timezone.utc).isoformat()
-                updated.append(item)
-        _save_db(db)
-        self._result = updated
+        # IMPORTANT: this must NOT execute immediately. Every caller in this
+        # codebase chains filters AFTER update(), e.g.
+        #   db.table("pages").update({...}).eq("id", page_id).execute()
+        # If update() ran here, self.filters would still be empty (the
+        # .eq() call hasn't happened yet) and _matches() would match EVERY
+        # row in the table -- silently overwriting the whole table instead
+        # of the one intended row. Defer to execute() instead, by which
+        # point all chained filters have been collected.
+        self._pending_update = data
         return self
 
     def delete(self) -> MockQueryBuilder:
-        db = _load_db()
-        items = db.setdefault(self.table_name, [])
-        kept = []
-        deleted = []
-        for item in items:
-            if self._matches(item):
-                deleted.append(item)
-            else:
-                kept.append(item)
-        db[self.table_name] = kept
-        _save_db(db)
-        self._result = deleted
+        # Same reasoning as update(): must defer to execute() so filters
+        # chained after .delete() (the convention used everywhere in this
+        # codebase) are honored instead of deleting every row in the table.
+        self._pending_delete = True
         return self
 
     def eq(self, field: str, value: Any) -> MockQueryBuilder:
@@ -190,36 +348,42 @@ class MockQueryBuilder:
         return self
 
     def upsert(self, data: Any) -> MockQueryBuilder:
-        db = _load_db()
-        rows = data if isinstance(data, list) else [data]
-        items = db.setdefault(self.table_name, [])
-        inserted = []
-        for row in rows:
-            row = dict(row)
-            existing_idx = -1
-            if "id" in row:
-                for idx, item in enumerate(items):
-                    if item.get("id") == row["id"]:
-                        existing_idx = idx
-                        break
-            elif "project_id" in row and self.table_name == "configurations":
-                for idx, item in enumerate(items):
-                    if item.get("project_id") == row["project_id"]:
-                        existing_idx = idx
-                        break
+        with _db_lock:
+            db = _load_db()
+            rows = data if isinstance(data, list) else [data]
+            items = db.setdefault(self.table_name, [])
+            inserted = []
+            for row in rows:
+                row = dict(row)
+                existing_idx = -1
+                if "id" in row:
+                    for idx, item in enumerate(items):
+                        if item.get("id") == row["id"]:
+                            existing_idx = idx
+                            break
+                elif "project_id" in row and self.table_name == "configurations":
+                    for idx, item in enumerate(items):
+                        if item.get("project_id") == row["project_id"]:
+                            existing_idx = idx
+                            break
+                elif "page_id" in row and self.table_name in ("page_floor_links", "page_registrations"):
+                    for idx, item in enumerate(items):
+                        if item.get("page_id") == row["page_id"]:
+                            existing_idx = idx
+                            break
 
-            if existing_idx != -1:
-                items[existing_idx].update(row)
-                items[existing_idx]["updated_at"] = datetime.now(timezone.utc).isoformat()
-                inserted.append(items[existing_idx])
-            else:
-                if "id" not in row:
-                    row["id"] = str(uuid.uuid4())
-                row["created_at"] = datetime.now(timezone.utc).isoformat()
-                row["updated_at"] = datetime.now(timezone.utc).isoformat()
-                items.append(row)
-                inserted.append(row)
-        _save_db(db)
+                if existing_idx != -1:
+                    items[existing_idx].update(row)
+                    items[existing_idx]["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    inserted.append(items[existing_idx])
+                else:
+                    if "id" not in row:
+                        row["id"] = str(uuid.uuid4())
+                    row["created_at"] = datetime.now(timezone.utc).isoformat()
+                    row["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    items.append(row)
+                    inserted.append(row)
+            _save_db(db)
         self._result = inserted
         return self
 
@@ -244,12 +408,38 @@ class MockQueryBuilder:
         return True
 
     def execute(self) -> MockResponse:
+        if hasattr(self, "_pending_update"):
+            with _db_lock:
+                db = _load_db()
+                items = db.setdefault(self.table_name, [])
+                updated = []
+                for item in _candidates(self.table_name, items, self.filters):
+                    if self._matches(item):
+                        for k, v in self._pending_update.items():
+                            item[k] = v
+                        item["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        updated.append(item)
+                _save_db(db)
+            return MockResponse(updated)
+
+        if hasattr(self, "_pending_delete"):
+            with _db_lock:
+                db = _load_db()
+                items = db.setdefault(self.table_name, [])
+                to_delete_ids = {id(item) for item in _candidates(self.table_name, items, self.filters) if self._matches(item)}
+                kept = [item for item in items if id(item) not in to_delete_ids]
+                deleted = [item for item in items if id(item) in to_delete_ids]
+                db[self.table_name] = kept
+                _save_db(db)
+            return MockResponse(deleted)
+
         if hasattr(self, "_result"):
             return MockResponse(self._result)
 
-        db = _load_db()
-        items = db.setdefault(self.table_name, [])
-        filtered = [item for item in items if self._matches(item)]
+        with _db_lock:
+            db = _load_db()
+            items = db.setdefault(self.table_name, [])
+            filtered = [item for item in _candidates(self.table_name, items, self.filters) if self._matches(item)]
 
         if self.order_by:
             filtered.sort(key=lambda x: str(x.get(self.order_by) or ""), reverse=self.order_desc)
@@ -274,12 +464,54 @@ class MockClient:
         return MockQueryBuilder(table_name)
 
 
+def bulk_update_by_id(table_name: str, updates_by_id: dict[str, dict]) -> int:
+    """Apply many per-row field updates to one table in a single file write.
+
+    Callers that update N rows via N separate .update({...}).eq("id", ...)
+    .execute() calls (e.g. write_global_geometry looping over every member
+    of a page) trigger N full read-modify-write cycles of local_db.json in
+    the mock DB -- each one dumping the ENTIRE multi-MB file back to disk.
+    Besides being slow, this made the file spend most of its time mid-write,
+    so any interruption (dev-server hot-reload, a second overlapping
+    request) had a real chance of landing mid-json.dump and truncating/
+    corrupting the whole database -- which is exactly what happened once in
+    practice. Real Supabase has no such risk (proper DB, real transactions),
+    so this only takes the fast path for the offline mock client; against
+    real Supabase it degrades to the same per-row loop calling code used to
+    do, which is fine there.
+    """
+    if not updates_by_id:
+        return 0
+    db_client = get_db()
+    if not isinstance(db_client, MockClient):
+        count = 0
+        for row_id, fields in updates_by_id.items():
+            db_client.table(table_name).update(fields).eq("id", row_id).execute()
+            count += 1
+        return count
+
+    with _db_lock:
+        db = _load_db()
+        items = db.setdefault(table_name, [])
+        now = datetime.now(timezone.utc).isoformat()
+        count = 0
+        for item in items:
+            fields = updates_by_id.get(item.get("id"))
+            if fields is None:
+                continue
+            for k, v in fields.items():
+                item[k] = v
+            item["updated_at"] = now
+            count += 1
+        _save_db(db)
+    return count
+
+
 def get_db() -> Any:
     """Return the Supabase Client or a fully offline MockClient fallback."""
     global _client
     if _client is None:
         cfg = get_settings()
-        # Fallback to local file-based database if Supabase URL is paused/placeholder
         if (
             not cfg.supabase_url
             or "cfsrdgoapoziffjesllw" in cfg.supabase_url

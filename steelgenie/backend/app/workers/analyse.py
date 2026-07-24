@@ -84,7 +84,10 @@ async def run_analyse(
     detect_braces: bool = True,
     detect_unlabeled: bool = False,
     ocr_dpi: int = 400,
-    floor_elevation_ft: float = 12.0,
+    # No default -- T.O.S. is per-drawing and always user-entered (see
+    # AnalyseRequest.floor_elevation_ft, which is required for the same
+    # reason).
+    floor_elevation_ft: float,
 ) -> None:
     """
     Analysis worker coroutine.
@@ -158,8 +161,10 @@ async def run_analyse(
 
     await progress(80, f"Saving {len(result.get('members', []))} members…")
 
-    # Delete existing members for this page (re-analysis)
+    # Delete existing members, grids, and registrations for this page (re-analysis)
     db.table("members").delete().eq("page_id", page_id).execute()
+    db.table("grids").delete().eq("page_id", page_id).execute()
+    db.table("page_registrations").delete().eq("page_id", page_id).execute()
 
     # Save new members
     raw_members: List[Dict[str, Any]] = result.get("members", [])
@@ -169,9 +174,33 @@ async def run_analyse(
         kind = m.get("type", "beam")
         if kind == "brace":
             kind = "vbrace"
-        elif kind not in ("beam", "column", "vbrace", "hbrace", "joist"):
+        # Stage 3 (2026-07-17 rebuild) added a "footing" member type (see
+        # main.py's emit_symbol_columns) so a foundation-plan footing
+        # outline and the column that lands on it can be persisted as two
+        # linked records instead of one. Before this line, "footing" wasn't
+        # in the recognized-kind list below and silently fell through to
+        # "beam" -- which is actively dangerous, not just wrong: registration
+        # .py's sync_global_columns treats every non-column member's
+        # endpoints as beam/joist evidence a column reaches that floor, so a
+        # mislabeled footing would have injected fake beam-connectivity
+        # evidence at every footing's own position.
+        elif kind not in ("beam", "column", "vbrace", "hbrace", "joist", "footing"):
             kind = "beam"
 
+        # Some raw members (e.g. main.py's emit_symbol_columns) already
+        # carry their own nested "geometry" dict with extraction-stage-only
+        # fields (grid_ref, category, linked_group_id, ...) that the
+        # allow-list below doesn't otherwise capture from top-level keys.
+        # Read it here so those fields survive into the persisted row
+        # instead of being silently discarded on every re-extraction --
+        # Stage 3 (2026-07-17 rebuild)'s category/linked_group_id/
+        # linked_role are the immediate reason this was added, but
+        # grid_ref (referenced by registration.py's B1 grid-corroboration
+        # signal) was ALSO being dropped here before this change, for every
+        # member, on every project -- a pre-existing gap, not introduced
+        # this session, fixed here as a natural side effect of fixing this
+        # allow-list for Stage 3.
+        _raw_geo = m.get("geometry") or {}
         geometry = {
             "x": m.get("x", 0),
             "y": m.get("y", 0),
@@ -199,6 +228,28 @@ async def run_analyse(
             # guesses.
             "suggested": m.get("confirmed") is False,
             "size_unknown": m.get("size_unknown", False),
+            "grid_ref": _raw_geo.get("grid_ref"),
+            "category": _raw_geo.get("category"),
+            "linked_group_id": _raw_geo.get("linked_group_id"),
+            "linked_role": _raw_geo.get("linked_role"),
+            # Stage 6 Part 2 (2026-07-17): these were ALSO being silently
+            # dropped by this allow-list, same bug as grid_ref/category
+            # above. raw_x/raw_y (the true detected symbol position, before
+            # grid-snapping) and symbol/sym_w/sym_h (the real detected icon
+            # type + its actual on-page size) are what the 2D overlay needs
+            # to place a marker exactly on the real symbol and draw it at
+            # the real symbol's shape/size instead of a generic fixed box --
+            # every column/footing on every project was silently losing
+            # this data at persistence time, before the frontend ever saw
+            # it, which is why the overlay looked "close but not exact."
+            "raw_x": _raw_geo.get("raw_x"),
+            "raw_y": _raw_geo.get("raw_y"),
+            "snap_offset_ft": _raw_geo.get("snap_offset_ft"),
+            "symbol": _raw_geo.get("symbol"),
+            "sym_w": _raw_geo.get("sym_w"),
+            "sym_h": _raw_geo.get("sym_h"),
+            "depth_in": _raw_geo.get("depth_in"),
+            "error_flags": _raw_geo.get("error_flags"),
         }
 
         member_rows.append({
@@ -207,7 +258,13 @@ async def run_analyse(
             "section": m.get("profile"),
             "grade": "A992" if kind in ("beam", "column") else "A36",
             "rotation": m.get("rotation", 0),
-            "status": "active",
+            # Preserve the extraction pipeline's own status when it set one
+            # (e.g. emit_symbol_columns() marks a low-confidence/no-label
+            # symbol-only column "need_review", matching SteelGenie's own
+            # "Need Review" flag on guessed columns) -- this used to be
+            # unconditionally overwritten to "active" here, silently
+            # discarding that distinction before it ever reached the DB.
+            "status": m.get("status") or "active",
             "source": "ai",
             "geometry": geometry,
             "confidence": _confidence_to_float(m.get("confidence")),
@@ -224,8 +281,74 @@ async def run_analyse(
         for i in range(0, len(member_rows), 100):
             db.table("members").insert(member_rows[i:i+100]).execute()
 
-    # Update page status
-    db.table("pages").update({"status": "estimating"}).eq("id", page_id).execute()
+    # Persist grid lines with their REAL bubble labels (e.g. "1", "2.3", "A")
+    # read straight off this sheet by extract_grid_lines(), instead of the
+    # sequential "1,2,3.../A,B,C" placeholder that
+    # registration.extract_grids_for_page() falls back to when no grids
+    # exist yet. A real label lets the same physical grid line register
+    # correctly across multiple sheets of the same floor; a sequential one
+    # doesn't, since every page restarts its own numbering from 1/A.
+    grid_bubbles = result.get("grid_bubbles") or {}
+    grid_rows = []
+    for entry in grid_bubbles.get("v", []):
+        label = entry.get("label")
+        if label is None:
+            continue  # no confirmed bubble text -- let the sequential fallback handle it
+        grid_rows.append({
+            "page_id": page_id, "axis": "x", "label": label,
+            "position": entry["position"], "confidence": 0.9, "source": "ai",
+        })
+    for entry in grid_bubbles.get("h", []):
+        label = entry.get("label")
+        if label is None:
+            continue
+        grid_rows.append({
+            "page_id": page_id, "axis": "y", "label": label,
+            "position": entry["position"], "confidence": 0.9, "source": "ai",
+        })
+    if grid_rows:
+        for i in range(0, len(grid_rows), 100):
+            db.table("grids").insert(grid_rows[i:i+100]).execute()
+        logger.info("Persisted %d real-labeled grid lines for page=%s", len(grid_rows), page_id)
+
+    # Persist the T.O.S. elevation on the page so that cluster_pages_into_floors()
+    # can group this page with other pages at the same elevation into one floor.
+    # Without this write, floor clustering has no tos_ft to work from.
+    # is_foundation_plan: same "FOUNDATION PLAN"/"FOUNDATION FRAMING" text
+    # check main.py's extraction already runs to decide symbol-detection
+    # rules, now also persisted so the frontend can label this page's
+    # elevation field "Bottom of Column" instead of "Top of Steel" --
+    # verified live against the real SteelGenie app on two separate
+    # projects (Bayhealth, Congress Heights) that this is its actual
+    # convention, not a guess. Purely a label -- the elevation number
+    # itself is stored and used exactly as before.
+    page_update = {"status": "estimating", "is_foundation_plan": bool(result.get("is_foundation_plan"))}
+    if floor_elevation_ft is not None:
+        page_update["tos_ft"] = floor_elevation_ft
+    db.table("pages").update(page_update).eq("id", page_id).execute()
+
+    # Register this page's floor NOW, inside the extraction job, instead of
+    # leaving it for GET /model/merged's _ensure_project_registered() to do
+    # lazily on the next 3D-view fetch. register_floor()'s grid-correlation
+    # matching is the slow part of this whole pipeline (confirmed elsewhere
+    # to take 45s+ on floors with many grid lines) -- running it inside a
+    # synchronous request handler that the 3D viewer's loading-progress bar
+    # is waiting on made that bar sit at its asymptotic 95% cap for as long
+    # as registration took, looking permanently stuck. Doing it here means
+    # it happens once, during the extraction job (which already has its own
+    # honest progress bar for exactly this kind of long-running work), so
+    # by the time the 3D viewer requests the merged model the page is
+    # already registered and that fetch stays fast.
+    await progress(90, "Registering sheet into building coordinates…")
+    try:
+        from app.engineering.registration import cluster_pages_into_floors, register_floor
+        await loop.run_in_executor(None, cluster_pages_into_floors, project_id)
+        link_row = db.table("page_floor_links").select("floor_id").eq("page_id", page_id).maybe_single().execute()
+        floor_id = (link_row.data or {}).get("floor_id") if link_row else None
+        if floor_id:
+            await loop.run_in_executor(None, register_floor, floor_id)
+    except Exception:
+        logger.exception("Post-extraction registration failed for page=%s (non-fatal)", page_id)
 
     summary = result.get("summary", {})
     await _update_job(

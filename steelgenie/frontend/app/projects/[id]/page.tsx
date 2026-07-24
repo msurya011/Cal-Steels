@@ -9,16 +9,19 @@ import { useMembers } from '../../../features/workspace/hooks/useMembers'
 import { PageRail } from '../../../features/workspace/components/PageRail/PageRail'
 import { CanvasToolbar } from '../../../features/workspace/components/CanvasToolbar'
 import { PlanCanvas } from '../../../features/workspace/components/PlanCanvas/PlanCanvas'
-import { MemberExplorer } from '../../../features/workspace/components/MemberExplorer/MemberExplorer'
-import { SummaryBar } from '../../../features/workspace/components/SummaryBar'
-import { PropertiesPanel } from '../../../features/workspace/components/PropertiesPanel'
+import { MembersTab } from '../../../features/workspace/components/LeftSidebar/MembersTab'
+import { NavigationPanel } from '../../../features/workspace/components/LeftSidebar/NavigationPanel'
+import { PropertiesPanel } from '../../../features/workspace/components/RightSidebar/PropertiesPanel'
 import { ScaleCalibrationModal } from '../../../features/workspace/components/ScaleCalibrationModal'
 import { SheetSummary } from '../../../features/workspace/components/SheetSummary'
 import { VerticalToolStrip } from '../../../features/workspace/components/VerticalToolStrip'
+import { KeyPlanView } from '../../../features/workspace/components/KeyPlan/KeyPlanView'
+import { KeyPlanPropertiesPanel } from '../../../features/workspace/components/KeyPlan/KeyPlanPropertiesPanel'
+import { KeyPlanFloor } from '../../../features/workspace/components/KeyPlan/KeyPlanTypes'
 import { supabase } from '../../../lib/supabase'
-import { getEventsWebSocketUrl, jobsApi, membersApi, layerPresetsApi } from '../../../lib/api'
+import { getEventsWebSocketUrl, jobsApi, membersApi, layerPresetsApi, floorsApi, bomApi } from '../../../lib/api'
 import { toast } from 'sonner'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 export default function TakeoffWorkspacePage() {
   const params = useParams()
@@ -40,6 +43,12 @@ export default function TakeoffWorkspacePage() {
     clearSelection,
     setSelection,
     toggleSelection,
+    show3d,
+    pushHistoryLog,
+    markPageDirty,
+    clearPageDirty,
+    dirtyPageIds,
+    bumpModelRefresh,
   } = useWorkspaceStore()
 
   // Auto-select first page if none active
@@ -50,6 +59,13 @@ export default function TakeoffWorkspacePage() {
       setScale(p.scale_label, p.scale_num)
     }
   }, [pages, currentPageId, setCurrentPage, setScale])
+
+  // Load key plan floors on mount/project change
+  useEffect(() => {
+    if (projectId) {
+      refetchKeyPlanFloors(currentPageId)
+    }
+  }, [projectId, currentPageId])
 
   // Query/Mutations: members
   const {
@@ -64,43 +80,35 @@ export default function TakeoffWorkspacePage() {
     validateColumns,
   } = useMembers(currentPageId)
 
-  // Listen for 'R' key to rotate the selected column 90 degrees
-  useEffect(() => {
-    const handleKeyDown = async (e: KeyboardEvent) => {
-      // Ignore if user is typing in an input or textarea
-      const tag = (e.target as HTMLElement).tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement).isContentEditable) {
-        return
-      }
-
-      if (e.key === 'r' || e.key === 'R') {
-        const selectedIds = Array.from(selection)
-        if (selectedIds.length === 1) {
-          const id = selectedIds[0]
-          const selectedMember = members.find((m: any) => m.id === id)
-          if (selectedMember && selectedMember.kind === 'column') {
-            e.preventDefault()
-            const currentRotation = selectedMember.rotation || 0
-            const nextRotation = (currentRotation + 90) % 180 // toggle between 0 and 90
-            try {
-              await updateMember({ 
-                id, 
-                data: { rotation: nextRotation } 
-              })
-              toast.success(`Rotated column to ${nextRotation}°`)
-            } catch {
-              toast.error('Failed to rotate column')
-            }
-          }
-        }
-      }
+  // BOM items carry the fields SteelGenie's "Color By" tool actually colors
+  // by once a build has run (Sequence / Weight / Labor Code / Paint) -- these
+  // don't exist on the raw extracted member row, only on its BOM line item
+  // (joined via member_id). Refetches whenever ['members'] is invalidated
+  // (i.e. right after a build), same as everything else that depends on BOM.
+  const { data: bomItems = [] } = useQuery({
+    queryKey: ['bom-items-for-toolstrip', projectId],
+    queryFn: () => bomApi.list(projectId),
+    enabled: !!projectId,
+  })
+  const bomByMemberId = React.useMemo(() => {
+    const map: Record<string, any> = {}
+    for (const item of bomItems) {
+      if (item.member_id) map[item.member_id] = item
     }
+    return map
+  }, [bomItems])
+  const membersForToolStrip = React.useMemo(
+    () =>
+      members.map((m: any) => {
+        const bom = bomByMemberId[m.id]
+        return bom
+          ? { ...m, sequence: bom.sequence, weight_lbs: bom.weight_lbs, labor_code: bom.labor_code, paint: bom.paint }
+          : m
+      }),
+    [members, bomByMemberId]
+  )
 
-    window.addEventListener('keydown', handleKeyDown)
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown)
-    }
-  }, [selection, members, updateMember])
+
 
   const activePage = pages.find((p: any) => p.id === currentPageId) || null
   const [analysingState, setAnalysingState] = useState(false)
@@ -109,6 +117,68 @@ export default function TakeoffWorkspacePage() {
   const queryClient = useQueryClient()
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [leftTab, setLeftTab] = useState<'pages' | 'members'>('pages')
+
+  // ── Key Plan (multi-page floor overlay) state ────────────────────────────
+  const [showKeyPlan, setShowKeyPlan] = useState(false)
+  const [keyPlanFloors, setKeyPlanFloors] = useState<KeyPlanFloor[]>([])
+  const [activeFloorId, setActiveFloorId] = useState<string | null>(null)
+  const [manualPageIds, setManualPageIds] = useState<Set<string>>(new Set())
+  const [hiddenPageIds, setHiddenPageIds] = useState<Set<string>>(new Set())
+
+  const refetchKeyPlanFloors = async (preferPageId?: string | null) => {
+    try {
+      const floors: KeyPlanFloor[] = await floorsApi.list(projectId)
+      setKeyPlanFloors(floors || [])
+      const pid = preferPageId ?? currentPageId
+      const floorWithPage = pid ? floors.find((f) => f.pages.some((p) => p.page_id === pid)) : null
+      setActiveFloorId((prev) => {
+        if (floorWithPage) return floorWithPage.id
+        if (prev && floors.some((f) => f.id === prev)) return prev
+        return floors[0]?.id ?? null
+      })
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to load floors for Key Plan')
+    }
+  }
+
+  const handleToggleKeyPlan = () => {
+    setShowKeyPlan((prev) => {
+      const next = !prev
+      if (next) refetchKeyPlanFloors(currentPageId)
+      return next
+    })
+  }
+
+  const handleKeyPlanDragCommit = async (pageId: string, dxFt: number, dyFt: number) => {
+    const floor = keyPlanFloors.find((f) => f.id === activeFloorId)
+    const page = floor?.pages.find((p) => p.page_id === pageId)
+    const reg = page?.registration
+    if (!reg) return
+    try {
+      await floorsApi.overrideRegistration(pageId, { tx_ft: reg.tx_ft + dxFt, ty_ft: reg.ty_ft + dyFt })
+      await refetchKeyPlanFloors()
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to save manual alignment')
+    }
+  }
+
+  const toggleManualPage = (pageId: string) => {
+    setManualPageIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(pageId)) next.delete(pageId)
+      else next.add(pageId)
+      return next
+    })
+  }
+
+  const toggleHiddenPage = (pageId: string) => {
+    setHiddenPageIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(pageId)) next.delete(pageId)
+      else next.add(pageId)
+      return next
+    })
+  }
 
   // Card-level page updates (scale / T.O.S. / status) — keeps store in sync
   const handleCardUpdatePage = async (pageId: string, data: any) => {
@@ -145,7 +215,7 @@ export default function TakeoffWorkspacePage() {
         floor_elevation_ft: page.tos_ft ?? 12.0,
       })
       // Polling fallback: shows progress/completion even if WebSocket events are lost.
-      if (res?.job_id) pollJob(res.job_id)
+      if (res?.job_id) pollJob(res.job_id, page.id)
     } catch (err: any) {
       toast.error(err.message || 'Failed to start extraction job')
       setAnalysingState(false)
@@ -154,7 +224,7 @@ export default function TakeoffWorkspacePage() {
   }
 
   // Poll job status every 2s until done/failed (fallback when WS events are lost).
-  const pollJob = (jobId: string) => {
+  const pollJob = (jobId: string, extractedPageId?: string) => {
     const started = Date.now()
     const timer = setInterval(async () => {
       try {
@@ -183,8 +253,18 @@ export default function TakeoffWorkspacePage() {
           toast.error(`Extraction failed: ${job.error || 'unknown error'}`, { id: 'analysis-toast' })
         } else {
           toast.success(job.message || 'Member extraction completed!', { id: 'analysis-toast' })
+          if (extractedPageId) clearPageDirty(extractedPageId)
           queryClient.invalidateQueries({ queryKey: ['members'] })
           queryClient.invalidateQueries({ queryKey: ['pages'] })
+          // Live-merge this page's newly extracted members into the 3D
+          // viewer's persistent scene immediately -- matches the reference
+          // product, where the model updates the instant a sheet finishes
+          // extracting instead of requiring a manual "Build"/reload.
+          // MUST pass the page id: the 3D viewer's incremental loader keys
+          // its "already loaded this page, skip" guard off lastEditedPageId,
+          // so a bare bumpModelRefresh() here silently failed to re-merge a
+          // re-extracted (or newly extracted alongside already-loaded) page.
+          bumpModelRefresh(extractedPageId)
         }
       } catch {
         // transient polling error — keep trying until timeout
@@ -238,6 +318,11 @@ export default function TakeoffWorkspacePage() {
               toast.error(`Analysis failed: ${error}`, { id: 'analysis-toast' })
             } else {
               toast.success('Member extraction completed successfully!', { id: 'analysis-toast' })
+              if (extractingPageId) clearPageDirty(extractingPageId)
+              // Same fix as the polling path above: pass the page id so the
+              // 3D viewer's incremental loader actually re-merges this page
+              // instead of treating it as already-loaded and skipping it.
+              bumpModelRefresh(extractingPageId ?? undefined)
             }
             setAnalysingState(false)
             setExtractingPageId(null)
@@ -498,18 +583,94 @@ export default function TakeoffWorkspacePage() {
     }
   }
 
-  const handleMemberDragEnd = async (id: string, newX: number, newY: number) => {
+  const calculateLengthFt = (x1: number, y1: number, x2: number, y2: number) => {
+    if (!imageNaturalWidth || !selectedRatio) return null
+    const dxPx = (x2 - x1) * imageNaturalWidth
+    const dyPx = (y2 - y1) * imageNaturalWidth * imageAspect
+    const lenPts = (Math.sqrt(dxPx * dxPx + dyPx * dyPx) * 72) / 150
+    return (lenPts * selectedRatio) / 864
+  }
+
+  const handleMemberDragEnd = async (id: string, dx: number, dy: number) => {
     try {
       const existing = members.find((m: any) => m.id === id)
       if (!existing) return
-      await updateMember({ 
-        id, 
-        data: { geometry: { ...existing.geometry, x: newX, y: newY } } 
+
+      const updatedGeometry = { ...existing.geometry }
+      const hasSpan = existing.geometry.bx1 !== undefined && existing.geometry.bx1 !== null &&
+                      existing.geometry.bx2 !== undefined && existing.geometry.bx2 !== null
+
+      if (hasSpan) {
+        updatedGeometry.bx1 = (existing.geometry.bx1 || 0) + dx
+        updatedGeometry.by1 = (existing.geometry.by1 || 0) + dy
+        updatedGeometry.bx2 = (existing.geometry.bx2 || 0) + dx
+        updatedGeometry.by2 = (existing.geometry.by2 || 0) + dy
+        if (existing.geometry.x !== undefined && existing.geometry.x !== null) {
+          updatedGeometry.x = existing.geometry.x + dx
+        }
+        if (existing.geometry.y !== undefined && existing.geometry.y !== null) {
+          updatedGeometry.y = existing.geometry.y + dy
+        }
+      } else {
+        updatedGeometry.x = (existing.geometry.x || 0) + dx
+        updatedGeometry.y = (existing.geometry.y || 0) + dy
+      }
+
+      await updateMember({
+        id,
+        data: { geometry: updatedGeometry }
       })
       await validateColumns()
-      toast.success('Member position updated and snapped')
+      pushHistoryLog('move', `Move ${existing.piecemark || existing.section || existing.kind}`)
+      if (currentPageId) markPageDirty(currentPageId)
+      toast.success('Member position updated')
     } catch {
       toast.error('Failed to update member position')
+    }
+  }
+
+  const handleEndpointDragEnd = async (id: string, endpoint: 'start' | 'end', x: number, y: number) => {
+    try {
+      const existing = members.find((m: any) => m.id === id)
+      if (!existing) return
+
+      const newBx1 = endpoint === 'start' ? x : (existing.geometry.bx1 || 0)
+      const newBy1 = endpoint === 'start' ? y : (existing.geometry.by1 || 0)
+      const newBx2 = endpoint === 'end' ? x : (existing.geometry.bx2 || 0)
+      const newBy2 = endpoint === 'end' ? y : (existing.geometry.by2 || 0)
+
+      let newAngle = (Math.atan2(newBy2 - newBy1, newBx2 - newBx1) * 180) / Math.PI
+      if (newAngle > 90) newAngle -= 180
+      if (newAngle < -90) newAngle += 180
+
+      const newBeamDir = Math.abs(newBx2 - newBx1) >= Math.abs(newBy2 - newBy1) ? 'H' : 'V'
+
+      const updatedGeometry = {
+        ...existing.geometry,
+        bx1: newBx1,
+        by1: newBy1,
+        bx2: newBx2,
+        by2: newBy2,
+        x: (newBx1 + newBx2) / 2,
+        y: (newBy1 + newBy2) / 2,
+        angle_deg: newAngle,
+        beam_dir: newBeamDir,
+      }
+
+      const calculatedLength = calculateLengthFt(newBx1, newBy1, newBx2, newBy2)
+
+      await updateMember({
+        id,
+        data: {
+          geometry: updatedGeometry,
+          length_ft: calculatedLength !== null ? calculatedLength : existing.length_ft,
+        }
+      })
+      pushHistoryLog('resize', `Resize ${existing.piecemark || existing.section || existing.kind}`)
+      if (currentPageId) markPageDirty(currentPageId)
+      toast.success('Member endpoints updated')
+    } catch {
+      toast.error('Failed to update member endpoints')
     }
   }
 
@@ -544,9 +705,19 @@ export default function TakeoffWorkspacePage() {
     column: 'W10X49',
     beam: 'W12X26',
     brace: 'HSS5X5X5/16',
+    joist: 'K-SERIES',
+    hbrace: 'HSS5X5X5/16',
   }
 
-  const handleDrawMember = async (kind: 'column' | 'beam' | 'brace', geom: any) => {
+  const KIND_API_MAP: Record<string, string> = {
+    brace: 'vbrace',
+    hbrace: 'hbrace',
+    joist: 'joist',
+    column: 'column',
+    beam: 'beam',
+  }
+
+  const handleDrawMember = async (kind: 'column' | 'beam' | 'brace' | 'joist' | 'hbrace', geom: any) => {
     let lengthFt: number | null = null
     if (selectedRatio && imageNaturalWidth && kind !== 'column') {
       const wPx = imageNaturalWidth
@@ -558,7 +729,7 @@ export default function TakeoffWorkspacePage() {
     }
     try {
       const created = await createMember({
-        kind: kind === 'brace' ? 'vbrace' : kind,
+        kind: KIND_API_MAP[kind] || kind,
         section: KIND_DEFAULT_SECTION[kind],
         source: 'manual',
         status: 'need_review',
@@ -574,6 +745,8 @@ export default function TakeoffWorkspacePage() {
         length_ft: lengthFt,
       })
       if (created?.id) setSelection(new Set([created.id]))
+      pushHistoryLog('add', `Add ${kind[0].toUpperCase() + kind.slice(1)}`)
+      if (currentPageId) markPageDirty(currentPageId)
       toast.success(`${kind[0].toUpperCase() + kind.slice(1)} added — set its section in the panel`)
     } catch (err: any) {
       toast.error(err.message || 'Failed to add member')
@@ -582,7 +755,10 @@ export default function TakeoffWorkspacePage() {
 
   const handleMemberUpdate = async (id: string, data: any) => {
     try {
+      const existing = members.find((m: any) => m.id === id)
       await updateMember({ id, data })
+      pushHistoryLog('edit', `Edit ${existing?.piecemark || existing?.section || existing?.kind || 'member'}`)
+      if (currentPageId) markPageDirty(currentPageId)
       toast.success('Member properties saved')
     } catch {
       toast.error('Failed to update member properties')
@@ -591,7 +767,10 @@ export default function TakeoffWorkspacePage() {
 
   const handleMemberDelete = async (id: string) => {
     try {
+      const existing = members.find((m: any) => m.id === id)
       await deleteMember(id)
+      pushHistoryLog('delete', `Delete ${existing?.piecemark || existing?.section || existing?.kind || 'member'}`)
+      if (currentPageId) markPageDirty(currentPageId)
       toast.success('Member deleted')
     } catch {
       toast.error('Failed to delete member')
@@ -601,6 +780,8 @@ export default function TakeoffWorkspacePage() {
   const handleBulkUpdate = async (args: { ids: string[]; update: any }) => {
     try {
       await bulkUpdateMembers(args)
+      pushHistoryLog('edit', `Edit ${args.ids.length} member${args.ids.length === 1 ? '' : 's'}`)
+      if (currentPageId) markPageDirty(currentPageId)
       toast.success('Selected members updated successfully')
     } catch (err: any) {
       toast.error(err.message || 'Failed to update members in bulk')
@@ -610,6 +791,8 @@ export default function TakeoffWorkspacePage() {
   const handlePropertiesBulkUpdate = async (ids: string[], update: any) => {
     try {
       await bulkUpdateMembers({ ids, update })
+      pushHistoryLog('edit', `Edit ${ids.length} member${ids.length === 1 ? '' : 's'}`)
+      if (currentPageId) markPageDirty(currentPageId)
       toast.success('Selected members updated successfully')
     } catch (err: any) {
       toast.error(err.message || 'Failed to update members in bulk')
@@ -619,6 +802,8 @@ export default function TakeoffWorkspacePage() {
   const handleBulkDelete = async (ids: string[]) => {
     try {
       await bulkDeleteMembers(ids)
+      pushHistoryLog('delete', `Delete ${ids.length} member${ids.length === 1 ? '' : 's'}`)
+      if (currentPageId) markPageDirty(currentPageId)
       toast.success('Selected members deleted successfully')
       clearSelection()
     } catch (err: any) {
@@ -626,147 +811,124 @@ export default function TakeoffWorkspacePage() {
     }
   }
 
+  // Listen for 'R' key to rotate the selected column 90 degrees,
+  // and Backspace/Delete to delete the selected member(s)
+  useEffect(() => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      // Ignore if user is typing in an input or textarea
+      const tag = (e.target as HTMLElement).tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement).isContentEditable) {
+        return
+      }
+
+      if (e.key === 'r' || e.key === 'R') {
+        const selectedIds = Array.from(selection)
+        if (selectedIds.length === 1) {
+          const id = selectedIds[0]
+          const selectedMember = members.find((m: any) => m.id === id)
+          if (selectedMember && selectedMember.kind === 'column') {
+            e.preventDefault()
+            const currentRotation = selectedMember.rotation || 0
+            const nextRotation = (currentRotation + 90) % 180 // toggle between 0 and 90
+            try {
+              await updateMember({ 
+                id, 
+                data: { rotation: nextRotation } 
+              })
+              toast.success(`Rotated column to ${nextRotation}°`)
+            } catch {
+              toast.error('Failed to rotate column')
+            }
+          }
+        }
+      } else if (e.key === 'Backspace' || e.key === 'Delete') {
+        const selectedIds = Array.from(selection)
+        if (selectedIds.length > 0) {
+          e.preventDefault()
+          await handleBulkDelete(selectedIds)
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [selection, members, updateMember, handleBulkDelete])
+
+  // "Clean" (Members panel header) -- wipe every extracted member on the
+  // active page and reset its status so it can be re-extracted from
+  // scratch. Distinct from bulk-delete-selection: this always targets the
+  // whole current page regardless of what's selected.
+  const handleCleanPage = async () => {
+    if (!activePage || members.length === 0) return
+    if (!confirm(`Delete all ${members.length} extracted members on this page and reset it? This can't be undone.`)) return
+    try {
+      await bulkDeleteMembers(members.map((m: any) => m.id))
+      await updatePage({ pageId: activePage.id, data: { status: 'not_started' } })
+      clearSelection()
+      toast.success('Page cleaned — ready to re-extract')
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to clean page')
+    }
+  }
+
+  // Find other pages on the active floor
+  const floorPages = React.useMemo(() => {
+    const activeFloor = keyPlanFloors.find((f) => f.pages.some((p) => p.page_id === currentPageId))
+    if (!activeFloor) return []
+    return activeFloor.pages.map((fp: any) => {
+      const pageObj = pages.find((p: any) => p.id === fp.page_id)
+      return {
+        id: fp.page_id,
+        image_url: pageObj?.image_url || null,
+        sheet_no: fp.sheet_no,
+        title: fp.title,
+        registration: fp.registration || {
+          tx_ft: 0,
+          ty_ft: 0,
+          ft_per_pct_x: pageObj?.scale_num ? 100 / pageObj.scale_num : 1.0,
+          ft_per_pct_y: pageObj?.scale_num ? 100 / pageObj.scale_num : 1.0,
+          rotation_deg: 0,
+        },
+      }
+    })
+  }, [keyPlanFloors, currentPageId, pages])
+
   return (
     <div style={{ display: 'flex', height: '100%', width: '100%', overflow: 'hidden' }}>
       {/* Integrated Left Sidebar: Navigation (Pages / Members) */}
-      {sidebarOpen && (
-        <div
-          style={{
-            width: '270px',
-            backgroundColor: '#111827',
-            borderRight: '1px solid rgba(59, 130, 246, 0.1)',
-            display: 'flex',
-            flexDirection: 'column',
-            height: '100%',
-            flexShrink: 0,
-          }}
-        >
-          {/* Sidebar Header */}
-          <div
-            style={{
-              height: '48px',
-              borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              padding: '0 16px',
-              backgroundColor: '#0F172A',
+      <NavigationPanel
+        sidebarOpen={sidebarOpen}
+        setSidebarOpen={setSidebarOpen}
+        leftTab={leftTab}
+        setLeftTab={setLeftTab}
+        membersCount={members.length}
+        pagesTabContent={
+          <PageRail
+            projectId={projectId}
+            pages={pages}
+            isLoading={workspaceLoading}
+            refetchWorkspace={() => {
+              queryClient.invalidateQueries({ queryKey: ['drawings', projectId] })
+              queryClient.invalidateQueries({ queryKey: ['pages'] })
             }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#F1F5F9' }}>
-              <Columns size={16} style={{ color: '#3B82F6' }} />
-              <span style={{ fontSize: '13px', fontWeight: 700 }}>Navigation</span>
-            </div>
-            <button
-              onClick={() => setSidebarOpen(false)}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: '#64748B',
-                cursor: 'pointer',
-                fontSize: '18px',
-                lineHeight: 1,
-                padding: '2px',
-              }}
-              title="Close Navigation"
-            >
-              &times;
-            </button>
-          </div>
-
-          {/* Capsule Segmented Tabs Control */}
-          <div style={{ padding: '12px 16px', backgroundColor: '#111827' }}>
-            <div
-              style={{
-                display: 'flex',
-                backgroundColor: '#0F172A',
-                padding: '4px',
-                borderRadius: '24px',
-                border: '1px solid rgba(59, 130, 246, 0.15)',
-              }}
-            >
-              <button
-                onClick={() => setLeftTab('pages')}
-                style={{
-                  flex: 1,
-                  backgroundColor: leftTab === 'pages' ? '#1B3A60' : 'transparent',
-                  color: leftTab === 'pages' ? '#FFFFFF' : '#94A3B8',
-                  border: leftTab === 'pages' ? '1px solid rgba(59, 130, 246, 0.3)' : 'none',
-                  borderRadius: '20px',
-                  padding: '6px 12px',
-                  fontSize: '11px',
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                  outline: 'none',
-                  transition: 'all 0.2s ease',
-                }}
-              >
-                Pages
-              </button>
-              <button
-                onClick={() => setLeftTab('members')}
-                style={{
-                  flex: 1,
-                  backgroundColor: leftTab === 'members' ? '#1B3A60' : 'transparent',
-                  color: leftTab === 'members' ? '#FFFFFF' : '#94A3B8',
-                  border: leftTab === 'members' ? '1px solid rgba(59, 130, 246, 0.3)' : 'none',
-                  borderRadius: '20px',
-                  padding: '6px 12px',
-                  fontSize: '11px',
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                  outline: 'none',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  transition: 'all 0.2s ease',
-                }}
-              >
-                <span>Members</span>
-                <span
-                  style={{
-                    backgroundColor: '#F59E0B',
-                    color: '#0F172A',
-                    padding: '2px 6px',
-                    borderRadius: '10px',
-                    fontSize: '10px',
-                    fontWeight: 800,
-                    marginLeft: '6px',
-                    lineHeight: 1,
-                  }}
-                >
-                  {members.length}
-                </span>
-              </button>
-            </div>
-          </div>
-
-          {/* Sidebar Content */}
-          <div style={{ flex: 1, overflow: 'hidden' }}>
-            {leftTab === 'pages' ? (
-              <PageRail
-                projectId={projectId}
-                pages={pages}
-                isLoading={workspaceLoading}
-                refetchWorkspace={() => {
-                  queryClient.invalidateQueries({ queryKey: ['drawings', projectId] })
-                  queryClient.invalidateQueries({ queryKey: ['pages'] })
-                }}
-                onUpdatePage={handleCardUpdatePage}
-                onExtract={handleCardExtract}
-                extractingPageId={extractingPageId}
-                extractProgress={extractProgress}
-              />
-            ) : (
-              <MemberExplorer
-                members={members}
-                bulkUpdateMembers={handleBulkUpdate}
-                bulkDeleteMembers={handleBulkDelete}
-              />
-            )}
-          </div>
-        </div>
-      )}
+            onUpdatePage={handleCardUpdatePage}
+            onExtract={handleCardExtract}
+            extractingPageId={extractingPageId}
+            extractProgress={extractProgress}
+          />
+        }
+        membersTabContent={
+          <MembersTab
+            members={members}
+            activePage={activePage}
+            onClean={handleCleanPage}
+            onBuild={() => activePage && handleCardExtract(activePage)}
+            isBuilding={!!activePage && extractingPageId === activePage.id}
+          />
+        }
+      />
 
       {/* Center workspace canvas */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -786,21 +948,35 @@ export default function TakeoffWorkspacePage() {
             }}
           >
             <VerticalToolStrip
-              members={members}
+              members={membersForToolStrip}
               projectId={projectId}
               sidebarOpen={sidebarOpen}
               onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+              showKeyPlan={showKeyPlan}
+              onToggleKeyPlan={handleToggleKeyPlan}
             />
           </div>
-          <PlanCanvas
-            imageUrl={activePage?.image_url || null}
-            members={members}
-            onMemberSelect={handleMemberSelect}
-            onAddAnnotationMarker={handleAddAnnotationMarker}
-            onRulerCalibrate={handleRulerCalibrate}
-            onDrawMember={handleDrawMember}
-            onMemberDragEnd={handleMemberDragEnd}
-          />
+          {showKeyPlan ? (
+            <KeyPlanView
+              floor={keyPlanFloors.find((f) => f.id === activeFloorId) || null}
+              manualPageIds={manualPageIds}
+              hiddenPageIds={hiddenPageIds}
+              onDragCommit={handleKeyPlanDragCommit}
+            />
+          ) : (
+            <PlanCanvas
+              imageUrl={activePage?.image_url || null}
+              members={membersForToolStrip}
+              onMemberSelect={handleMemberSelect}
+              onAddAnnotationMarker={handleAddAnnotationMarker}
+              onRulerCalibrate={handleRulerCalibrate}
+              onDrawMember={handleDrawMember}
+              onMemberDragEnd={handleMemberDragEnd}
+              onEndpointDragEnd={handleEndpointDragEnd}
+              floorPages={floorPages}
+              currentPageId={currentPageId}
+            />
+          )}
 
           {calibLine && imageNaturalWidth && (
             <ScaleCalibrationModal
@@ -812,24 +988,42 @@ export default function TakeoffWorkspacePage() {
             />
           )}
         </div>
-
-        <SummaryBar members={members} />
       </div>
 
-      {/* Right dock: Sheet Summary when nothing selected, Properties when editing */}
-      {selection.size > 0 ? (
-        <PropertiesPanel
-          selection={selection}
-          members={members}
-          onUpdate={handleMemberUpdate}
-          onDelete={handleMemberDelete}
-          onBulkUpdate={handlePropertiesBulkUpdate}
-          onBulkDelete={handleBulkDelete}
-          onClose={clearSelection}
-          pageTos={activePage?.tos_ft || 12.0}
+      {/* Right dock: Sheet Summary when nothing selected, Properties when
+          editing, Key Plan panel when the Key Plan tool is active. Hidden
+          entirely while the 3D pane is open — with 3D on, the screen is
+          just [2D drawing | 3D view], and the 3D pane has its own
+          Properties dock (opened via its own corner toggle) instead. */}
+      {!show3d && showKeyPlan && (
+        <KeyPlanPropertiesPanel
+          projectId={projectId}
+          floors={keyPlanFloors}
+          activeFloorId={activeFloorId}
+          onSelectFloor={setActiveFloorId}
+          manualPageIds={manualPageIds}
+          onToggleManual={toggleManualPage}
+          hiddenPageIds={hiddenPageIds}
+          onToggleHidden={toggleHiddenPage}
+          onApplied={() => refetchKeyPlanFloors()}
+          onClose={() => setShowKeyPlan(false)}
         />
-      ) : (
-        <SheetSummary members={members} />
+      )}
+      {!show3d && !showKeyPlan && (
+        selection.size > 0 ? (
+          <PropertiesPanel
+            selection={selection}
+            members={members}
+            onUpdate={handleMemberUpdate}
+            onDelete={handleMemberDelete}
+            onBulkUpdate={handlePropertiesBulkUpdate}
+            onBulkDelete={handleBulkDelete}
+            onClose={clearSelection}
+            pageTos={activePage?.tos_ft || 12.0}
+          />
+        ) : (
+          <SheetSummary members={members} />
+        )
       )}
     </div>
   )

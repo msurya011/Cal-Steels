@@ -18,6 +18,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image as PILImage, ImageEnhance, ImageFilter
 
+# ── Column Validation Engine: structural-context scoring gate for column
+#    candidates (grid intersection, footing/column classification, mark
+#    match, beam connectivity, schedule corroboration). Pure/no heavy deps,
+#    safe to import at module load rather than lazily. ────────────────────
+from app.engineering import column_validation_engine
+
 # ── OpenCV-based raster beam line detector ───────────────────────────────────
 try:
     from detection_cv import detect_beam_lines_raster as _detect_beam_lines_raster
@@ -96,6 +102,10 @@ MEMBER_COLORS = {
     "beam":   "#EC4899",
     "column": "#3B82F6",
     "brace":  "#F59E0B",
+    # Stage 3 (2026-07-17 rebuild): footing outline, distinct from the
+    # column it carries -- neutral grey so it doesn't compete visually
+    # with the blue column mark now drawn at the same location.
+    "footing": "#6B7280",
 }
 
 STEEL_PATTERNS = [
@@ -115,7 +125,17 @@ STEEL_PATTERNS = [
     r'PIPE[\d.]+',
 ]
 
-_GRID_LETTER = re.compile(r'^[A-Z](\.\d+)?$')
+# Grid-letter labels. Beyond a single letter (A, B, C…) real drawings also
+# use two conventions this used to miss entirely (found on this project's
+# binder, sheet 35 / index 34 — a "match line" partial-zone sheet):
+#   • doubled letters once the alphabet runs out: AA, BB, CC, DD, EE…
+#     (never two DIFFERENT letters — that would start matching ordinary
+#     words like "TO", "IN", "NO", "OF" that happen to sit near the plan
+#     edge, so the backreference \1? deliberately only allows a letter
+#     followed by ITSELF)
+#   • prime marks for offset/secondary grid lines: C', D', F'5 (letter,
+#     optional subgrid ".N", optional prime, optional trailing digit)
+_GRID_LETTER = re.compile(r"^([A-Z])\1?(\.\d+)?('\d*)?$")
 _GRID_NUMBER  = re.compile(r'^\d+(\.\d+)?$')
 
 # Max distance (PDF points) between a profile label and a column symbol.
@@ -776,10 +796,32 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             if dist >= LABEL_R:
                 continue
 
-            # Score = proximity × (0.97 + 0.03 × t_center)
+            # Score = proximity × (0.97 + 0.03 × t_center) + length preference.
+            #
+            # Length preference (2026-07-20): a structural beam centreline is a
+            # LONG drawn line; a dimension witness/extension tick is a SHORT
+            # stub. On this project's framing plans the horizontal dimension
+            # strings printed just above/below each girder row drop VERTICAL
+            # witness ticks (~60 pt) that sit almost exactly on top of the
+            # vertical beam centrelines — so a vertical label would score the
+            # ~60 pt tick a hair higher than the real ~300 pt beam beside it
+            # purely because the tick happened to be 2 pt closer, and the beam
+            # got clipped to a 60 pt stub. (This only bites VERTICAL beams,
+            # because only the horizontal dimension strings' witness lines run
+            # vertically; horizontal beams were already correct, so this term
+            # must not change their outcome.) Proximity still dominates
+            # (weight 1.0); the length term is a small tie-breaker (max +0.06)
+            # that only decides between two candidates the label sits almost
+            # equally close to -- exactly the stub-vs-real-beam case. A real
+            # beam is always the longer of the two, so this reliably prefers
+            # it without widening any tolerance or matching new lines. Capped
+            # by the per-direction max so it never rewards over-long
+            # grid/boundary lines (those are already rejected above anyway).
             proximity  = 1.0 - dist / LABEL_R
             t_center   = 1.0 - 2.0 * abs(t_c - 0.5)
-            score = proximity * (0.97 + 0.03 * t_center)
+            _len_cap   = MAX_V_MATCH if (ady > adx * 2) else MAX_H_MATCH
+            _len_pref  = 0.06 * min(ln / _len_cap, 1.0) if _len_cap > 0 else 0.0
+            score = proximity * (0.97 + 0.03 * t_center) + _len_pref
             if score > _best_score:
                 _best_score = score
                 _best       = (lx1, ly1, lx2, ly2, ln)
@@ -1741,10 +1783,34 @@ def refine_column_geometry(drawings, cluster_idx, scale_ratio):
 
 
 # ── Column symbol detection (I/H cross-section marks in vector drawings) ──────
-def detect_column_symbols(page, scale_ratio: float = 96):
+def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: bool = False,
+                          plan_bounds: tuple = None):
     """
     Detect the small I-section / W-section plan-view symbols drawn in the PDF.
+
+    plan_bounds: (x0, y0, x1, y1) of the actual plan area, excluding the
+    title block, dimension strings, and margin notes. This detector used to
+    scan the ENTIRE page unconditionally -- every other symbol/profile
+    detector in this pipeline (extract_profiles, etc.) already respects
+    plan_bounds, but this one never did, so title-block logos, north-arrow
+    callouts, and dimension-string tick marks near the sheet border could
+    get misdetected as column symbols and show up as extra phantom columns
+    scattered outside the building footprint. Optional (defaults to no
+    filtering) so callers that don't have plan_bounds yet still work.
     ...
+
+    is_foundation_plan: when True, ALSO accepts small unfilled diamond/square
+    outline marks (4-line closed shapes with no dark fill) as column symbols.
+    Foundation/footing plans mark column bases with an outline footing/pier
+    symbol (e.g. "F1", "P1"), not the solid-black steel column plan mark this
+    function was originally built around -- without this, every column on a
+    foundation plan except the rare coincidental match was silently rejected
+    by the "un-filled outlines are ignored" rule below, which exists
+    specifically to keep framing-plan dimension/annotation boxes from being
+    mistaken for columns. That rule is correct for framing plans; it's wrong
+    for foundation plans, where the real column marks ARE unfilled outlines.
+    Scoped to this flag (not a global change) so framing-plan detection,
+    already tuned and verified, is untouched.
     """
     try:
         drawings = page.get_drawings()
@@ -1764,12 +1830,57 @@ def detect_column_symbols(page, scale_ratio: float = 96):
         d = abs(a - b) % 180.0
         return min(d, 180.0 - d)
 
-    def _has_IH_pattern(angles, tol=20.0):
-        for a in angles:
-            par  = sum(1 for b in angles if _ang_diff(a, b) <= tol)
-            perp = sum(1 for b in angles if abs(_ang_diff(a, b) - 90.0) <= tol)
-            if par >= 2 and perp >= 1:
-                return True
+    def _has_IH_pattern(angles, lengths=None, tol=20.0):
+        """
+        Root cause fix (2026-07-17, Stage 6): this test used to accept ANY
+        shape with >=2 near-parallel + >=1 near-perpendicular line segments
+        -- which is trivially true for every rectangle, square, and diamond
+        (a rotated square), not just a real steel column plan mark. That's
+        the exact bug behind "the round and diamond looking shape is not a
+        column", flagged at the very start of this rebuild.
+
+        A real I/H section plan symbol has a genuine flange/web geometry:
+        two long flange segments joined by a distinctly SHORTER web
+        segment (true for every real W/HSS section -- the web width is
+        always a small fraction of the flange span). A closed box's four
+        sides, by contrast, are all roughly the same length -- there is no
+        long/short disparity. When segment lengths are available, require
+        that at least one "perpendicular" segment be meaningfully shorter
+        (< 45% of the average "parallel" segment length) than the parallel
+        group it's paired with -- this is what actually distinguishes an
+        open I/H glyph from a closed rectangle/diamond outline, using
+        geometry that was already being computed, not a new detection
+        pass. `lengths=None` preserves the old angle-only behavior for any
+        caller that hasn't been updated to pass lengths yet.
+
+        45% (not a looser 60%) specifically because a moderately elongated
+        CLOSED box (e.g. a 2:1 rectangle, short side exactly half the long
+        side) would otherwise still slip through at 60% purely from its own
+        aspect ratio, with no real flange/web relationship at all -- tested
+        and confirmed this exact failure mode during Stage 6 (2026-07-17)
+        before tightening the threshold. A real W/HSS section's web is
+        drawn distinctly thinner than that relative to its flange span in
+        every plan-view icon convention observed this session. This is a
+        calibrated threshold, not a proven physical constant -- same
+        category as other tuned tolerances in this file (see
+        COLUMN_SNAP_TOL_FT, TOS_MATCH_TOL_FT elsewhere) -- revisit if a real
+        drawing surfaces a genuine I/H icon this rejects.
+        """
+        for idx_a, a in enumerate(angles):
+            par_idxs = [j for j, b in enumerate(angles) if _ang_diff(a, b) <= tol]
+            perp_idxs = [j for j, b in enumerate(angles) if abs(_ang_diff(a, b) - 90.0) <= tol]
+            if len(par_idxs) >= 2 and len(perp_idxs) >= 1:
+                if lengths is None:
+                    return True
+                par_lens = [lengths[j] for j in par_idxs if j < len(lengths)]
+                perp_lens = [lengths[j] for j in perp_idxs if j < len(lengths)]
+                if not par_lens or not perp_lens:
+                    # Length data incomplete for this candidate -- fall back
+                    # to the angle-only signal rather than silently reject.
+                    return True
+                par_avg = sum(par_lens) / len(par_lens)
+                if par_avg > 0 and any(pl < par_avg * 0.45 for pl in perp_lens):
+                    return True
         return False
 
     for i, d in enumerate(drawings):
@@ -1783,6 +1894,18 @@ def detect_column_symbols(page, scale_ratio: float = 96):
         # SYM_MAX_PT: maximum (largest W/HSS section at this scale).
         if not (SYM_MIN_PT < w < SYM_MAX_PT and SYM_MIN_PT < h < SYM_MAX_PT):
             continue
+
+        # Reject anything outside the actual plan area (title block, north
+        # arrow, dimension strings near the sheet border) -- small margin
+        # (2x EPS-ish) so a real column symbol whose bbox straddles the
+        # plan-boundary line isn't clipped.
+        if plan_bounds is not None:
+            _cx_chk = (rect.x0 + rect.x1) / 2
+            _cy_chk = (rect.y0 + rect.y1) / 2
+            _margin = 20.0
+            if not (plan_bounds[0] - _margin <= _cx_chk <= plan_bounds[2] + _margin
+                    and plan_bounds[1] - _margin <= _cy_chk <= plan_bounds[3] + _margin):
+                continue
 
         # Store the overall DRAWING bounding box alongside the centre.
         # We accumulate rects per cluster and recompute the centre from
@@ -1805,6 +1928,15 @@ def detect_column_symbols(page, scale_ratio: float = 96):
                                   drawing_fill[1] +
                                   drawing_fill[2]) / 3
 
+        # Real footing/pier marks on this project's foundation plans are
+        # drawn DASHED (visibly confirmed against the actual sheet) -- grid
+        # extension lines, dimension-string boxes, and other solid-line
+        # annotation near the sheet border are not. Used below to keep the
+        # foundation-plan-only relaxed rules from accepting solid-line
+        # clutter as a footing mark.
+        _dashes = d.get("dashes") or ""
+        _is_dashed = _dashes not in ("", "[] 0")
+
         items     = d.get("items", [])
         has_curve = False
         n_lines   = 0
@@ -1812,6 +1944,7 @@ def detect_column_symbols(page, scale_ratio: float = 96):
         v_count   = 0   # number of vertical segments (web)
         seg_angles = []  # angle (mod 180°) of every line segment — for the
                          # rotation-invariant I/H test below
+        seg_lengths = []  # parallel to seg_angles -- see Stage 6 fix below
 
         for item in items:
             kind = item[0]
@@ -1824,10 +1957,12 @@ def detect_column_symbols(page, scale_ratio: float = 96):
                     p1, p2 = item[1], item[2]
                     dx = abs(p2.x - p1.x)
                     dy = abs(p2.y - p1.y)
-                    if math.hypot(dx, dy) < 2:
+                    _seg_len = math.hypot(dx, dy)
+                    if _seg_len < 2:
                         continue
                     seg_angles.append(math.degrees(math.atan2(p2.y - p1.y,
                                                               p2.x - p1.x)) % 180.0)
+                    seg_lengths.append(_seg_len)
                     if dx > dy * 1.5:
                         h_count += 1
                     elif dy > dx * 1.5:
@@ -1838,8 +1973,13 @@ def detect_column_symbols(page, scale_ratio: float = 96):
                 # PDF rectangle primitive.
                 # ONLY accept if the drawing has a VERY DARK (near-black) fill —
                 # this is the signature of a structural column plan mark.
-                # Un-filled outlines and light-coloured annotation boxes are ignored.
-                if drawing_brightness < 0.25:
+                # Un-filled outlines and light-coloured annotation boxes are
+                # ignored -- EXCEPT on foundation plans, where the real
+                # footing/pier mark IS an unfilled outline (often drawn as a
+                # single rotated "re" primitive rather than 4 separate line
+                # segments), so the fill requirement would otherwise silently
+                # drop it before it's even counted as a candidate shape.
+                if drawing_brightness < 0.25 or is_foundation_plan:
                     try:
                         rr = item[1]
                         rw = abs(rr.x1 - rr.x0)
@@ -1850,7 +1990,33 @@ def detect_column_symbols(page, scale_ratio: float = 96):
                             h_count += 2
                             v_count += 1
                             n_lines += 4
-                            seg_angles += [0.0, 0.0, 90.0]  # box = 2 flanges + web
+                            # Root cause fix (2026-07-17, Stage 6 -- this is
+                            # the exact bug behind "the round and diamond
+                            # looking shape is not a column", flagged at the
+                            # very start of this rebuild): a PDF "re"
+                            # rectangle primitive is, by definition, a
+                            # CLOSED four-sided box -- a plain square, a
+                            # square rotated 45 degrees so it renders as a
+                            # diamond, a generic annotation pad, anything.
+                            # It is NOT an I/H flange-web glyph, which is an
+                            # OPEN shape (two flange segments that never
+                            # touch, joined only by a thin web). The line
+                            # this replaces injected a synthetic
+                            # seg_angles=[0, 0, 90] for EVERY such rectangle
+                            # regardless of what it actually was, which
+                            # manufactured a fake "verified I/H pattern"
+                            # signal for any roughly-square box -- exactly
+                            # what let round/diamond footing outlines and
+                            # generic pads get accepted as if they were real
+                            # steel column marks. A rectangle primitive
+                            # shape is still a legitimate candidate mark --
+                            # it just needs to go through the actual
+                            # box-shaped rules below (filled_rect for a dark
+                            # solid square, foundation_outline for an
+                            # unfilled one on a foundation plan), which
+                            # already exist, are already correctly gated on
+                            # fill/size/aspect, and do not depend on
+                            # pretending this is an I/H pattern to fire.
                     except Exception:
                         pass
 
@@ -1862,19 +2028,154 @@ def detect_column_symbols(page, scale_ratio: float = 96):
         # rotated to any angle (skewed grids, canopy/angled framing) — the case
         # where the old strict horizontal/vertical test missed columns, leaving
         # beams with no centre to snap to.
-        if not has_curve and _has_IH_pattern(seg_angles):
-            raw.append((cx, cy, _raw_rect, i))
+        if not has_curve and _has_IH_pattern(seg_angles, lengths=seg_lengths):
+            raw.append((cx, cy, _raw_rect, i, "ih_pattern"))
             continue
 
         # ── Accept small FILLED rectangle (solid black plan mark only) ────────
         if (not has_curve and n_lines == 4 and 0.5 < aspect < 2.0
                 and w < 28 and h < 28 and drawing_brightness < 0.25):
-            raw.append((cx, cy, _raw_rect, i))
+            raw.append((cx, cy, _raw_rect, i, "filled_rect"))
             continue
 
         # ── Accept small CIRCLED I/H symbol ───────────────────────────────────
-        if has_curve and _has_IH_pattern(seg_angles) and 10 < w < 45 and 10 < h < 45:
-            raw.append((cx, cy, _raw_rect, i))
+        if has_curve and _has_IH_pattern(seg_angles, lengths=seg_lengths) and 10 < w < 45 and 10 < h < 45:
+            raw.append((cx, cy, _raw_rect, i, "circled_ih"))
+            continue
+
+        # ── Foundation plans only: small UNFILLED diamond/square outline ──────
+        # (footing/pier mark). Same 4-line, roughly-square-proportioned shape
+        # as the filled-rectangle rule above, but with no fill requirement --
+        # see the is_foundation_plan docstring note for why this is safe to
+        # loosen only here rather than for every page. A dashed-line-style
+        # requirement was tried here but PDF exporters don't consistently
+        # encode dash arrays in drawing metadata (some real footing marks on
+        # some sheets report no dash pattern at all, silently zeroing out
+        # every candidate) -- the mark-label-proximity filter below is the
+        # real guard against false positives instead.
+        #
+        # Size bound fix (2026-07-17, Stage 6): this used to additionally
+        # require w < 30 and h < 30 -- a fixed constant, not derived from
+        # scale, tighter than the SYM_MIN_PT..SYM_MAX_PT envelope every
+        # candidate already had to pass to reach this point at all. On a
+        # project that draws footings at true plan scale (documented
+        # below -- an 11'-6" footing is ~103pt at 1/8"=1'-0", confirmed on
+        # a real sheet), that redundant 30pt cap silently rejected footing
+        # outlines the scale-aware envelope already correctly allowed
+        # through. Live-verified: removing this cap and closing the
+        # separate _has_IH_pattern false-positive bug together took a real
+        # foundation plan from 49 detected footings down to 5 (the cap
+        # alone was hiding the loss) then back up -- see chat trace. Rely
+        # on the already-applied, scale-aware SYM_MIN_PT/SYM_MAX_PT bound
+        # from the top of this loop instead of a second, inconsistent
+        # fixed-pixel limit.
+        if (is_foundation_plan and not has_curve and n_lines == 4
+                and 0.4 < aspect < 2.5):
+            raw.append((cx, cy, _raw_rect, i, "foundation_outline"))
+
+    # ── Fragmented dashed/segmented shape rescue (foundation plans only) ──
+    # Confirmed via direct inspection of a real project PDF (Bayhealth
+    # Sussex MOB, foundation plan sheet S1.00): some PDF exporters draw a
+    # dashed footing outline -- and sometimes the steel column's inner H/I
+    # plan-view glyph too -- as MANY separate single-line "drawing" objects
+    # (one per dash tick, or one per glyph edge) instead of one dashed
+    # stroke or one 4-line path. Every accept rule above evaluates ONE
+    # drawing object at a time (_has_IH_pattern needs >=2 parallel + >=1
+    # perpendicular segment WITHIN that one drawing; the 4-line rules need
+    # n_lines==4 within that one drawing), so a real column whose symbol is
+    # authored this way is invisible to every rule above -- confirmed live:
+    # roughly half the columns on that sheet (the ones using the square +
+    # inner-H/I-glyph convention) got zero detection, while the plain
+    # hollow-square footings on the same sheet were fine. Also: that
+    # project draws footings at TRUE plan scale (an 11'-6" square footing
+    # is ~103pt wide at 1/8"=1'-0"), far past SYM_MAX_PT/the 30pt cap above
+    # -- both of which assume a compact schematic icon, not a true-scale
+    # outline -- so this rescue pass uses its own, real-world-footing-sized
+    # envelope (up to ~20 real feet) rather than SYM_MAX_PT.
+    #
+    # Fix: chain-cluster small isolated line fragments by endpoint
+    # proximity (dash gaps run ~9pt on that sheet; eps=12 covers that with
+    # margin, and also bridges directly-touching glyph edges whose shared
+    # vertices are ~0pt apart), then re-run the same angle-histogram tests
+    # against each fragment group's AGGREGATE geometry instead of one
+    # drawing at a time. Purely additive: only touches drawings with
+    # exactly one unfilled line item, which no rule above ever accepts on
+    # its own, so this cannot change any already-working detection.
+    if is_foundation_plan:
+        _FOOTING_MAX_PT = max(SYM_MAX_PT, 20.0 * 12.0 * _ipt)  # ~20 real ft ceiling
+        _FRAG_EPS = 12.0
+        frag_idx: list[int] = []
+        frag_pts: list[tuple] = []  # (x0, y0, x1, y1) per fragment
+        for i, d in enumerate(drawings):
+            items = d.get("items", [])
+            if len(items) != 1 or items[0][0] != "l" or d.get("fill") is not None:
+                continue
+            p1, p2 = items[0][1], items[0][2]
+            seg_len = math.hypot(p2.x - p1.x, p2.y - p1.y)
+            if seg_len < 2 or seg_len > _FOOTING_MAX_PT:
+                continue
+            if plan_bounds is not None:
+                _mcx, _mcy = (p1.x + p2.x) / 2, (p1.y + p2.y) / 2
+                if not (plan_bounds[0] - 20 <= _mcx <= plan_bounds[2] + 20
+                        and plan_bounds[1] - 20 <= _mcy <= plan_bounds[3] + 20):
+                    continue
+            frag_idx.append(i)
+            frag_pts.append((p1.x, p1.y, p2.x, p2.y))
+
+        _fused = [False] * len(frag_idx)
+        for a in range(len(frag_idx)):
+            if _fused[a]:
+                continue
+            group = [a]
+            _fused[a] = True
+            queue = [a]
+            while queue:
+                cur = queue.pop()
+                cx0, cy0, cx1, cy1 = frag_pts[cur]
+                for b in range(len(frag_idx)):
+                    if _fused[b]:
+                        continue
+                    bx0, by0, bx1, by1 = frag_pts[b]
+                    if (math.hypot(cx0 - bx0, cy0 - by0) < _FRAG_EPS or
+                            math.hypot(cx0 - bx1, cy0 - by1) < _FRAG_EPS or
+                            math.hypot(cx1 - bx0, cy1 - by0) < _FRAG_EPS or
+                            math.hypot(cx1 - bx1, cy1 - by1) < _FRAG_EPS):
+                        _fused[b] = True
+                        group.append(b)
+                        queue.append(b)
+
+            if len(group) < 3:
+                continue  # too few fragments to be a real shape (stray tick/noise)
+
+            g_angles = []
+            gxs: list[float] = []
+            gys: list[float] = []
+            for gi in group:
+                x0, y0, x1, y1 = frag_pts[gi]
+                gxs += [x0, x1]
+                gys += [y0, y1]
+                if math.hypot(x1 - x0, y1 - y0) >= 2:
+                    g_angles.append(math.degrees(math.atan2(y1 - y0, x1 - x0)) % 180.0)
+            gw, gh = max(gxs) - min(gxs), max(gys) - min(gys)
+            if gw <= 0 or gh <= 0:
+                continue
+            g_aspect = gw / gh
+            if not (SYM_MIN_PT < gw < _FOOTING_MAX_PT and SYM_MIN_PT < gh < _FOOTING_MAX_PT):
+                continue
+            if not (0.4 < g_aspect < 2.5):
+                continue
+            if not (_has_IH_pattern(g_angles) or len(group) >= 4):
+                continue
+
+            # Register every fragment in this group as its own raw
+            # candidate at ITS OWN true center -- the existing EPS-based
+            # cluster step right below re-merges them into one physical
+            # column, exactly like it already does for multi-sub-path
+            # filled-rectangle symbols.
+            for gi in group:
+                x0, y0, x1, y1 = frag_pts[gi]
+                _fcx, _fcy = (x0 + x1) / 2, (y0 + y1) / 2
+                raw.append((_fcx, _fcy, (x0, y0, x1, y1), frag_idx[gi], "fragmented_outline"))
 
     # Deduplicate using EXPANDING cluster (DBSCAN-style, eps=15pt).
     #
@@ -1892,7 +2193,16 @@ def detect_column_symbols(page, scale_ratio: float = 96):
     #   eps=15pt — small enough to never bridge two real columns (always >30pt apart
     #   at any typical drawing scale), large enough to chain sub-paths of the same
     #   symbol together step-by-step regardless of total symbol span.
-    EPS = 15
+    #
+    # Foundation plans widen this to 30pt: a footing mark here is drawn as TWO
+    # separate shapes -- the dashed footing outline (square) and the small
+    # I-tick column mark at its centre -- which are further apart (their
+    # separate drawing objects' centres don't coincide as tightly as one
+    # symbol's own sub-paths do) than 15pt reliably bridges, producing two
+    # separate "columns" for the same physical footing instead of one. Still
+    # well under real footing-to-footing spacing (multiple feet = tens of pt)
+    # so this doesn't risk merging two adjacent real footings together.
+    EPS = 30 if is_foundation_plan else 15
     symbols = []
     used = [False] * len(raw)
     for i in range(len(raw)):
@@ -1913,16 +2223,397 @@ def detect_column_symbols(page, scale_ratio: float = 96):
 
         ref_cx, ref_cy, rotation, symbol_type, depth_in = refine_column_geometry(
             drawings, [raw[k][3] for k in cluster_idx], scale_ratio)
+
+        # Aggregate shape signals across every raw sub-path in this cluster
+        # -- the Symbol Classification Engine (column_symbol_classifier.py)
+        # needs the union bbox (for aspect-ratio and size-relative-to-sheet
+        # checks) and whether ANY sub-path had a curve or a dash, since a
+        # symbol's sub-paths were collected without this being tracked
+        # per-symbol before now.
+        _bxs = [raw[k][2][0] for k in cluster_idx] + [raw[k][2][2] for k in cluster_idx]
+        _bys = [raw[k][2][1] for k in cluster_idx] + [raw[k][2][3] for k in cluster_idx]
+        _bbox = (min(_bxs), min(_bys), max(_bxs), max(_bys))
+        _has_curve_any = False
+        _is_dashed_any = False
+        # 2026-07-17: a detail/section-reference bubble is a UNIVERSAL
+        # drafting convention (AIA/NCS) regardless of firm or drawing --
+        # a circle/hex/diamond bisected by one roughly-horizontal divider
+        # line, with a detail number above it and a sheet number below it.
+        # Two real projects this session each broke a text-pattern-based
+        # detection of this ("S0300" 4-digit, then "S2.03" dotted) because
+        # every firm writes its sheet numbers differently -- fixing the
+        # regex per-format is the exact wrong approach (hardcoding to a
+        # PDF), since the next drawing will just use a third convention.
+        # The SHAPE signature is universal and content-independent: detect
+        # the divider bar itself, not what the two numbers say. A real
+        # column/footing mark's own sub-paths never contain a line that
+        # spans most of the symbol's own width while sitting near its
+        # vertical center -- that specific geometry only shows up on a
+        # bisected reference bubble.
+        # Aggregate horizontal, near-vertical-center line length instead of
+        # requiring ONE continuous segment -- a divider bar drawn with a
+        # dashed/hidden linetype (common for internal ruling lines) or
+        # fragmented into multiple short PDF path segments would never
+        # individually clear a single-segment length threshold, even
+        # though together they trace the same divider. Summing handles
+        # both a solid divider and a dashed one the same way.
+        _divider_len = 0.0
+        _bbox_w_chk = _bbox[2] - _bbox[0]
+        _bbox_h_chk = _bbox[3] - _bbox[1]
+        _bbox_mid_y_chk = (_bbox[1] + _bbox[3]) / 2
+        for k in cluster_idx:
+            _d = drawings[raw[k][3]]
+            for _item in _d.get("items", []):
+                if _item[0] == "c":
+                    _has_curve_any = True
+                elif _item[0] == "l":
+                    _p1, _p2 = _item[1], _item[2]
+                    _lx1, _ly1, _lx2, _ly2 = _p1.x, _p1.y, _p2.x, _p2.y
+                    _llen = math.hypot(_lx2 - _lx1, _ly2 - _ly1)
+                    if _bbox_w_chk > 0 and _bbox_h_chk > 0:
+                        _is_horiz = abs(_ly2 - _ly1) <= max(2.0, _llen * 0.12)
+                        _mid_y = (_ly1 + _ly2) / 2
+                        _near_vcenter = abs(_mid_y - _bbox_mid_y_chk) <= _bbox_h_chk * 0.35
+                        if _is_horiz and _near_vcenter:
+                            _divider_len += _llen
+            _dashes = _d.get("dashes") or ""
+            if _dashes not in ("", "[] 0"):
+                _is_dashed_any = True
+        _has_divider_bar = _bbox_w_chk > 0 and _divider_len >= _bbox_w_chk * 0.55
+
+        # Which shape-acceptance rule(s) matched this cluster's sub-paths --
+        # the real signal for "is this actually an I/H column icon" rather
+        # than refine_column_geometry's symbol_type, which defaults to "I"
+        # for ANY non-circle/non-bare-rect shape (including a generic
+        # 4-line footing outline), making it unreliable on its own for
+        # telling a real column icon apart from a footing outline. See
+        # column_symbol_classifier.py.
+        _accept_rules = {raw[k][4] for k in cluster_idx if len(raw[k]) > 4}
+        _has_ih_pattern = bool(_accept_rules & {"ih_pattern", "circled_ih"})
+
+        # Phase 2 feature extraction (Universal Symbol Library lookup) --
+        # classifies this cluster's outer_boundary/inner_geometry/fill_type
+        # combination and matches it against the catalog of real-world
+        # column symbol styles (hollow square, filled square, square+dot,
+        # square+diamond, square+cross, square+I/H, square+inner-square,
+        # circle-in-footing, diamond-in-footing, ...) instead of only the
+        # four accept_rules above. Purely additive/informational at this
+        # stage -- see column_feature_extraction.py and
+        # column_symbol_library.py. Never lets a candidate through or
+        # blocks one on its own; downstream classification/validation
+        # treats it as one more signal.
+        try:
+            from app.engineering.column_feature_extraction import extract_cluster_features
+            _features = extract_cluster_features(drawings, [raw[k][3] for k in cluster_idx])
+        except Exception:
+            _features = {"outer_boundary": None, "inner_geometry": None, "fill_type": None,
+                         "library_match": None, "library_name": None,
+                         "expected_member_type": None, "library_confidence": 0.0}
+
         symbols.append({
             "cx": ref_cx,
             "cy": ref_cy,
             "rotation": rotation,
             "symbol": symbol_type,
-            "depth_in": depth_in
+            "depth_in": depth_in,
+            "accept_rules": sorted(_accept_rules),
+            "has_ih_pattern": _has_ih_pattern,
+            "bbox": _bbox,
+            # Real detected bounding-box size (page-pt units, same space as
+            # cx/cy) -- Stage 6 Part 2: lets the 2D overlay render a footing/
+            # box symbol AT THE ACTUAL SIZE OF THE REAL SHAPE instead of a
+            # generic fixed-size glyph, matching SteelGenie's convention
+            # (verified live: SteelGenie sizes footing outlines to the real
+            # detected mark, but keeps I/H column icons a small fixed
+            # schematic size regardless of the real glyph's on-page size).
+            "bbox_w": _bbox[2] - _bbox[0],
+            "bbox_h": _bbox[3] - _bbox[1],
+            "has_curve": _has_curve_any,
+            "is_dashed": _is_dashed_any,
+            "has_divider_bar": _has_divider_bar,
+            "outer_boundary": _features.get("outer_boundary"),
+            "inner_geometry": _features.get("inner_geometry"),
+            "fill_type": _features.get("fill_type"),
+            "library_match": _features.get("library_match"),
+            "library_name": _features.get("library_name"),
+            "expected_member_type": _features.get("expected_member_type"),
+            "library_confidence": _features.get("library_confidence", 0.0),
         })
 
-    print(f"[SYMBOLS] Column symbols detected: {len(symbols)}")
+    # Symbol Classification Engine: distinguishes real structural-column
+    # candidates (steel column plan marks, isolated footings, pile caps)
+    # from everything else a foundation/framing plan draws that can
+    # coincidentally match the shape rules above -- grid bubbles, detail/
+    # section callouts, dimension ticks, equipment pads, wall footings,
+    # annotations. This is the gatekeeper the mission calls for: nothing
+    # downstream (mark-filter, emit_symbol_columns) should ever see a
+    # candidate this stage rejects. See column_symbol_classifier.py.
+    try:
+        from app.engineering.column_symbol_classifier import classify_and_filter_symbols
+        symbols, rejected = classify_and_filter_symbols(symbols, page, is_foundation_plan=is_foundation_plan)
+        print(f"[SYMBOLS] Column symbols detected (pre mark-filter): {len(symbols)} "
+              f"(classifier rejected {len(rejected)})")
+    except Exception as _e:
+        print(f"[SYMBOLS] Classifier unavailable ({_e}), skipping classification stage")
+        print(f"[SYMBOLS] Column symbols detected (pre mark-filter): {len(symbols)}")
+
     return symbols
+
+
+def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
+    """
+    Foundation-plan footing/column detector, grid-intersection anchored.
+
+    Why this exists (2026-07-20, built after the symbol-shape detector was
+    shown live to miss ~2/3 of the real footings on a real foundation plan
+    and to misplace the ones it did find):
+
+    A foundation plan is the one sheet where the drawing itself tells you
+    exactly where every column is -- the general note says verbatim
+    "FOUNDATIONS, COLUMNS AND PIERS ARE CENTERED ON THE GRID LINE". So the
+    single most reliable place to look for a footing/column is a grid
+    INTERSECTION, and the correct place to PLACE its marker is the
+    intersection point itself (dead-center on the footing), not the drifting
+    centroid of whatever vector sub-paths a shape detector happened to
+    cluster. This inverts the old approach: instead of finding shapes and
+    hoping they sit on the grid, we walk the grid and ask "is there footing
+    ink here?".
+
+    Two stages:
+      1. Build a CLEAN grid from the sheet's own grid bubbles. Grid bubbles
+         are the large-font (>=11pt) single-token labels ("1".."8", "A".."F",
+         "C.1") printed in one row along the top/bottom (numbers -> vertical
+         grid lines) and one column along the left/right (letters ->
+         horizontal grid lines). Restricting to the dominant large-font
+         perimeter band drops the small-font (~9.5pt) detail/section-bubble
+         numbers scattered through the interior that pollute the generic
+         text-grid extractor.
+      2. At each intersection, count nearby short vector fragments (the
+         dashed footing outline + inner square + column I-mark are all drawn
+         as many small line segments). A real footing concentrates many
+         fragments spread across a footing-sized box in BOTH axes; a bare
+         wall/grid-line crossing produces only a thin line of fragments along
+         one axis. Require enough fragments AND real 2-D extent.
+
+    Returns a list of dicts: {cx, cy, grid_ref, n_frags, span_w, span_h}.
+    Deliberately foundation-plan-only and self-contained -- it does not touch
+    the framing-plan beam-convergence detector or the shape/symbol detector.
+    """
+    import re as _re
+    bx0, by0, bx1, by1 = plan_bounds
+
+    # ── Stage 1: clean grid from large-font perimeter bubbles ────────────────
+    try:
+        td = page.get_text("dict")
+    except Exception:
+        return []
+    _NUM = _re.compile(r'^[0-9]{1,2}(?:\.[0-9])?$')
+    _LET = _re.compile(r'^[A-Z]{1,2}(?:\.[0-9])?$')
+    nums: list[tuple] = []
+    lets: list[tuple] = []
+    for b in td.get("blocks", []):
+        for l in b.get("lines", []):
+            for s in l.get("spans", []):
+                t = s["text"].strip()
+                fs = s.get("size", 0)
+                if fs < 11 or not t or len(t) > 4:
+                    continue
+                cx = (s["bbox"][0] + s["bbox"][2]) / 2
+                cy = (s["bbox"][1] + s["bbox"][3]) / 2
+                if _NUM.match(t):
+                    nums.append((t, cx, cy))
+                elif _LET.match(t):
+                    lets.append((t, cx, cy))
+
+    def _dominant_band(pts, coord_idx, tol=15.0):
+        """Keep only the points in the single densest coordinate band (the
+        printed grid edge); return their opposite-axis positions + labels."""
+        if not pts:
+            return [], {}
+        buck: dict[int, list] = {}
+        for p in pts:
+            buck.setdefault(round(p[coord_idx] / tol), []).append(p)
+        best = max(buck.values(), key=len)
+        # opposite axis carries the grid-line position
+        pos_idx = 2 if coord_idx == 1 else 1
+        best.sort(key=lambda p: p[pos_idx])
+        out_pos: list[float] = []
+        out_lab: dict[float, str] = {}
+        for p in best:
+            v = p[pos_idx]
+            if not out_pos or abs(v - out_pos[-1]) > 18:
+                out_pos.append(v)
+                out_lab[v] = p[0]
+        return out_pos, out_lab
+
+    # numbers share a Y (a row) -> vertical grid lines at their X
+    v_grid, v_lab = _dominant_band(nums, 2)
+    # letters share an X (a column) -> horizontal grid lines at their Y
+    h_grid, h_lab = _dominant_band(lets, 1)
+    if len(v_grid) < 2 or len(h_grid) < 2:
+        # Not enough grid to anchor to -- caller falls back to the old path.
+        return []
+
+    # ── Stage 2: footing ink at each intersection ────────────────────────────
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+    frags: list[tuple] = []
+    for d in drawings:
+        for it in d.get("items", []):
+            if it[0] == "l":
+                p1, p2 = it[1], it[2]
+                seg = math.hypot(p2.x - p1.x, p2.y - p1.y)
+                if 3 < seg < 90:
+                    frags.append((p1.x, p1.y, p2.x, p2.y,
+                                  (p1.x + p2.x) / 2, (p1.y + p2.y) / 2))
+
+    # Scale-aware search radius: footings run ~2-12 ft; at 1/8"=1'-0"
+    # (scale_ratio=96) that's ~18-108pt, so a 40pt half-window centered on the
+    # intersection comfortably contains the footing outline without reaching
+    # into the neighbouring bay (bays are 279pt here). Scale it so the same
+    # holds on sheets drawn at other scales.
+    _ipt = 72.0 / max(scale_ratio, 1)
+    R = max(28.0, 40.0 * (_ipt / (72.0 / 96)))
+    MIN_FRAGS = 5
+    MIN_SPAN = 16.0
+
+    out = []
+    for gy in h_grid:
+        for gx in v_grid:
+            xs: list[float] = []
+            ys: list[float] = []
+            n = 0
+            for x1, y1, x2, y2, cx, cy in frags:
+                if abs(cx - gx) < R and abs(cy - gy) < R:
+                    xs += [x1, x2]
+                    ys += [y1, y2]
+                    n += 1
+            if n < MIN_FRAGS:
+                continue
+            sw = max(xs) - min(xs)
+            sh = max(ys) - min(ys)
+            # Require real 2-D extent -- a bare wall/grid crossing is thin in
+            # one axis (fragments strung along a single line).
+            if sw < MIN_SPAN or sh < MIN_SPAN:
+                continue
+            _vlab = v_lab.get(gx, "?")
+            _hlab = h_lab.get(gy, "?")
+            out.append({
+                "cx": gx, "cy": gy,
+                "grid_ref": f"{_vlab}-{_hlab}",
+                "n_frags": n, "span_w": round(sw, 1), "span_h": round(sh, 1),
+            })
+    print(f"[FOUNDATION] grid-anchored footings: {len(out)} "
+          f"(grid {len(v_grid)}x{len(h_grid)}, R={R:.0f}pt)")
+    return out
+
+
+def filter_foundation_symbols_by_marks(symbols: list, page, v_grid: list, h_grid: list,
+                                        is_foundation_plan: bool = False) -> list:
+    """
+    Reject candidate foundation-plan column/footing symbols that don't have a
+    real mark label (F1, F1A, C2, P1, ...) anywhere near them -- shape-
+    matching alone is too weak a signal on a cluttered real sheet (catches
+    hatch-pattern fill lines, leader-line elbows, elevation callout text
+    boxes, detail/section reference bubbles). Verified against two different
+    real projects.
+
+    Two things had to change from a naive "any mark within a fixed radius"
+    filter, both found by testing against real drawings of very different
+    density:
+
+    1. RADIUS IS DERIVED FROM THE MARKS' OWN SPACING, not v_grid/h_grid.
+       v_grid/h_grid (the general grid-line detector) turned out to be noisy
+       on at least one real sheet -- it reported 19 "vertical grid lines"
+       where only ~9 real column lines exist, which threw off any bay-width
+       calculation built on top of it. The mark labels' own median nearest-
+       neighbor spacing is a much more direct, reliable signal for "how
+       dense is this sheet", since it's exactly the thing we're trying to
+       calibrate against.
+    2. EACH MARK CAN ONLY CLAIM A LIMITED NUMBER OF NEARBY SYMBOLS.
+       A pure radius filter breaks down on dense sheets: when real marks are
+       packed close together, nearly every point on the page ends up within
+       reach of SOME real mark, so distance alone stops being selective
+       (Congress Heights RC: 167 raw candidates, 77 real marks, but 136+
+       still passed a radius-only filter). Capping how many candidates any
+       single mark can "sponsor" (its nearest few, not everyone in range)
+       keeps the filter selective on dense sheets while still tolerating
+       sparse sheets where one type-label legitimately marks more than one
+       physical column nearby.
+
+    Calibrated against two real projects: Bayhealth Sussex MOB (sparse,
+    ~224pt median mark spacing) and Congress Heights RC (dense, ~139pt).
+    """
+    if not (is_foundation_plan and symbols):
+        return symbols
+
+    _MARK_RE = re.compile(r'^(?:[FPC]\d{1,3}[A-Z]?)$')
+    _mark_positions: list[tuple[float, float]] = []
+    try:
+        for w in page.get_text("words"):
+            word_text = (w[4] or "").strip().upper()
+            if _MARK_RE.match(word_text):
+                _mark_positions.append(((w[0] + w[2]) / 2, (w[1] + w[3]) / 2))
+    except Exception:
+        _mark_positions = []
+
+    if not _mark_positions:
+        return symbols
+
+    # Median nearest-OTHER-mark distance, ignoring <40pt gaps (those are the
+    # same physical label split into two text-extraction tokens, e.g.
+    # "F90" + "A", not two distinct marks).
+    _nn_dists = []
+    for i, (mx, my) in enumerate(_mark_positions):
+        others = [math.hypot(mx - ox, my - oy)
+                  for j, (ox, oy) in enumerate(_mark_positions) if j != i]
+        others = sorted(d for d in others if d > 40.0)
+        if others:
+            _nn_dists.append(others[0])
+
+    if _nn_dists:
+        _nn_dists.sort()
+        n = len(_nn_dists)
+        _median_mark_spacing = (_nn_dists[n // 2] if n % 2
+                                 else (_nn_dists[n // 2 - 1] + _nn_dists[n // 2]) / 2)
+    else:
+        _median_mark_spacing = 200.0  # only one mark on the whole page -- no spacing signal
+
+    _MARK_RADIUS = _median_mark_spacing
+    _CAP_PER_MARK = 2  # a mark may legitimately label more than one nearby
+                        # column of the same type, but not an unlimited number
+
+    accepted_idx: set = set()
+    # Track each accepted symbol's OWN nearest mark distance (not just which
+    # marks claimed it) so the Column Validation Engine downstream can score
+    # "mark sitting right on the symbol" higher than "mark at the edge of
+    # this sheet's tolerance" instead of treating every accepted symbol as
+    # equally well-evidenced.
+    nearest_mark_dist: dict = {}
+    for mx, my in _mark_positions:
+        dists = sorted(
+            (math.hypot(s["cx"] - mx, s["cy"] - my), si)
+            for si, s in enumerate(symbols)
+            if math.hypot(s["cx"] - mx, s["cy"] - my) < _MARK_RADIUS
+        )
+        for _d, si in dists[:_CAP_PER_MARK]:
+            accepted_idx.add(si)
+            if si not in nearest_mark_dist or _d < nearest_mark_dist[si]:
+                nearest_mark_dist[si] = _d
+
+    filtered = []
+    for si, s in enumerate(symbols):
+        if si not in accepted_idx:
+            continue
+        s["nearest_mark_dist"] = round(nearest_mark_dist.get(si, _MARK_RADIUS), 1)
+        s["mark_radius"] = round(_MARK_RADIUS, 1)
+        filtered.append(s)
+
+    print(f"[SYMBOLS] Mark-filter: median_mark_spacing={_median_mark_spacing:.0f} "
+          f"radius={_MARK_RADIUS:.0f} cap={_CAP_PER_MARK} {len(symbols)} -> {len(filtered)}")
+    return filtered
 
 
 def detect_raster_grid_lines(img_path: str, plan_bounds: tuple) -> tuple:
@@ -2205,8 +2896,15 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
     # Kicks in only when plan_cov > 0.70 to avoid widening on normal drawings
     EDGE = min(0.45, 0.25 + max(0.0, plan_cov - 0.70) * 0.67)
 
-    letter_pts: list[tuple[float, float]] = []
-    number_pts: list[tuple[float, float]] = []
+    # Each point now carries its actual bubble text alongside the position --
+    # previously this text was read purely to classify letter-vs-number and
+    # then thrown away, so every downstream consumer (registration.py's
+    # multi-sheet grid persistence) had no real label to use and fell back to
+    # sequential "1,2,3.../A,B,C" numbering that doesn't match the sheet's
+    # real grid at all. Carrying (text, cx, cy) through lets us return the
+    # REAL bubble label for each final position, not just its coordinate.
+    letter_pts: list[tuple[str, float, float]] = []
+    number_pts: list[tuple[str, float, float]] = []
 
     _td = text_dict if text_dict is not None else page.get_text("dict")
     for block in _td["blocks"]:
@@ -2234,21 +2932,121 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
                     continue
 
                 if _GRID_LETTER.match(t):
-                    letter_pts.append((cx, cy))
+                    letter_pts.append((t, cx, cy))
                 elif _GRID_NUMBER.match(t):
                     try:
                         if not (0.5 <= float(t) <= 200):
                             continue
                     except ValueError:
                         continue
-                    number_pts.append((cx, cy))
+                    number_pts.append((t, cx, cy))
+
+    # ── Dominant-band noise filter ──────────────────────────────────────────
+    # ROOT CAUSE (found on full-page / high-coverage drawings such as this
+    # project's binder, where plan_cov -> 1.0 and EDGE widens to its max of
+    # 0.45): a 0.45 EDGE zone covers the outer 45% on EACH side, i.e. ~90% of
+    # the page along that axis. That leaves almost no "interior" region to
+    # exclude, so interior dimension strings, joist-spacing call-outs, and
+    # load-schedule figures (e.g. "27", "30" PSF values) scattered anywhere
+    # in that 90% band pass the perimeter check and get treated as grid
+    # bubbles. On a real sheet this pollutes the candidate set ~10x over the
+    # true bubble count (e.g. 190 "number" candidates on a sheet with only
+    # 21 real grid numbers) — far past the 55%-majority threshold that
+    # _dominant_sequence() needs to reject noise, so the noise survives.
+    #
+    # Real grid bubbles for one axis always sit on a single shared row (same
+    # Y, letters/numbers spread out in X) or a single shared column (same X,
+    # spread out in Y) — because they're printed along ONE edge of the plan.
+    # Interior annotations don't share that coordinate; each one sits at its
+    # own essentially-unique X/Y. So before classifying letters vs numbers
+    # into vertical/horizontal families, snap each point set to whichever
+    # single coordinate band actually holds the bulk of the points (its
+    # "printed edge"), and drop everything that isn't part of that band (or
+    # a comparably-sized twin band — many drawings repeat the same grid
+    # labels on both the near and far edge of the plan).
+    #
+    # This is a tighter, position-based test layered on top of (not instead
+    # of) the existing EDGE/perimeter/font-size/numeric-range checks above —
+    # none of those are weakened.
+    def _dominant_band(pts, tol=15.0, min_frac=0.45, min_count=3):
+        if len(pts) < min_count:
+            return pts
+
+        def _bucket(idx):
+            buckets: dict[int, list] = {}
+            for p in pts:
+                key = round(p[idx] / tol)
+                buckets.setdefault(key, []).append(p)
+            return buckets
+
+        buckets_x = _bucket(1)   # points sharing near-identical cx (a column)
+        buckets_y = _bucket(2)   # points sharing near-identical cy (a row)
+        best_x = max(buckets_x.values(), key=len)
+        best_y = max(buckets_y.values(), key=len)
+
+        # Pick whichever axis actually concentrates the points into a real
+        # band (real grid bubbles cluster tightly on ONE of these two axes;
+        # noise doesn't cluster tightly on either).
+        if len(best_x) >= len(best_y):
+            buckets, best = buckets_x, best_x
+        else:
+            buckets, best = buckets_y, best_y
+
+        threshold = max(min_count, min_frac * len(best))
+        kept = [p for grp in buckets.values() if len(grp) >= threshold for p in grp]
+        # Never let the filter manufacture a false "no grid" result when the
+        # raw candidate set was small to begin with and simply didn't form a
+        # clean single band — fall back to returning everything untouched
+        # rather than guessing wrong.
+        return kept if kept else pts
+
+    def _label_rank(label):
+        """Numeric rank for a grid label, used only to test ordering — NOT
+        for the returned position/label data itself."""
+        try:
+            return float(label)
+        except ValueError:
+            mm = re.match(r"^([A-Z])\1?(?:\.(\d+))?", label)
+            if not mm:
+                return 0.0
+            base = ord(mm.group(1))
+            sub = float(mm.group(2)) if mm.group(2) else 0.0
+            return base * 100 + sub
+
+    def _monotonic_filter(pts, min_frac=0.75):
+        """
+        Reject point sets that pass the band-density test above but are NOT
+        actually a grid: e.g. a printed load/area schedule table can have a
+        tight column of numbers (tripping the band filter) whose VALUES
+        don't track position — real grid bubbles are always laid out in
+        ascending (or descending) order along the edge they're printed on,
+        a schedule table's numbers are not. If fewer than min_frac of
+        consecutive (position-sorted) pairs are non-decreasing or
+        non-increasing, this isn't a real grid — drop it entirely rather
+        than risk persisting a wrong "confident" label.
+        """
+        if len(pts) < 3:
+            return pts
+        xs_spread = max(p[1] for p in pts) - min(p[1] for p in pts)
+        ys_spread = max(p[2] for p in pts) - min(p[2] for p in pts)
+        axis_idx = 1 if xs_spread >= ys_spread else 2
+        sv = sorted(pts, key=lambda p: p[axis_idx])
+        vals = [_label_rank(p[0]) for p in sv]
+        n = len(vals) - 1
+        inc = sum(1 for i in range(n) if vals[i + 1] >= vals[i])
+        dec = sum(1 for i in range(n) if vals[i + 1] <= vals[i])
+        frac = max(inc, dec) / n
+        return pts if frac >= min_frac else []
+
+    letter_pts = _monotonic_filter(_dominant_band(letter_pts))
+    number_pts = _monotonic_filter(_dominant_band(number_pts))
 
     def _classify_family(pts):
-        """Return (v_positions, h_positions) for a set of bubble label points."""
+        """Return (v_points, h_points) for a set of (label, cx, cy) bubble points."""
         if not pts:
             return [], []
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
+        xs = [p[1] for p in pts]
+        ys = [p[2] for p in pts]
         def _uniq(vals, tol=20):
             seen = []
             for v in sorted(vals):
@@ -2256,13 +3054,15 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
                     seen.append(v)
             return len(seen)
         if _uniq(xs) >= _uniq(ys):
-            return xs, []
+            return pts, []
         else:
-            return [], ys
+            return [], pts
 
-    def _dominant_sequence(vals, span):
+    def _dominant_sequence(pts, span):
         """
-        Universal interior-annotation filter.
+        Universal interior-annotation filter, operating on (label, cx, cy)
+        points keyed by their relevant axis coordinate (already isolated by
+        _classify_family into an all-V or all-H family).
 
         With a wider EDGE zone (needed for large/full-page plans), some
         interior annotation numbers (bay-span callouts like '18', '24')
@@ -2281,50 +3081,62 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
         max_gap = max(30% of plan span, 120 pt) — generous enough to handle
         any structural bay size (typical largest bay ≤ 30 ft = 270–405 pt).
         """
-        if len(vals) < 3:
-            return vals
-        sv      = sorted(vals)
+        if len(pts) < 3:
+            return pts
+        # Sort by whichever coordinate actually varies for this family (the
+        # axis value lives in cx for a V family, cy for an H family -- both
+        # are present on every point, so just pick by spread).
+        xs_spread = max(p[1] for p in pts) - min(p[1] for p in pts)
+        ys_spread = max(p[2] for p in pts) - min(p[2] for p in pts)
+        axis_idx = 1 if xs_spread >= ys_spread else 2
+
+        sv      = sorted(pts, key=lambda p: p[axis_idx])
         max_gap = max(span * 0.30, 120.0)
 
         best, cur = [sv[0]], [sv[0]]
-        for v in sv[1:]:
-            if v - cur[-1] <= max_gap:
-                cur.append(v)
+        for p in sv[1:]:
+            if p[axis_idx] - cur[-1][axis_idx] <= max_gap:
+                cur.append(p)
             else:
                 if len(cur) > len(best):
                     best = cur[:]
-                cur = [v]
+                cur = [p]
         if len(cur) > len(best):
             best = cur
 
         # Only apply if the dominant sequence is clearly the majority.
         # For truly sparse grids (large irregular bays) the condition won't
         # fire and all values are returned untouched.
-        return best if len(best) >= max(3, len(vals) * 0.55) else vals
+        return best if len(best) >= max(3, len(pts) * 0.55) else pts
 
     lv, lh = _classify_family(letter_pts)
     nv, nh = _classify_family(number_pts)
 
-    v_raw = lv + nv
-    h_raw = lh + nh
+    v_pts = lv + nv
+    h_pts = lh + nh
 
     # Apply dominant-sequence filter to drop isolated annotation clusters
     # that sneak in when EDGE is widened for large / full-page drawings.
-    v_raw = _dominant_sequence(v_raw, plan_w)
-    h_raw = _dominant_sequence(h_raw, plan_h)
+    v_pts = _dominant_sequence(v_pts, plan_w)
+    h_pts = _dominant_sequence(h_pts, plan_h)
 
-    def dedup(vals, tol=18):
-        out = []
-        for v in sorted(vals):
-            if not out or abs(v - out[-1]) > tol:
-                out.append(v)
-        return out
+    def dedup_labeled(pts, axis_idx, tol=18):
+        """Dedup by position (same clustering as before), keeping the first
+        real label text seen in each cluster."""
+        out_pos: list[float] = []
+        out_label: dict[float, str] = {}
+        for p in sorted(pts, key=lambda p: p[axis_idx]):
+            v = p[axis_idx]
+            if not out_pos or abs(v - out_pos[-1]) > tol:
+                out_pos.append(v)
+                out_label[v] = p[0]
+        return out_pos, out_label
 
-    v_grid = dedup(v_raw)
-    h_grid = dedup(h_raw)
-    print(f"[GRID] V({len(v_grid)}): {[round(x) for x in v_grid]}")
-    print(f"[GRID] H({len(h_grid)}): {[round(y) for y in h_grid]}")
-    return v_grid, h_grid
+    v_grid, v_labels = dedup_labeled(v_pts, 1)
+    h_grid, h_labels = dedup_labeled(h_pts, 2)
+    print(f"[GRID] V({len(v_grid)}): {[(round(x), v_labels[x]) for x in v_grid]}")
+    print(f"[GRID] H({len(h_grid)}): {[(round(y), h_labels[y]) for y in h_grid]}")
+    return v_grid, h_grid, v_labels, h_labels
 
 
 # ── Member classification ─────────────────────────────────────────────────────
@@ -2400,18 +3212,33 @@ def classify_member(profile: str,
         }
         _is_col_weight = weight >= _col_thresholds.get(depth, 9999)
 
+        # TIERs 1-4 below all ultimately depend on this sheet actually having
+        # real column symbols marked on it. On a pure framing/roof plan with
+        # zero column symbols anywhere (this project's roof framing sheets
+        # only show beams/joists -- columns are only marked once, on the
+        # foundation/column plan), the grid-intersection and label-only
+        # tiers (2/3/4) used to still fire from weight/depth/position alone,
+        # misclassifying short or heavy W-section beam labels as phantom
+        # columns -- producing extra/duplicate column members that don't
+        # correspond to any real footing. Require at least one real column
+        # symbol detected SOMEWHERE on the page before trusting any of that
+        # inference; a profile that's unambiguously column-only (PIPE /
+        # square HSS, handled in TIER 0 above) is exempt since those are
+        # never legitimately beams regardless of the sheet.
+        if not column_symbols:
+            return "beam"
+
         # ── TIER 1: near a detected I/H column symbol ─────────────────────────
         # The symbol drawn on the plan is the strongest signal — use it first.
         # BUT only promote to column if the section weight also confirms it.
         # Short beams framing INTO a column have their label placed right next
         # to the column symbol — without the weight check, they get stolen.
-        if column_symbols:
-            for sym in column_symbols:
-                if math.hypot(cx - sym["cx"], cy - sym["cy"]) < SYMBOL_ASSOC_RADIUS:
-                    if _is_col_weight or depth <= 10:
-                        return "column"
-                    # Light section near symbol = beam framing into column
-                    break
+        for sym in column_symbols:
+            if math.hypot(cx - sym["cx"], cy - sym["cy"]) < SYMBOL_ASSOC_RADIUS:
+                if _is_col_weight or depth <= 10:
+                    return "column"
+                # Light section near symbol = beam framing into column
+                break
 
         # ── TIER 2: at a named grid intersection ──────────────────────────────
         # Columns sit exactly at grid line crossings; beams span between them.
@@ -2425,7 +3252,6 @@ def classify_member(profile: str,
         # ── TIER 3: depth rule — short W-sections are columns on every drawing ─
         # W6 and W8 are almost never used as beams in structural framing plans.
         # W10 sections are columns far more often than beams.
-        # This rule fires even when no symbols or grid are detected.
         if depth <= 8:
             return "column"
         if depth == 10 and weight >= 22:
@@ -2832,6 +3658,15 @@ def build_members(profiles, page_w, page_h,
     # ── Pass 1: exclusive symbol → profile matching ───────────────────────────
     symbol_matched_cols: set[int] = set()   # profile indices confirmed as columns
     profile_sym_pos: dict[int, tuple] = {}  # p_idx → (sx_frac, sy_frac) of matched symbol
+    # Stage 3 (2026-07-17 rebuild): keep the matched symbol's own index too,
+    # not just its position, so Pass 2 can look up the Symbol Classification
+    # Engine's category for it (column_symbols[s_idx]["category"], set by
+    # classify_and_filter_symbols before build_members is ever called) --
+    # this is the primary, mark-matched column pathway (the one that
+    # actually produces most foundation-plan columns; emit_symbol_columns is
+    # the secondary, no-label-symbol fallback), so this is the path that
+    # needs the footing/column split to have any real-world effect.
+    profile_sym_idx: dict[int, int] = {}
     if column_symbols:
         # Build all (distance, symbol_idx, profile_idx) pairs within radius
         candidates = []
@@ -2854,6 +3689,7 @@ def build_members(profiles, page_w, page_h,
                     round(column_symbols[s_idx]["cx"] / page_w, 4),
                     round(column_symbols[s_idx]["cy"] / page_h, 4),
                 )
+                profile_sym_idx[p_idx] = s_idx
         print(f"[BUILD] {len(symbol_matched_cols)} profiles matched to column symbols "
               f"(of {len(column_symbols)} symbols, {len(profiles)} profiles)")
 
@@ -3248,6 +4084,44 @@ def build_members(profiles, page_w, page_h,
                     length_ft = 0.0
 
         sym = profile_sym_pos.get(p_idx)
+
+        # Stage 3 (2026-07-17 rebuild, live-verified against real SteelGenie
+        # foundation plans): only treat this as a footing/column split when
+        # the profile is STILL symbol-matched at this point (the beam-line
+        # and section-type overrides above call
+        # symbol_matched_cols.discard(p_idx) when they reclassify a false
+        # column match back to a beam -- checking membership here, not just
+        # profile_sym_idx, is what keeps those overrides authoritative).
+        _sym_idx = profile_sym_idx.get(p_idx) if p_idx in symbol_matched_cols else None
+        _sym_category = (
+            column_symbols[_sym_idx].get("category")
+            if (_sym_idx is not None and column_symbols) else None
+        )
+
+        if mtype == "column" and _sym_category == "footing_isolated":
+            import uuid as _uuid_mod
+            _linked_group_id = str(_uuid_mod.uuid4())
+            members.append({
+                "profile":   None,
+                "type":      "footing",
+                "length_ft": 0.0,
+                "beam_dir":  None,
+                "bx1": None, "by1": None, "bx2": None, "by2": None,
+                "x":  round(render_cx / page_w, 4),
+                "y":  round(render_cy / page_h, 4),
+                "lx": round(p["cx"] / page_w, 4),
+                "ly": round(p["cy"] / page_h, 4),
+                "sx": sym[0] if sym else None,
+                "sy": sym[1] if sym else None,
+                "w":  0.03, "h": 0.03,
+                "color":     MEMBER_COLORS.get("footing", "#6B7280"),
+                "confirmed": True,
+                "is_column": False,
+                "geometry": {"category": _sym_category, "linked_group_id": _linked_group_id, "linked_role": "footing"},
+            })
+        else:
+            _linked_group_id = None
+
         members.append({
             "profile":   p["profile"],
             "type":      mtype,
@@ -3270,6 +4144,8 @@ def build_members(profiles, page_w, page_h,
             "color":     MEMBER_COLORS.get(mtype, "#6B7280"),
             "confirmed": True,
             "is_column": mtype == "column",
+            "geometry": ({"category": _sym_category, "linked_group_id": _linked_group_id, "linked_role": "column" if _linked_group_id else None}
+                         if _sym_category else None),
         })
 
     # ── Post-processing: remove duplicates and short stubs ───────────────────
@@ -4077,9 +4953,21 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
     return members
 
 
+# Diagnostic-only capture of every column-symbol candidate's structural-
+# validation outcome from the MOST RECENT emit_symbol_columns() call --
+# reset and repopulated at the top of every call. Not used by any real code
+# path; exists so a "why did the foundation plan only extract some of its
+# columns" question can be answered with real per-candidate scores instead
+# of guessing, by re-running extraction (which calls emit_symbol_columns
+# normally, no side effects added) and then reading this back via
+# GET /pages/{id}/debug/column-validation-log. See model.py for that route.
+_LAST_COLUMN_VALIDATION_LOG: list = []
+
+
 def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                         page_w, page_h, scale_ratio: float = 96,
-                        pts_per_foot: float = 0.0, profiles=None):
+                        pts_per_foot: float = 0.0, profiles=None,
+                        is_foundation_plan: bool = False):
     """Emit a COLUMN member for each detected column symbol that sits at a grid
     intersection and isn't already represented by a column member.
 
@@ -4088,9 +4976,23 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     never counted.  Here we count them: position = symbol, size left blank (a
     later Column-Schedule pass can fill it).  Gating on a grid intersection
     (near a vertical AND a horizontal grid line) keeps false marks out.
+
+    is_foundation_plan: the MIN_BEAMS gate below ("only count a symbol as a
+    column if at least 2 beams visibly frame into it") was written for
+    framing plans, where a real column always has beams landing on it and a
+    stray annotation mark never does. A foundation/column plan has NO beams
+    at all -- footings and piers are the whole point of the sheet -- so that
+    gate silently rejected every single column symbol on a foundation plan,
+    which is exactly the "Column: 0" bug reported on a sheet that's visibly
+    covered in footing/column marks. On a foundation plan, grid-intersection
+    proximity (or, failing that, just being a real detected symbol at all)
+    is itself sufficient evidence -- there's no beam signal to require.
     """
     if not column_symbols:
         column_symbols = []
+
+    global _LAST_COLUMN_VALIDATION_LOG
+    _LAST_COLUMN_VALIDATION_LOG = []
 
     # ── Scale-aware thresholds ────────────────────────────────────────────────
     _ipt = 72.0 / max(scale_ratio, 1)
@@ -4109,6 +5011,75 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
 
     existing = [(m["x"] * page_w, m["y"] * page_h)
                 for m in members if m.get("type") == "column"]
+
+    # General bay size (avg grid spacing), used by the Column Validation
+    # Engine's grid-intersection scoring below -- distinct from the
+    # foundation-plan-only _grid_envelope block further down, which uses a
+    # bay size just to add slack around the envelope. This one just needs
+    # "how far off grid is close, relatively, on THIS sheet" so a candidate
+    # a few points off grid on a tightly-spaced sheet isn't scored the same
+    # as one the same distance off grid on a widely-spaced sheet.
+    _bay_size_pt = None
+    if v_grid and len(v_grid) > 1:
+        _bay_size_pt = (max(v_grid) - min(v_grid)) / (len(v_grid) - 1)
+    elif h_grid and len(h_grid) > 1:
+        _bay_size_pt = (max(h_grid) - min(h_grid)) / (len(h_grid) - 1)
+
+    # Foundation plans only: reject any symbol far outside the actual
+    # structural grid envelope entirely (not just "off_grid", which still
+    # kept it). Real footing/column marks sit within the building's grid
+    # system; a symbol out in the open margin/notes area (duct-bank callouts,
+    # retaining-wall references, general notes) or riding on an unrelated
+    # symbol (e.g. a triangular brace-frame mark) can still coincidentally
+    # pass the shape/dash checks in detect_column_symbols, and those were
+    # showing up as columns scattered outside the building footprint. One
+    # bay-width of slack beyond the outermost real grid lines still allows a
+    # genuinely eccentric footing near the building edge.
+    # Reverted (2026-07-20): a same-axis-alignment self-correcting extension
+    # was tried here and immediately disproven live -- on the "sasa"
+    # foundation plan it pulled in an entire row/column of REAL PDF content
+    # that isn't a footing or column at all ("SEE ARCH / C-L BEAM" centerline
+    # dimension callouts, "ELEVATOR SILL" note text), because dimension/note
+    # annotations near a sheet's top and side edges are themselves often
+    # evenly spaced and lined up with the grid -- alignment alone is NOT
+    # sufficient evidence of a real missing grid line, it was the wrong
+    # signal. Back to the simple, safe one-bay-width margin below. The real
+    # fix for "foundation plan doesn't extract every real column" has to be
+    # at grid-line detection itself (why extract_grid_lines() missed a real
+    # bubble label) or at the symbol classifier (why a dimension centerline
+    # mark and a footing mark aren't distinguished) -- not here.
+    _grid_envelope = None
+    if is_foundation_plan and v_grid and h_grid:
+        _bay_x = (max(v_grid) - min(v_grid)) / max(len(v_grid) - 1, 1) if len(v_grid) > 1 else 60.0
+        _bay_y = (max(h_grid) - min(h_grid)) / max(len(h_grid) - 1, 1) if len(h_grid) > 1 else 60.0
+        _grid_envelope = (
+            min(v_grid) - _bay_x, min(h_grid) - _bay_y,
+            max(v_grid) + _bay_x, max(h_grid) + _bay_y,
+        )
+
+    # Best-guess profile for a symbol-only column with no label of its own --
+    # matches SteelGenie's own behavior (verified live: an unlabeled column
+    # symbol still gets a real guessed section, e.g. "W12X79", flagged with a
+    # warning + "Need Review" status, rather than a placeholder like "COL").
+    # Guess = whichever real column-type profile already appears most often
+    # elsewhere in this project's labeled members -- a far better guess than
+    # a fixed constant, since it reflects what this specific project actually
+    # uses. Falls back to a common light structural column size only when
+    # nothing else on the page gives any hint at all.
+    _COL_PROFILE_RE = re.compile(r'^(?:W\d{1,2}X\d{1,3}|HSS\d+(?:\.\d+)?X\d+(?:\.\d+)?X[\d./]+|PIPE\S*)$', re.IGNORECASE)
+    _col_profile_counts: dict[str, int] = {}
+    for m in members:
+        if m.get("type") == "column":
+            prof = (m.get("profile") or "").upper().strip()
+            if prof and _COL_PROFILE_RE.match(prof):
+                _col_profile_counts[prof] = _col_profile_counts.get(prof, 0) + 1
+    if profiles:
+        for p in profiles:
+            prof = (p.get("profile") or "").upper().strip()
+            if prof and _COL_PROFILE_RE.match(prof):
+                _col_profile_counts[prof] = _col_profile_counts.get(prof, 0) + 1
+    _guessed_profile = (max(_col_profile_counts, key=_col_profile_counts.get)
+                         if _col_profile_counts else "W12X40")
 
     beam_ends = []
     beam_end_dirs: dict[tuple[float, float], str] = {}
@@ -4129,6 +5100,66 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     for s in column_symbols:
         cx, cy = s["cx"], s["cy"]   # union-bbox centre (raw)
 
+        # 2026-07-20: the envelope gate used to be an unconditional hard
+        # reject for ANY candidate outside it. That's exactly what caused
+        # the original "foundation plan doesn't extract every real column"
+        # bug -- the envelope is only as good as extract_grid_lines()'s own
+        # grid-bubble detection, and a real footing sitting just past an
+        # UNDETECTED outermost grid line got thrown out here even though it
+        # has genuine footing-shape evidence and a real "F1"/"P2"-style mark
+        # next to it. Bare geometric alignment with the grid is NOT
+        # structural evidence (that's the exact reasoning that produced the
+        # false-positive "℄ BEAM" / "ELEVATOR SILL" incident and was
+        # reverted) -- but a real mark match IS: it's independent textual
+        # confirmation this is a labeled structural member, not a guess from
+        # position alone. So the envelope stays a hard gate for anything
+        # WITHOUT that kind of confirmed evidence (classifier_confidence
+        # below the "real mark nearby" threshold -- see
+        # column_symbol_classifier.py's has_mark-gated rules, which top out
+        # at 0.45 with no mark and jump to >=0.65 once a real F/P/C mark is
+        # found), and only lets a candidate through past it when the
+        # classifier has already confirmed real structural evidence, not
+        # merely a plausible shape in a plausible place.
+        _classifier_conf = s.get("classifier_confidence") or 0.0
+        # 2026-07-20: threshold sits strictly ABOVE the classifier's own
+        # highest no-mark/shape-only confidence (ih_pattern with no tight-
+        # radius mark match tops out at 0.65 -- see
+        # column_symbol_classifier.py) and AT/BELOW its lowest real-mark-
+        # confirmed confidence (a footing outline + tight-radius F/P/C mark
+        # is 0.70). This is the actual dividing line between "shape looked
+        # plausible" and "an independent structural label confirms it" --
+        # live-verified: at 0.65 this let three real annotation clusters
+        # (a dimension-centerline callout, a leader-note callout, a rebar
+        # detail heading) bypass the envelope on shape-pattern confidence
+        # alone with no real mark; raising to 0.70 excludes all of them
+        # while still letting confirmed-mark footings/columns through.
+        _has_confirmed_evidence = _classifier_conf >= 0.70
+        if _grid_envelope is not None and not _has_confirmed_evidence:
+            _ex0, _ey0, _ex1, _ey1 = _grid_envelope
+            if not (_ex0 <= cx <= _ex1 and _ey0 <= cy <= _ey1):
+                rejected += 1
+                _LAST_COLUMN_VALIDATION_LOG.append({
+                    "cx": cx, "cy": cy, "category": s.get("category"),
+                    "outcome": "rejected", "stage": "grid_envelope",
+                    "classifier_confidence": _classifier_conf,
+                    "reason": "outside grid envelope and no confirmed mark/shape evidence "
+                              f"(classifier_confidence={_classifier_conf:.2f} < 0.65)",
+                })
+                continue
+        elif _grid_envelope is not None:
+            _ex0, _ey0, _ex1, _ey1 = _grid_envelope
+            if not (_ex0 <= cx <= _ex1 and _ey0 <= cy <= _ey1):
+                # Outside the envelope but has confirmed evidence (real mark
+                # match) -- let it through, but record why for the debug log.
+                _LAST_COLUMN_VALIDATION_LOG.append({
+                    "cx": cx, "cy": cy, "category": s.get("category"),
+                    "outcome": "envelope_bypassed", "stage": "grid_envelope",
+                    "classifier_confidence": _classifier_conf,
+                    "reason": "outside grid envelope but confirmed by classifier "
+                              f"(confidence={_classifier_conf:.2f}, category={s.get('category')}) "
+                              "-- likely a real footing/column past an undetected grid line",
+                })
+
         # Count distinct beam endpoints framing into this symbol.
         close_ends = [(ex, ey) for ex, ey in beam_ends
                       if math.hypot(cx - ex, cy - ey) < FRAME_PT]
@@ -4138,8 +5169,13 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                        for ux, uy in unique_ends):
                 unique_ends.append((ex, ey))
 
-        if len(unique_ends) < MIN_BEAMS:
+        if len(unique_ends) < MIN_BEAMS and not is_foundation_plan:
             rejected += 1
+            _LAST_COLUMN_VALIDATION_LOG.append({
+                "cx": cx, "cy": cy, "category": s.get("category"),
+                "outcome": "rejected", "stage": "min_beams",
+                "beam_end_count": len(unique_ends),
+            })
             continue
 
         raw_x, raw_y = cx, cy
@@ -4166,7 +5202,7 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
 
         # Match labels (within 20pt)
         has_label_match = False
-        matched_profile = "COL"
+        matched_profile = _guessed_profile
         if profiles:
             for p in profiles:
                 if math.hypot(cx - p["cx"], cy - p["cy"]) < 20.0:
@@ -4174,32 +5210,202 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                     matched_profile = p["profile"]
                     break
 
-        score = 0.0
+        # Column Validation Engine: don't trust geometry/label matching
+        # alone. Combine grid-intersection proximity, the Symbol
+        # Classification Engine's own footing/column category+confidence,
+        # how close the nearest real mark actually is (not just "one was
+        # somewhere in range"), and beam connectivity into one structural-
+        # context score. A candidate that clears every geometric filter
+        # upstream (shape match, classifier, mark-radius) can still fail
+        # here if ALL of those signals are simultaneously weak -- that
+        # combination is what a circular annotation bubble or a stray
+        # detail marker that dodged the earlier curve-based checks looks
+        # like structurally, even when its shape looked plausible.
+        grid_snap_dist = None
+        if gx is not None and gy is not None:
+            grid_snap_dist = math.hypot(cx - gx, cy - gy)
+        elif gx is not None:
+            grid_snap_dist = abs(cx - gx)
+        elif gy is not None:
+            grid_snap_dist = abs(cy - gy)
+
+        ctx_score, ctx_signals, ctx_passed = column_validation_engine.score_column_candidate(
+            has_grid_intersection=not off_grid,
+            grid_snap_dist_pt=grid_snap_dist,
+            bay_size_pt=_bay_size_pt,
+            classifier_category=s.get("category"),
+            classifier_confidence=s.get("classifier_confidence"),
+            nearest_mark_dist_pt=s.get("nearest_mark_dist"),
+            mark_radius_pt=s.get("mark_radius"),
+            beam_end_count=len(unique_ends),
+            is_foundation_plan=is_foundation_plan,
+            schedule_matched=False,  # not known at page-extraction time; see registration.py
+        )
+        # A real label match on the symbol itself (framing-plan profile
+        # callout, e.g. "W12X40" sitting right on the mark) is independent,
+        # strong positive evidence the structural-context score above has
+        # no way to see -- fold it in as a flat bonus rather than losing it.
         if has_label_match:
-            score += 0.40
-        if not off_grid:
-            score += 0.30
-        if len(unique_ends) >= 2:
-            score += 0.20
-        if s.get("symbol") in ("I", "BOX", "PIPE"):
-            score += 0.10
+            ctx_score = round(min(1.0, ctx_score + 0.25), 3)
 
-        status = 'active' if score >= 0.75 else 'need_review'
-
-        error_flags = []
-        if off_grid:
-            error_flags.append("no_grid")
-        if not has_label_match:
-            error_flags.append("no_label")
-        if len(unique_ends) < 2:
-            error_flags.append("orphan")
-
-        # Grid index naming
+        # Grid index naming -- computed here, before _reason_parts(), because
+        # that closure reads grid_ref as a free variable: if grid_ref were
+        # only assigned later in this same loop body (as it used to be, right
+        # after this block was originally written), Python raises "cannot
+        # access free variable 'grid_ref' where it is not associated with a
+        # value in enclosing scope" on the closure's first read each
+        # iteration -- this crashed extraction on every page that reached
+        # this code path (re-diagnosed and re-fixed 2026-07-21 after being
+        # reverted along with an unrelated feature; see the reason string
+        # below is the ONLY thing that needs grid_ref before this point).
         v_idx = sorted(v_grid).index(gx) + 1 if v_grid and gx is not None and gx in v_grid else "?"
         h_idx = sorted(h_grid).index(gy) + 1 if h_grid and gy is not None and gy in h_grid else "?"
         grid_ref = f"{v_idx}-{h_idx}" if (v_idx != "?" or h_idx != "?") else None
 
+        # Human-readable reason string (mandate's "confidence model" format:
+        # every accepted/rejected candidate states WHY). Built from the
+        # strongest signals actually present rather than a generic dump of
+        # ctx_signals, so the debug log/overlay reads like an engineer's
+        # note, not a data structure.
+        def _reason_parts():
+            parts = []
+            _cat = s.get("category")
+            if _cat:
+                parts.append(f"category={_cat}")
+            if s.get("classifier_reason"):
+                parts.append(s["classifier_reason"])
+            if not off_grid:
+                parts.append(f"on grid {grid_ref}" if grid_ref else "on grid intersection")
+            else:
+                parts.append("off grid")
+            if has_label_match:
+                parts.append(f"matched profile label '{matched_profile}'")
+            if len(unique_ends) >= 2:
+                parts.append(f"{len(unique_ends)} beam ends frame in")
+            parts.append(f"confidence {ctx_score:.2f}")
+            return "; ".join(parts)
+
+        if not ctx_passed and not has_label_match:
+            rejected += 1
+            _LAST_COLUMN_VALIDATION_LOG.append({
+                "cx": cx, "cy": cy, "category": s.get("category"),
+                "outcome": "rejected", "stage": "validation_engine",
+                "ctx_score": ctx_score, "ctx_signals": ctx_signals,
+                "has_label_match": has_label_match,
+                "beam_end_count": len(unique_ends), "off_grid": off_grid,
+                "classifier_confidence": s.get("classifier_confidence"),
+                "reason": "Rejected: " + _reason_parts(),
+            })
+            continue
+
+        _LAST_COLUMN_VALIDATION_LOG.append({
+            "cx": cx, "cy": cy, "category": s.get("category"),
+            "outcome": "accepted", "stage": "validation_engine",
+            "ctx_score": ctx_score, "ctx_signals": ctx_signals,
+            "has_label_match": has_label_match,
+            "beam_end_count": len(unique_ends), "off_grid": off_grid,
+            "classifier_confidence": s.get("classifier_confidence"),
+            "reason": "Accepted: " + _reason_parts(),
+        })
+
+        score = ctx_score
+        status = 'active' if score >= column_validation_engine.REVIEW_FLOOR else 'need_review'
+
+        # error_flags drives the 2D overlay's red "needs attention" styling
+        # (ColumnSymbol.tsx: any flag other than "suggested" -> red). "no_label"
+        # and "orphan" were written for FRAMING-plan columns, where a real
+        # column normally has both a size label AND beams framing into it, so
+        # missing either is a genuine anomaly worth flagging red. On a
+        # foundation plan neither is true by design -- profile lives on a
+        # separate Column Schedule sheet (never a label here) and there are
+        # no beams on this sheet type at all -- so every single legitimate
+        # footing column tripped both flags unconditionally, turning the
+        # entire sheet red instead of highlighting real problems. SteelGenie
+        # doesn't do this either: verified live, their guessed/no-label
+        # columns render with the same plain symbol as any other column: the
+        # "guessed" signal only shows up in the properties panel (status +
+        # warning icon), not as a loud 2D overlay color.
+        error_flags = []
+        if off_grid:
+            error_flags.append("no_grid")
+        if not is_foundation_plan:
+            if not has_label_match:
+                error_flags.append("no_label")
+            if len(unique_ends) < 2:
+                error_flags.append("orphan")
+
+        # v_idx/h_idx/grid_ref already computed above, before _reason_parts().
+
         added.append((px, py))
+
+        # Stage 3 (2026-07-17 rebuild, live-verified against the real
+        # SteelGenie app): on a real foundation plan, the footing outline
+        # ("F80 (-1.50')") and the column that lands on it (short diagonal
+        # I-icon + profile, "W12X53") are TWO linked records, not one. This
+        # codebase's shape detection still clusters the outline and the
+        # inner tick-mark sub-paths into a single geometric symbol before
+        # classification ever runs (see column_symbol_classifier.py's rule
+        # 6b docstring for why that's still correct for DETECTION) -- this
+        # is the point where that merged detection is split back into two
+        # separate members again: a kind="footing" record and a
+        # kind="column" record, sharing one linked_group_id so the 3D
+        # viewer/BOM can associate them later. Every OTHER category
+        # (steel_column, pile_cap, concrete_column, etc.) is unchanged --
+        # still emitted as the single column member it always was, so this
+        # is additive to foundation-plan footing symbols specifically, not
+        # a rewrite of column emission overall.
+        _category = s.get("category")
+
+        # Stage 6 Part 2 (2026-07-17, live-verified against real SteelGenie):
+        # the shape-acceptance rule(s) that got a candidate through
+        # detection are a far more reliable "what icon should this render
+        # as" signal than refine_column_geometry's symbol_type, which
+        # defaults to "I" for almost any non-circle/non-bare-rect shape --
+        # including a plain 4-line footing outline (see the _accept_rules
+        # comment above). A footing_isolated match is ALWAYS an outline box
+        # in the real drawing, so force "BOX" for it regardless of what
+        # symbol_type guessed. Also carry the real detected bounding-box
+        # size through (as a page-fraction, same units as x/y) so the 2D
+        # overlay can size the box glyph to the ACTUAL mark instead of a
+        # generic fixed square -- exactly what the user flagged as missing.
+        _real_symbol = "BOX" if _category == "footing_isolated" else s.get("symbol", "I")
+        _sym_w_frac = round((s.get("bbox_w") or 0.0) / page_w, 4)
+        _sym_h_frac = round((s.get("bbox_h") or 0.0) / page_h, 4)
+
+        if _category == "footing_isolated":
+            import uuid as _uuid_mod
+            linked_group_id = str(_uuid_mod.uuid4())
+            members.append({
+                "profile": None, "type": "footing", "length_ft": 0.0,
+                "beam_dir": None,
+                "bx1": None, "by1": None, "bx2": None, "by2": None,
+                "x":  round(px / page_w, 4), "y":  round(py / page_h, 4),
+                "lx": round(px / page_w, 4), "ly": round(py / page_h, 4),
+                "sx": round(px / page_w, 4), "sy": round(py / page_h, 4),
+                "rotation": s.get("rotation", 0),
+                "source": "vector_symbol",
+                "status": status,
+                "geometry": {
+                    "x": round(px / page_w, 4),
+                    "y": round(py / page_h, 4),
+                    "raw_x": round(raw_x / page_w, 4),
+                    "raw_y": round(raw_y / page_h, 4),
+                    "grid_ref": grid_ref,
+                    "symbol": _real_symbol,
+                    "sym_w": _sym_w_frac,
+                    "sym_h": _sym_h_frac,
+                    "category": _category,
+                    "linked_group_id": linked_group_id,
+                    "linked_role": "footing",
+                    "error_flags": error_flags,
+                },
+                "w": 0.02, "h": 0.02,
+                "color": MEMBER_COLORS.get("footing", MEMBER_COLORS["column"]), "confirmed": True,
+                "is_column": False, "size_unknown": True,
+            })
+        else:
+            linked_group_id = None
+
         members.append({
             "profile": matched_profile, "type": "column", "length_ft": 0.0,
             "beam_dir": None,
@@ -4217,13 +5423,31 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                 "raw_y": round(raw_y / page_h, 4),
                 "snap_offset_ft": round(math.hypot(px - raw_x, py - raw_y) / pts_per_foot, 2) if pts_per_foot > 0 else 0.0,
                 "grid_ref": grid_ref,
-                "symbol": s.get("symbol", "I"),
+                # A column linked to a footing is the small diagonal I/H
+                # tick mark next to the footing box in the real drawing, not
+                # the outline itself -- detection can't yet tell that tick
+                # apart from the outline (same merged cluster, see the
+                # comment above), so it keeps the small fixed-size I/H icon
+                # rather than inheriting the footing's real (much larger)
+                # bounding box. A standalone column (no linked footing) IS
+                # its own real detected shape, so it gets the real size.
+                "symbol": s.get("symbol", "I") if linked_group_id else _real_symbol,
+                "sym_w": None if linked_group_id else _sym_w_frac,
+                "sym_h": None if linked_group_id else _sym_h_frac,
                 "depth_in": round(s.get("depth_in", 12.0), 1),
+                "category": _category,
+                "linked_group_id": linked_group_id,
+                "linked_role": "column" if linked_group_id else None,
                 "error_flags": error_flags,
+                # Matches SteelGenie's own "Section size of this member is
+                # guessed by the Steel Genie" warning -- true whenever this
+                # column had no real profile label of its own and got the
+                # best-guess profile (_guessed_profile) instead.
+                "guessed": not has_label_match,
             },
             "w": 0.018, "h": 0.018,
             "color": MEMBER_COLORS["column"], "confirmed": True,
-            "is_column": True, "size_unknown": True if matched_profile == "COL" else False,
+            "is_column": True, "size_unknown": not has_label_match,
         })
 
     # ── Emit Suggested Ghost Columns ──────────────────────────────────────────
@@ -4289,6 +5513,23 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     print(f"[COLUMNS] emitted {len(added)} symbol columns "
           f"(rejected {rejected} fp — < {MIN_BEAMS} beam endpoints; "
           f"scale_ratio={scale_ratio}  FRAME={FRAME_IN}\" real  SNAP={SNAP_IN}\" real)")
+
+    # Diagnostic-only: persist the validation log to a file rather than a
+    # module-level global. A background-task worker can end up running this
+    # function under a DIFFERENT `main` module object than the one a debug
+    # endpoint's `import main` resolves to (Python treats the app's own
+    # entrypoint module, __main__, as a separate identity from a later
+    # `import main` of the same file) -- a plain in-memory global silently
+    # diverges between the two, so the debug endpoint would always read back
+    # an empty list even though this function ran and populated its own
+    # copy. A file on disk has no such identity split.
+    try:
+        import json as _json
+        _log_path = os.path.join(os.path.dirname(__file__), "_column_validation_debug.json")
+        with open(_log_path, "w") as _f:
+            _json.dump(_LAST_COLUMN_VALIDATION_LOG, _f)
+    except Exception as _exc:
+        print(f"[COLUMNS] could not write validation debug log: {_exc}")
     return members
 
 
@@ -5207,6 +6448,10 @@ async def analyse_pdf(req: AnalysisRequest):
         plan_bounds = find_plan_boundary(page, page_w, page_h, text_dict=text_dict)
 
         # 2. Detect column symbols (I/H shapes in vector paths) — fallback to CV for raster
+        # Default False so the raster branch below (which has no text layer
+        # to check) safely falls back to framing-plan behavior rather than
+        # leaving this undefined.
+        _is_foundation_plan = False
         if is_raster:
             column_symbols = []
             try:
@@ -5237,11 +6482,25 @@ async def analyse_pdf(req: AnalysisRequest):
             except Exception as e:
                 print(f"[ANALYSE] Raster column CV detection failed: {e}")
         else:
-            column_symbols = detect_column_symbols(page, scale_ratio=req.scale_ratio or 96)
+            # Foundation/footing plans mark column bases with an unfilled
+            # diamond/square outline (F1, P1, ...), not the solid-black steel
+            # column plan mark this detector otherwise looks for -- see
+            # detect_column_symbols' is_foundation_plan docstring note.
+            _page_text_upper = page.get_text().upper()
+            _is_foundation_plan = "FOUNDATION PLAN" in _page_text_upper or "FOUNDATION FRAMING" in _page_text_upper
+            column_symbols = detect_column_symbols(page, scale_ratio=req.scale_ratio or 96, is_foundation_plan=_is_foundation_plan,
+                                                   plan_bounds=plan_bounds)
 
-        # 3. Grid lines — SECONDARY signal
-        v_grid, h_grid = extract_grid_lines(page, page_w, page_h, plan_bounds,
-                                            text_dict=text_dict)
+        # 3. Grid lines — SECONDARY signal. v_labels/h_labels map each
+        # position to its REAL bubble text (e.g. "1", "2.3", "A") read
+        # straight off the sheet, when the text-based detection path found
+        # it. Geometric fallback paths below (raster morphological / column-
+        # symbol-derived) have no text to offer, so they clear the label map
+        # for that axis -- callers must treat a missing label as "no real
+        # label available" rather than inventing one.
+        v_grid, h_grid, v_labels, h_labels = extract_grid_lines(
+            page, page_w, page_h, plan_bounds, text_dict=text_dict
+        )
 
         # 3b. For raster images, replace text-derived grid with morphological
         #     line detection: finds the actual drawn structural column lines
@@ -5250,8 +6509,20 @@ async def analyse_pdf(req: AnalysisRequest):
             rv, rh = detect_raster_grid_lines(tmp_path, plan_bounds)
             if rv:
                 v_grid = rv
+                v_labels = {}
             if rh:
                 h_grid = rh
+                h_labels = {}
+
+        # 3a-2. Foundation-plan mark-label-proximity filtering, now that the
+        # real grid lines are available to derive a bay-relative search
+        # radius from -- see filter_foundation_symbols_by_marks() docstring.
+        # Must run BEFORE the symbol-derived grid fallback below, so that any
+        # remaining false-positive symbols don't get baked into v_grid/h_grid.
+        if _is_foundation_plan:
+            column_symbols = filter_foundation_symbols_by_marks(
+                column_symbols, page, v_grid, h_grid, is_foundation_plan=True
+            )
 
         # 3c. If v_grid or h_grid is empty, derive from column symbol positions.
         #     Vertical framing elevations often have no text grid labels, so
@@ -5472,7 +6743,8 @@ async def analyse_pdf(req: AnalysisRequest):
         _col_scale = req.scale_ratio or 96
         members = emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                                       page_w, page_h, scale_ratio=_col_scale,
-                                      pts_per_foot=pts_per_foot, profiles=profiles)
+                                      pts_per_foot=pts_per_foot, profiles=profiles,
+                                      is_foundation_plan=_is_foundation_plan)
         # COL text label columns — placed at beam convergence, not at label text.
         members = extract_col_text_columns(page, page_w, page_h, members,
                                            v_grid=v_grid, h_grid=h_grid,
@@ -5583,6 +6855,88 @@ async def analyse_pdf(req: AnalysisRequest):
             else:
                 print("[BRACE] brace_classifier not available — skipping")
 
+        # ── FOUNDATION PLAN: keep ONLY footings + columns ─────────────────────
+        # User directive (2026-07-20, repeated and explicit): "from the
+        # foundation plan extract only column as well as footing ... don't
+        # extract anything like beam, joist from the foundation plan ... mark
+        # exactly on the top of the column". A foundation plan's job is to
+        # locate footings/piers/columns -- the "beams" the generic detector
+        # pulls off it are really the wall/grid/dimension lines, which the
+        # user does not want. So on a foundation plan we DISCARD every beam/
+        # joist/brace/suggested member the pipeline built, and REPLACE the
+        # column/footing set with the grid-intersection detector, which places
+        # each marker dead-center on the real footing (the grid intersection,
+        # where the sheet itself says every column is centered). Framing plans
+        # are completely untouched by this block.
+        if _is_foundation_plan and not is_raster:
+            try:
+                _foots = detect_foundation_footings_grid(
+                    page, plan_bounds, scale_ratio=req.scale_ratio or 96)
+            except Exception as _fe:
+                print(f"[FOUNDATION] grid detector error (non-fatal): {_fe}")
+                _foots = []
+            if _foots:
+                import uuid as _uuid_mod
+                _new_members = []
+                for _f in _foots:
+                    _px, _py = _f["cx"], _f["cy"]
+                    _xf = round(_px / page_w, 4)
+                    _yf = round(_py / page_h, 4)
+                    _grp = str(_uuid_mod.uuid4())
+                    # Footing record (the outline box in the drawing).
+                    _new_members.append({
+                        "profile": None, "type": "footing", "length_ft": 0.0,
+                        "beam_dir": None,
+                        "bx1": None, "by1": None, "bx2": None, "by2": None,
+                        "x": _xf, "y": _yf, "lx": _xf, "ly": _yf,
+                        "sx": _xf, "sy": _yf,
+                        "rotation": 0, "source": "grid_footing",
+                        "status": "need_review",
+                        "geometry": {
+                            "x": _xf, "y": _yf, "raw_x": _xf, "raw_y": _yf,
+                            "grid_ref": _f["grid_ref"], "symbol": "BOX",
+                            "category": "footing_isolated",
+                            "linked_group_id": _grp, "linked_role": "footing",
+                            "error_flags": [],
+                        },
+                        "w": 0.02, "h": 0.02,
+                        "color": MEMBER_COLORS.get("footing", MEMBER_COLORS["column"]),
+                        "confirmed": True, "is_column": False, "size_unknown": True,
+                    })
+                    # Column record (the steel column landing on the footing).
+                    _new_members.append({
+                        "profile": None, "type": "column", "length_ft": 0.0,
+                        "beam_dir": None,
+                        "bx1": None, "by1": None, "bx2": None, "by2": None,
+                        "x": _xf, "y": _yf, "lx": _xf, "ly": _yf,
+                        "sx": _xf, "sy": _yf,
+                        "rotation": 0, "source": "grid_footing",
+                        "status": "need_review",
+                        "geometry": {
+                            "x": _xf, "y": _yf, "raw_x": _xf, "raw_y": _yf,
+                            "grid_ref": _f["grid_ref"], "symbol": "I",
+                            "category": "footing_isolated",
+                            "linked_group_id": _grp, "linked_role": "column",
+                            "error_flags": [], "guessed": True,
+                        },
+                        "w": 0.018, "h": 0.018,
+                        "color": MEMBER_COLORS["column"],
+                        "confirmed": True, "is_column": True, "size_unknown": True,
+                    })
+                members = _new_members
+                print(f"[FOUNDATION] replaced members with {len(_foots)} "
+                      f"footing+column pairs (dropped all beams/joists/braces)")
+            else:
+                # Detector found nothing usable (no clean grid) -- rather than
+                # emit the noisy generic output on a foundation plan, keep only
+                # whatever real footing/column members the old path produced and
+                # still drop the beams/joists/braces the user rejected.
+                members = [m for m in members
+                           if m.get("type") in ("footing", "column")
+                           and m.get("source") != "suggested"]
+                print("[FOUNDATION] grid detector empty; kept "
+                      f"{len(members)} footing/column members, dropped rest")
+
         # ── ROTATION OUTPUT TRANSFORM ─────────────────────────────────────────
         # All member coordinates above are fractions of the UNROTATED page
         # space (page_w × page_h = mediabox for rotated pages).  The image the
@@ -5623,6 +6977,19 @@ async def analyse_pdf(req: AnalysisRequest):
         print(f"[ANALYSE] {len(members)} members in {elapsed}s — {counts}")
 
         doc.close()
+
+        # Real grid bubble labels (e.g. "1", "2.3", "A") read straight off
+        # this sheet, as fractions of page width/height -- same convention as
+        # members' bx1/by1/bx2/by2 -- so the multi-sheet registration layer
+        # can persist the sheet's ACTUAL grid instead of guessing sequential
+        # numbers. Entries with no real detected label (geometric-fallback
+        # positions) are still included with label=None so callers know a
+        # line exists there even without a confirmed name.
+        grid_bubbles = {
+            "v": [{"position": round(x / page_w, 4), "label": v_labels.get(x)} for x in (v_grid or [])],
+            "h": [{"position": round(y / page_h, 4), "label": h_labels.get(y)} for y in (h_grid or [])],
+        }
+
         return {
             "members":         members,
             "summary":         summary,
@@ -5630,6 +6997,20 @@ async def analyse_pdf(req: AnalysisRequest):
             "elapsed":         elapsed,
             "elapsed_seconds": elapsed,
             "count":           len(members),
+            "grid_bubbles":    grid_bubbles,
+            # Verified live against the real SteelGenie reference app
+            # (2026-07-17 behavioral study, two separate projects): a
+            # foundation-plan sheet asks for "Bottom of Column", not "Top
+            # of Steel" -- different physical quantity (where a column
+            # STARTS vs. where a floor's steel sits), same convention
+            # CalSteel should match. _is_foundation_plan is already
+            # computed above (same "FOUNDATION PLAN"/"FOUNDATION FRAMING"
+            # text check that gates the foundation-outline symbol rules),
+            # just not previously surfaced past this function. Purely
+            # informational here -- frontend label + backend elevation
+            # math both stay exactly as they are; see analyse.py for where
+            # this gets persisted onto the page row.
+            "is_foundation_plan": _is_foundation_plan,
         }
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -5657,6 +7038,7 @@ async def save_project(req: SaveProjectRequest):
                 projects = _json.load(f)
         except Exception:
             projects = []
+
 
     entry = {
         "id":           str(_uuid.uuid4()),

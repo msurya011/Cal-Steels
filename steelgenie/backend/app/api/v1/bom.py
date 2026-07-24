@@ -140,6 +140,93 @@ async def get_bom_summary(
     )
 
 
+@router.get("/projects/{project_id}/bom/model-summary")
+async def get_model_summary(
+    project_id: UUID,
+    user: AuthUser,
+    page_id: Optional[UUID] = Query(None, description="If set, returns a Sheet Summary scoped to this page instead of the whole project"),
+):
+    """Project Summary / Sheet Summary breakdown for the 3D viewer's
+    Properties panel: Column/Beam/VBrace/HBrace/Joists/Moment Connection/
+    Bolt/Embed Plate/Camber/Anchor/Weld Studs/Total Weight/Hrs-per-Ton.
+
+    Camber, Weld Studs and Total Weight come straight from bom_items (real
+    data). Moment Connection is counted from members.geometry.connections
+    (added for the Properties-panel Connections editor). Anchor is counted
+    from column_groups.anchors. Bolt and Embed Plate are not extracted by
+    the CV pipeline yet, so they report 0 rather than a fabricated number --
+    same convention as SteelGenie's own "WIP" hrs/ton when the figure isn't
+    computable yet.
+    """
+    db = get_db()
+
+    sheet_filter: Optional[str] = None
+    page_ids_for_moment_count: list[str]
+    if page_id:
+        page = db.table("pages").select("*").eq("id", str(page_id)).maybe_single().execute().data
+        if not page:
+            raise HTTPException(status_code=404, detail="Page not found")
+        drawing = db.table("drawings").select("*").eq("id", page["drawing_id"]).maybe_single().execute().data
+        drawing_filename = (drawing or {}).get("filename") or "Drawing"
+        sheet_filter = f"{drawing_filename} — Page {page.get('idx', 0) + 1}"
+        page_ids_for_moment_count = [str(page_id)]
+    else:
+        drawings = db.table("drawings").select("id").eq("project_id", str(project_id)).execute().data or []
+        drawing_ids = [d["id"] for d in drawings]
+        page_ids_for_moment_count = []
+        if drawing_ids:
+            pgs = db.table("pages").select("id").in_("drawing_id", drawing_ids).execute().data or []
+            page_ids_for_moment_count.extend(p["id"] for p in pgs)
+
+    q = db.table("bom_items").select("*").eq("project_id", str(project_id))
+    if sheet_filter:
+        q = q.eq("sheet", sheet_filter)
+    items = q.execute().data or []
+
+    def _cat_count(cat: str) -> int:
+        return sum((r.get("qty") or 1) for r in items if r.get("category") == cat)
+
+    total_lbs = sum((r.get("weight_lbs") or 0) * (r.get("qty") or 1) for r in items)
+    camber_total = sum((r.get("camber") or 0) * (r.get("qty") or 1) for r in items)
+    weld_studs_total = sum((r.get("weld_studs") or 0) for r in items)
+
+    moment_connections = 0
+    if page_ids_for_moment_count:
+        all_members = db.table("members").select("geometry").in_("page_id", page_ids_for_moment_count).neq("status", "excluded").execute().data or []
+        for m in all_members:
+            conns = ((m.get("geometry") or {}).get("connections")) or {}
+            for side in ("left", "right"):
+                if (conns.get(side) or {}).get("type") == "Moment":
+                    moment_connections += 1
+
+    anchors_total = 0
+    if not page_id:
+        groups = db.table("column_groups").select("*").eq("project_id", str(project_id)).execute().data or []
+        for g in groups:
+            anchors = g.get("anchors")
+            if isinstance(anchors, list):
+                anchors_total += len(anchors)
+            elif isinstance(anchors, dict) and anchors.get("count"):
+                anchors_total += int(anchors["count"])
+
+    return {
+        "scope": "sheet" if page_id else "project",
+        "column": _cat_count("Columns"),
+        "beam": _cat_count("Beams"),
+        "vertical_brace": _cat_count("Vertical Braces"),
+        "horizontal_brace": _cat_count("Horizontal Braces"),
+        "joists": _cat_count("Joists"),
+        "moment_connection": moment_connections,
+        "bolt": 0,
+        "embed_plate": 0,
+        "camber": round(camber_total, 2),
+        "anchor": anchors_total,
+        "weld_studs": weld_studs_total,
+        "total_weight_tons": round(total_lbs / 2000, 2),
+        "hrs_per_ton": None,
+    }
+
+
 @router.post("/projects/{project_id}/bom/generate")
 async def generate_bom_from_members(project_id: UUID, user: AuthUser):
     """

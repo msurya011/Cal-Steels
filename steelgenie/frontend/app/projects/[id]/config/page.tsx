@@ -25,7 +25,11 @@ function Field({ label, badge, help, children }: { label: string; badge?: { text
       <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
         <label style={{ fontSize: '11px', color: '#94A3B8', fontWeight: 600 }}>{label}</label>
         {badge && <Badge text={badge.text} color={badge.color} />}
-        {help && <Info size={11} color="#475569" title={help} />}
+        {help && (
+          <span title={help} style={{ cursor: 'help', display: 'inline-flex', alignItems: 'center' }}>
+            <Info size={11} color="#475569" />
+          </span>
+        )}
       </div>
       {children}
     </div>

@@ -110,6 +110,16 @@ export const projectsApi = {
     apiFetch(`/api/v1/projects/${id}/clone`, {
       method: 'POST',
     }),
+  listFolders: () => apiFetch('/api/v1/projects/folders'),
+  createFolder: (name: string) =>
+    apiFetch('/api/v1/projects/folders', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+  deleteFolder: (id: string) =>
+    apiFetch(`/api/v1/projects/folders/${id}`, {
+      method: 'DELETE',
+    }),
 }
 
 // ── DRAWINGS & PAGES API ─────────────────────────────────────────────────────
@@ -120,6 +130,11 @@ export const drawingsApi = {
   updatePage: (pageId: string, data: any) =>
     apiFetch(`/api/v1/pages/${pageId}`, {
       method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  createBlankPages: (projectId: string, data: { page_count: number; paper_size: string; scale_label: string; scale_num: number }) =>
+    apiFetch(`/api/v1/projects/${projectId}/pages/blank`, {
+      method: 'POST',
       body: JSON.stringify(data),
     }),
 }
@@ -173,6 +188,8 @@ export const bomApi = {
     return apiFetch(`/api/v1/projects/${projectId}/bom/summary${qs ? '?' + qs : ''}`)
   },
   facets: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/bom/facets`),
+  modelSummary: (projectId: string, pageId?: string) =>
+    apiFetch(`/api/v1/projects/${projectId}/bom/model-summary${pageId ? `?page_id=${pageId}` : ''}`),
   generate: (projectId: string) =>
     apiFetch(`/api/v1/projects/${projectId}/bom/generate`, {
       method: 'POST',
@@ -209,10 +226,36 @@ export const schedulersApi = {
 
 // ── MODEL API ────────────────────────────────────────────────────────────────
 export const modelApi = {
-  get: (projectId: string, pageId: string, ratio = 96, elev = 12) =>
+  // Legacy per-page model endpoint -- superseded by `merged` below, which is
+  // what the 3D viewer actually uses. Left unused/uncalled; floor_elevation_ft
+  // has no default here or on the backend since T.O.S. is always per-drawing
+  // user input, never a guessed constant.
+  get: (projectId: string, pageId: string, floorElevationFt: number, ratio = 96) =>
     apiFetch(
-      `/api/v1/projects/${projectId}/model?page_id=${pageId}&scale_ratio=${ratio}&floor_elevation_ft=${elev}`
+      `/api/v1/projects/${projectId}/model?page_id=${pageId}&scale_ratio=${ratio}&floor_elevation_ft=${floorElevationFt}`
     ),
+  merged: (projectId: string, scope: 'building' | 'floor' | 'sheet' = 'building', scopeId?: string) =>
+    apiFetch(
+      `/api/v1/projects/${projectId}/model/merged?scope=${scope}${scopeId ? `&scope_id=${scopeId}` : ''}`
+    ),
+}
+
+// ── FLOORS API ───────────────────────────────────────────────────────────────
+export const floorsApi = {
+  list: (projectId: string) => apiFetch(`/api/v1/projects/${projectId}/floors`),
+  autoCluster: (projectId: string) =>
+    apiFetch(`/api/v1/projects/${projectId}/floors/auto-cluster`, { method: 'POST' }),
+  registerAll: (projectId: string, force = false) =>
+    apiFetch(`/api/v1/projects/${projectId}/floors/register-all?force=${force}`, { method: 'POST' }),
+  register: (floorId: string) =>
+    apiFetch(`/api/v1/floors/${floorId}/register`, { method: 'POST' }),
+  assignPageFloor: (pageId: string, floorId: string, zoneLabel?: string) =>
+    apiFetch(`/api/v1/pages/${pageId}/floor`, {
+      method: 'PATCH',
+      body: JSON.stringify({ floor_id: floorId, zone_label: zoneLabel }),
+    }),
+  overrideRegistration: (pageId: string, data: { tx_ft?: number; ty_ft?: number; rotation_deg?: number }) =>
+    apiFetch(`/api/v1/pages/${pageId}/registration`, { method: 'PATCH', body: JSON.stringify(data) }),
 }
 
 // ── CONFIG API ───────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { Trash2, Check, AlertTriangle, Layers, Copy, RotateCcw, RotateCw, ChevronDown, ChevronRight, Lock, Unlock, Info } from 'lucide-react'
-import { sectionsApi } from '../../../lib/api'
+import { sectionsApi } from '../../../../lib/api'
 import { toast } from 'sonner'
 
 interface Member {
@@ -24,7 +24,9 @@ interface PropertiesPanelProps {
   onBulkUpdate: (ids: string[], data: any) => Promise<void>
   onBulkDelete: (ids: string[]) => Promise<void>
   onClose: () => void
-  pageTos: number
+  // null when the sheet's T.O.S. hasn't been entered yet -- never a silent
+  // default. formatFtIn(null) renders "Not set" instead of guessing 12'-0".
+  pageTos: number | null
 }
 
 // Helper to format decimal feet values into standard Ft'-In Fraction"
@@ -415,7 +417,9 @@ export function PropertiesPanel({
                   style={{ cursor: 'pointer', width: '14px', height: '14px' }}
                 />
                 {label}
-                <Info size={11} color="#475569" title={tip} />
+                <span title={tip} style={{ cursor: 'help', display: 'inline-flex', alignItems: 'center' }}>
+                  <Info size={11} color="#475569" />
+                </span>
               </label>
             ))}
           </div>
@@ -938,7 +942,15 @@ export function PropertiesPanel({
             {/* Section Size Autocomplete */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', position: 'relative' }} ref={dropdownRef}>
               <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>
-                Section Size {!section && <AlertTriangle size={12} style={{ display: 'inline', color: '#EF4444', marginLeft: '4px' }} />}
+                Section Size{' '}
+                {!section && <AlertTriangle size={12} style={{ display: 'inline', color: '#EF4444', marginLeft: '4px' }} />}
+                {/* Matches SteelGenie's own warning icon on a symbol-only
+                    column whose size was guessed (no real label on the
+                    sheet) rather than read off the drawing -- see
+                    emit_symbol_columns()'s geometry.guessed flag. */}
+                {!!section && member?.geometry?.guessed && (
+                  <AlertTriangle size={12} style={{ display: 'inline', color: '#F59E0B', marginLeft: '4px' }} />
+                )}
               </label>
               <input
                 value={section}
@@ -953,7 +965,9 @@ export function PropertiesPanel({
                 style={{
                   padding: '8px 10px',
                   backgroundColor: 'rgba(30, 41, 59, 0.8)',
-                  border: section ? '1px solid rgba(59, 130, 246, 0.15)' : '1px solid #EF4444',
+                  border: section
+                    ? (member?.geometry?.guessed ? '1px solid rgba(245, 158, 11, 0.4)' : '1px solid rgba(59, 130, 246, 0.15)')
+                    : '1px solid #EF4444',
                   borderRadius: '6px',
                   color: '#F1F5F9',
                   fontSize: '13px',
@@ -963,6 +977,11 @@ export function PropertiesPanel({
               {!section && (
                 <span style={{ fontSize: '11px', color: '#F59E0B', marginTop: '2px', fontWeight: 600 }}>
                   {kind[0].toUpperCase() + kind.slice(1)} section size is empty
+                </span>
+              )}
+              {!!section && member?.geometry?.guessed && (
+                <span style={{ fontSize: '11px', color: '#F59E0B', marginTop: '2px', fontWeight: 600 }}>
+                  Section size of this member is guessed by CalSteel
                 </span>
               )}
               {showSuggestions && suggestions.length > 0 && (

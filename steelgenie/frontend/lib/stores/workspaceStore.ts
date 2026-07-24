@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export type ToolType = 'select' | 'hand' | 'ruler' | 'marker' | 'column' | 'beam' | 'brace'
+export type ToolType = 'select' | 'hand' | 'ruler' | 'marker' | 'column' | 'beam' | 'brace' | 'joist' | 'hbrace' | 'crop' | 'text' | 'rectangle' | 'line' | 'polyline'
 
 export interface Point {
   x: number
@@ -19,6 +19,41 @@ export interface RulerLine {
   y1: number
   x2: number
   y2: number
+}
+
+export interface TextMarker {
+  id: string
+  x: number
+  y: number
+  text: string
+}
+
+// Rectangle / Line / Polyline markup shapes -- SteelGenie's Annotate flyout.
+export interface ShapeMarker {
+  id: string
+  kind: 'rectangle' | 'line' | 'polyline'
+  points: Point[]
+}
+
+// A popped undo/redo entry carries enough of the removed item to restore it
+// on redo -- storing just the type (as the old undoStack did) loses the
+// data needed to put it back.
+type HistoryEntry =
+  | { type: 'marker'; data: Point }
+  | { type: 'ruler'; data: RulerLine }
+  | { type: 'text'; data: TextMarker }
+
+// SteelGenie-style itemized activity log ("Resize B_184", "Move B_9", "Add
+// text"...) shown in the History panel -- distinct from undoStack/redoStack
+// above, which only exist to make Ctrl+Z work for annotation markup. This
+// log is purely informational (no revert-to-this-point yet), covering
+// member edits too so every action taken on a sheet is visible in one place.
+export type HistoryLogKind = 'move' | 'resize' | 'add' | 'edit' | 'delete' | 'text' | 'marker' | 'ruler' | 'shape'
+export interface HistoryLogEntry {
+  id: string
+  ts: number
+  kind: HistoryLogKind
+  label: string
 }
 
 export interface LayerPreset {
@@ -40,7 +75,7 @@ export interface LayerPreset {
     columnProjections: boolean
     lengthFilter: boolean
   }
-  colorMode: 'kind' | 'status' | 'confidence' | 'section'
+  colorMode: 'kind' | 'status' | 'sequence' | 'weight' | 'labor_code' | 'paint'
 }
 
 export interface LayersState {
@@ -61,7 +96,7 @@ export interface LayersState {
     columnProjections: boolean
     lengthFilter: boolean
   }
-  colorMode: 'kind' | 'status' | 'confidence' | 'section'
+  colorMode: 'kind' | 'status' | 'sequence' | 'weight' | 'labor_code' | 'paint'
   activePresetId: string | null
   hiddenLegendKeys: Set<string>
 }
@@ -72,7 +107,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'All',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -93,7 +128,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'Steel only',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
     aids: {
       markers: false,
       rulers: false,
@@ -114,7 +149,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'QA pass',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -128,14 +163,14 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       columnProjections: true,
       lengthFilter: false,
     },
-    colorMode: 'confidence'
+    colorMode: 'status'
   },
   {
     id: 'preset-braces',
     name: 'Braces check',
     classVisibility: { beam: false, column: false, vbrace: true, hbrace: true, joist: false, unlabelled: false },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -177,7 +212,7 @@ const getInitialLayers = (): LayersState => {
   return {
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1.0, column: 1.0, vbrace: 1.0, hbrace: 1.0, joist: 1.0, unlabelled: 1.0 },
-    classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
     planVisible: true,
     aids: {
       markers: true,
@@ -243,8 +278,31 @@ interface WorkspaceState {
   rulerDragging: boolean
   markerDots: Point[]
   rulerLines: RulerLine[]
-  undoStack: ('marker' | 'ruler')[]
+  undoStack: ('marker' | 'ruler' | 'text')[]
+  redoStack: HistoryEntry[]
+  historyLog: HistoryLogEntry[]
+  pushHistoryLog: (kind: HistoryLogKind, label: string) => void
+  clearHistoryLog: () => void
+  // Pages with a member edited since their last Extract/Build -- flagged
+  // "Requesting Build" in the sheet rail until the user re-runs extraction,
+  // matching SteelGenie's behavior of never silently letting a built sheet's
+  // BOM/3D data drift out of sync with a manual edit.
+  dirtyPageIds: Set<string>
+  markPageDirty: (pageId: string) => void
+  clearPageDirty: (pageId: string) => void
+  textMarkers: TextMarker[]
+  shapeMarkers: ShapeMarker[]
+  addShapeMarker: (kind: ShapeMarker['kind'], points: Point[]) => void
+  removeShapeMarker: (id: string) => void
+  resetViewSignal: number
   selectedMemberId: string | null
+  
+  // Drag State for Interactive Editing
+  draggingMemberId: string | null
+  dragEndpoint: 'start' | 'end' | null
+  dragOffset: Point | null
+  setDraggingMember: (id: string | null, endpoint: 'start' | 'end' | null, offset: Point | null) => void
+
   activeTab: 'Plans' | 'BOM'
   currentPageId: string | null
   currentPageIndex: number
@@ -265,6 +323,22 @@ interface WorkspaceState {
   layers: LayersState
   presets: LayerPreset[]
 
+  // 3D split view — single source of truth shared between the project
+  // layout (top-right "3D" toggle, persistent across every sub-route) and
+  // the Plans page (which needs to hide its own right-side panels while
+  // it's open, and to trigger a rebuild when a page's T.O.S. changes).
+  show3d: boolean
+  modelRefreshSignal: number
+  // Which page's members most recently changed (edit/create/delete), if any
+  // -- lets the 3D viewer force-refresh just that page's geometry instead of
+  // silently no-op'ing (addPageMembers skips pages it already loaded unless
+  // told force=true, which is correct for "don't re-add a page that hasn't
+  // changed" but wrong for "this exact page's member WAS just edited").
+  lastEditedPageId: string | null
+  setShow3d: (show: boolean) => void
+  toggleShow3d: () => void
+  bumpModelRefresh: (pageId?: string) => void
+
   setTool: (tool: ToolType) => void
   setZoom: (zoom: number) => void
   setIsPanning: (panning: boolean) => void
@@ -276,8 +350,14 @@ interface WorkspaceState {
   setRulerDragging: (dragging: boolean) => void
   addMarkerDot: (pt: Point) => void
   addRulerLine: (line: RulerLine) => void
+  addTextMarker: (pt: Point, text: string) => void
+  removeTextMarker: (id: string) => void
+  removeMarkerDot: (index: number) => void
+  removeRulerLine: (index: number) => void
   pushUndo: (type: 'marker' | 'ruler') => void
   popUndo: () => void
+  redo: () => void
+  triggerResetView: () => void
   selectMember: (id: string | null) => void
   setActiveTab: (tab: 'Plans' | 'BOM') => void
   setCurrentPage: (id: string | null, idx: number) => void
@@ -303,7 +383,7 @@ interface WorkspaceState {
   setLayerOpacity: (kind: string, opacity: number) => void
   setLayerColor: (kind: string, hexColor: string) => void
   toggleAid: (aidName: string) => void
-  setColorMode: (mode: 'kind' | 'status' | 'confidence' | 'section') => void
+  setColorMode: (mode: 'kind' | 'status' | 'sequence' | 'weight' | 'labor_code' | 'paint') => void
   applyPreset: (presetId: string) => void
   savePreset: (name: string) => void
   deletePreset: (id: string) => void
@@ -324,7 +404,36 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   markerDots: [],
   rulerLines: [],
   undoStack: [],
+  redoStack: [],
+  textMarkers: [],
+  shapeMarkers: [],
+  addShapeMarker: (kind, points) =>
+    set((state) => ({
+      shapeMarkers: [...state.shapeMarkers, { id: `shape-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, kind, points }],
+    })),
+  removeShapeMarker: (id) => set((state) => ({ shapeMarkers: state.shapeMarkers.filter((s) => s.id !== id) })),
+  historyLog: [],
+  pushHistoryLog: (kind, label) =>
+    set((state) => ({
+      historyLog: [
+        ...state.historyLog,
+        { id: `hist-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ts: Date.now(), kind, label },
+      ],
+    })),
+  clearHistoryLog: () => set({ historyLog: [] }),
+  dirtyPageIds: new Set(),
+  markPageDirty: (pageId) => set((state) => ({ dirtyPageIds: new Set(state.dirtyPageIds).add(pageId) })),
+  clearPageDirty: (pageId) =>
+    set((state) => {
+      const next = new Set(state.dirtyPageIds)
+      next.delete(pageId)
+      return { dirtyPageIds: next }
+    }),
+  resetViewSignal: 0,
   selectedMemberId: null,
+  draggingMemberId: null,
+  dragEndpoint: null,
+  dragOffset: null,
   activeTab: 'Plans',
   currentPageId: null,
   currentPageIndex: 0,
@@ -344,6 +453,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   layers: getInitialLayers(),
   presets: getInitialPresets(),
 
+  // Always starts closed — the 3D pane must never appear until the user
+  // explicitly clicks the "3D" button in this session. Previously this read
+  // a persisted localStorage flag, which meant a brand-new/empty project
+  // could open with the 3D split-pane already showing (rendering a bare
+  // spinner on a black background since there was no model yet).
+  show3d: false,
+  modelRefreshSignal: 0,
+  lastEditedPageId: null,
+  setShow3d: (show) => set({ show3d: show }),
+  toggleShow3d: () => set((state) => ({ show3d: !state.show3d })),
+  bumpModelRefresh: (pageId) => set((state) => ({ modelRefreshSignal: state.modelRefreshSignal + 1, lastEditedPageId: pageId ?? state.lastEditedPageId })),
+
+  setDraggingMember: (id, endpoint, offset) => set({ draggingMemberId: id, dragEndpoint: endpoint, dragOffset: offset }),
+
   setTool: (tool) => set({ activeTool: tool }),
   setZoom: (zoom) => set({ zoomLevel: zoom }),
   setIsPanning: (panning) => set({ isPanning: panning }),
@@ -355,7 +478,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   setRulerDragging: (dragging) => set({ rulerDragging: dragging }),
   addMarkerDot: (pt) => set((state) => ({ markerDots: [...state.markerDots, pt] })),
   addRulerLine: (line) => set((state) => ({ rulerLines: [...state.rulerLines, line] })),
-  pushUndo: (type) => set((state) => ({ undoStack: [...state.undoStack, type] })),
+  addTextMarker: (pt, text) =>
+    set((state) => {
+      const marker: TextMarker = { id: `txt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, x: pt.x, y: pt.y, text }
+      return { textMarkers: [...state.textMarkers, marker], undoStack: [...state.undoStack, 'text'] }
+    }),
+  removeTextMarker: (id) => set((state) => ({ textMarkers: state.textMarkers.filter((m) => m.id !== id) })),
+  removeMarkerDot: (index) => set((state) => ({ markerDots: state.markerDots.filter((_, i) => i !== index) })),
+  removeRulerLine: (index) => set((state) => ({ rulerLines: state.rulerLines.filter((_, i) => i !== index) })),
+  pushUndo: (type) => set((state) => ({ undoStack: [...state.undoStack, type], redoStack: [] })),
   popUndo: () =>
     set((state) => {
       const nextStack = [...state.undoStack]
@@ -364,14 +495,35 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
 
       if (last === 'marker') {
         const nextMarkers = [...state.markerDots]
-        nextMarkers.pop()
-        return { undoStack: nextStack, markerDots: nextMarkers }
+        const removed = nextMarkers.pop()
+        const redoStack = removed ? [...state.redoStack, { type: 'marker' as const, data: removed }] : state.redoStack
+        return { undoStack: nextStack, markerDots: nextMarkers, redoStack }
+      } else if (last === 'text') {
+        const nextMarkers = [...state.textMarkers]
+        const removed = nextMarkers.pop()
+        const redoStack = removed ? [...state.redoStack, { type: 'text' as const, data: removed }] : state.redoStack
+        return { undoStack: nextStack, textMarkers: nextMarkers, redoStack }
       } else {
         const nextLines = [...state.rulerLines]
-        nextLines.pop()
-        return { undoStack: nextStack, rulerLines: nextLines }
+        const removed = nextLines.pop()
+        const redoStack = removed ? [...state.redoStack, { type: 'ruler' as const, data: removed }] : state.redoStack
+        return { undoStack: nextStack, rulerLines: nextLines, redoStack }
       }
     }),
+  redo: () =>
+    set((state) => {
+      const nextRedo = [...state.redoStack]
+      const entry = nextRedo.pop()
+      if (!entry) return {}
+      if (entry.type === 'marker') {
+        return { redoStack: nextRedo, markerDots: [...state.markerDots, entry.data], undoStack: [...state.undoStack, 'marker'] }
+      } else if (entry.type === 'text') {
+        return { redoStack: nextRedo, textMarkers: [...state.textMarkers, entry.data], undoStack: [...state.undoStack, 'text'] }
+      } else {
+        return { redoStack: nextRedo, rulerLines: [...state.rulerLines, entry.data], undoStack: [...state.undoStack, 'ruler'] }
+      }
+    }),
+  triggerResetView: () => set((state) => ({ resetViewSignal: state.resetViewSignal + 1, zoomLevel: 1.0 })),
   selectMember: (id) => set({ selectedMemberId: id, selection: id ? new Set([id]) : new Set() }),
   setActiveTab: (tab) => set({ activeTab: tab }),
   setCurrentPage: (id, idx) => set({ currentPageId: id, currentPageIndex: idx }),
@@ -384,7 +536,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
       const defaultLayers = {
         classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
         classOpacity: { beam: 1.0, column: 1.0, vbrace: 1.0, hbrace: 1.0, joist: 1.0, unlabelled: 1.0 },
-        classColors: { column: '#2563EB', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+        classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
         planVisible: true,
         aids: {
           markers: true,
@@ -417,6 +569,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
         markerDots: [],
         rulerLines: [],
         undoStack: [],
+        redoStack: [],
+        textMarkers: [],
+        shapeMarkers: [],
+        historyLog: [],
+        dirtyPageIds: new Set(),
         selectedMemberId: null,
         selection: new Set(),
         hiddenIds: new Set(),
@@ -579,26 +736,55 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
 
 export const getMemberRenderProps = (
   state: { layers: LayersState; hiddenIds: Set<string>; isolation: { kind?: string; ids?: Set<string> } | null },
-  member: { id: string; kind: string; confidence?: number | null; status?: string; section?: string | null }
+  member: {
+    id: string
+    kind: string
+    confidence?: number | null
+    status?: string
+    section?: string | null
+    // Sourced from the matching bom_items row (joined by member_id) once a
+    // build has run -- these are SteelGenie's actual "Color By" fields, not
+    // ones we invented. Null/undefined until Build has produced a BOM.
+    sequence?: number | string | null
+    weight_lbs?: number | null
+    labor_code?: string | null
+    paint?: string | null
+  }
 ) => {
   const { layers, hiddenIds, isolation } = state
   const mKind = member.kind
+
+  const weightTier = (w: number | null | undefined): string => {
+    if (w === null || w === undefined) return 'Unbuilt'
+    if (w < 100) return '< 100 lb'
+    if (w < 300) return '100–300 lb'
+    if (w < 600) return '300–600 lb'
+    return '> 600 lb'
+  }
 
   // 1. Central Legend toggle checks
   if (layers.hiddenLegendKeys && layers.hiddenLegendKeys.size > 0) {
     if (layers.colorMode === 'status' && member.status && layers.hiddenLegendKeys.has(member.status)) {
       return { visible: false, color: '#64748B', opacity: 0 }
     }
-    if (layers.colorMode === 'section' && member.section && layers.hiddenLegendKeys.has(member.section)) {
+    if (layers.colorMode === 'sequence') {
+      const key = member.sequence !== null && member.sequence !== undefined ? String(member.sequence) : 'Unsequenced'
+      if (layers.hiddenLegendKeys.has(key)) {
+        return { visible: false, color: '#64748B', opacity: 0 }
+      }
+    }
+    if (layers.colorMode === 'weight' && layers.hiddenLegendKeys.has(weightTier(member.weight_lbs))) {
       return { visible: false, color: '#64748B', opacity: 0 }
     }
-    if (layers.colorMode === 'confidence') {
-      const conf = member.confidence ?? 0
-      let tier = '<50%'
-      if (conf >= 0.9) tier = '>90%'
-      else if (conf >= 0.7) tier = '>70%'
-      else if (conf >= 0.5) tier = '>50%'
-      if (layers.hiddenLegendKeys.has(tier)) {
+    if (layers.colorMode === 'labor_code') {
+      const key = member.labor_code || 'Unassigned'
+      if (layers.hiddenLegendKeys.has(key)) {
+        return { visible: false, color: '#64748B', opacity: 0 }
+      }
+    }
+    if (layers.colorMode === 'paint') {
+      const key = member.paint || 'Unpainted'
+      if (layers.hiddenLegendKeys.has(key)) {
         return { visible: false, color: '#64748B', opacity: 0 }
       }
     }
@@ -649,34 +835,36 @@ export const getMemberRenderProps = (
     }
   } else {
     // If not isolated, respect colorMode
+    const hashColor = (key: string): string => {
+      let hash = 0
+      for (let i = 0; i < key.length; i++) {
+        hash = key.charCodeAt(i) + ((hash << 5) - hash)
+      }
+      const colors = ['#3B82F6', '#EF4444', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#06B6D4', '#14B8A6']
+      return colors[Math.abs(hash) % colors.length]
+    }
+
     if (layers.colorMode === 'status') {
       if (member.status === 'verified') color = '#10B981'
       else if (member.status === 'rejected') color = '#EF4444'
       else if (member.status === 'need_review') color = '#F59E0B'
       else color = '#64748B'
-    } else if (layers.colorMode === 'confidence') {
-      const conf = member.confidence ?? 0
-      if (conf >= 0.9) color = '#10B981'
-      else if (conf >= 0.7) color = '#3B82F6'
-      else if (conf >= 0.5) color = '#F59E0B'
-      else color = '#EF4444'
-    } else if (layers.colorMode === 'section') {
-      const section = member.section || 'Unspecified'
-      let hash = 0
-      for (let i = 0; i < section.length; i++) {
-        hash = section.charCodeAt(i) + ((hash << 5) - hash)
-      }
-      const colors = [
-        '#3B82F6',
-        '#EF4444',
-        '#10B981',
-        '#F59E0B',
-        '#8B5CF6',
-        '#EC4899',
-        '#06B6D4',
-        '#14B8A6',
-      ]
-      color = colors[Math.abs(hash) % colors.length]
+    } else if (layers.colorMode === 'sequence') {
+      const key = member.sequence !== null && member.sequence !== undefined ? String(member.sequence) : 'Unsequenced'
+      color = key === 'Unsequenced' ? '#64748B' : hashColor(key)
+    } else if (layers.colorMode === 'weight') {
+      const tier = weightTier(member.weight_lbs)
+      if (tier === '< 100 lb') color = '#10B981'
+      else if (tier === '100–300 lb') color = '#3B82F6'
+      else if (tier === '300–600 lb') color = '#F59E0B'
+      else if (tier === '> 600 lb') color = '#EF4444'
+      else color = '#64748B'
+    } else if (layers.colorMode === 'labor_code') {
+      const key = member.labor_code || 'Unassigned'
+      color = key === 'Unassigned' ? '#64748B' : hashColor(key)
+    } else if (layers.colorMode === 'paint') {
+      const key = member.paint || 'Unpainted'
+      color = key === 'Unpainted' ? '#94A3B8' : hashColor(key)
     }
   }
 

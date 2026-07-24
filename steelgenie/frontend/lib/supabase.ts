@@ -47,12 +47,18 @@ if (isMock) {
         if (!email || !password) {
           return { data: { user: null, session: null }, error: new Error("Email and password are required") };
         }
+        // IMPORTANT: this id must match what the backend's mock-token auth
+        // resolves to (app/core/security.py -> CurrentUser(id="00000000-...").
+        // These two used to disagree ("dev-user" here vs the real UUID on the
+        // backend), which silently broke every "owner_id === user.id" check
+        // on the frontend (e.g. the My Projects tab filter) even though the
+        // API itself was returning the right data the whole time.
         const session = {
           access_token: "mock-session-token",
           token_type: "bearer",
           expires_in: 3600,
           user: {
-            id: "dev-user",
+            id: "00000000-0000-0000-0000-000000000000",
             email: email,
             role: "authenticated",
           }
@@ -70,7 +76,7 @@ if (isMock) {
           token_type: "bearer",
           expires_in: 3600,
           user: {
-            id: "dev-user",
+            id: "00000000-0000-0000-0000-000000000000",
             email: email,
             role: "authenticated",
           }

@@ -106,8 +106,8 @@ export function LayerFilterPopover({ members, onClose, projectId }: LayerFilterP
     <div
       style={{
         position: 'absolute',
-        left: '52px', // Anchor to vertical tool strip
-        top: '60px',
+        left: '40px', // Anchor to vertical tool strip
+        top: '46px',
         width: '240px',
         backgroundColor: '#102030',
         border: '1px solid rgba(255, 255, 255, 0.08)',

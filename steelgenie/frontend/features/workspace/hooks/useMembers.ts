@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { membersApi } from '../../../lib/api'
+import { useWorkspaceStore } from '../../../lib/stores/workspaceStore'
 
 export function useMembers(pageId: string | null) {
   const queryClient = useQueryClient()
@@ -11,6 +12,15 @@ export function useMembers(pageId: string | null) {
     enabled: !!pageId,
   })
 
+  // Every mutation below also calls bumpModelRefresh(pageId) -- previously
+  // only page EXTRACTION did this, so editing/creating/deleting a member on
+  // an already-extracted page (drag an endpoint, change a profile, delete a
+  // duplicate) silently never touched the 3D view: the 2D plan and the
+  // members table updated, but the 3D scene had no idea anything changed
+  // until a full page reload. Passing pageId (not just bumping the counter)
+  // matters too -- see workspaceStore's lastEditedPageId doc comment: the 3D
+  // viewer's incremental sync otherwise skips pages it already loaded.
+
   // Mutation: Create member
   const createMutation = useMutation({
     mutationFn: (data: any) => {
@@ -19,6 +29,7 @@ export function useMembers(pageId: string | null) {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['members', pageId] })
+      if (pageId) useWorkspaceStore.getState().bumpModelRefresh(pageId)
     },
   })
 
@@ -27,6 +38,7 @@ export function useMembers(pageId: string | null) {
     mutationFn: ({ id, data }: { id: string; data: any }) => membersApi.update(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['members', pageId] })
+      if (pageId) useWorkspaceStore.getState().bumpModelRefresh(pageId)
     },
   })
 
@@ -35,6 +47,7 @@ export function useMembers(pageId: string | null) {
     mutationFn: membersApi.delete,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['members', pageId] })
+      if (pageId) useWorkspaceStore.getState().bumpModelRefresh(pageId)
     },
   })
 
@@ -44,6 +57,7 @@ export function useMembers(pageId: string | null) {
       membersApi.bulkUpdate(ids, update),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['members', pageId] })
+      if (pageId) useWorkspaceStore.getState().bumpModelRefresh(pageId)
     },
   })
 
@@ -52,6 +66,7 @@ export function useMembers(pageId: string | null) {
     mutationFn: (ids: string[]) => membersApi.bulkDelete(ids),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['members', pageId] })
+      if (pageId) useWorkspaceStore.getState().bumpModelRefresh(pageId)
     },
   })
 

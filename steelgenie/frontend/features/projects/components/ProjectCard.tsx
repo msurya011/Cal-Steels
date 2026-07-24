@@ -1,5 +1,6 @@
 import React from 'react'
-import { Pin, Star, Trash2, Copy, ArrowRight } from 'lucide-react'
+import { Pin, Star, Trash2, Copy, ArrowRight, FileImage } from 'lucide-react'
+import { relativeTime } from '../utils/relativeTime'
 
 interface Project {
   id: string
@@ -12,6 +13,9 @@ interface Project {
   description: string | null
   pinned: boolean
   created_at: string
+  updated_at?: string
+  thumbnail_url?: string | null
+  is_example?: boolean
 }
 
 interface ProjectCardProps {
@@ -51,6 +55,7 @@ export function ProjectCard({ project, onOpen, onPin, onClone, onDelete }: Proje
         transition: 'all 0.2s ease',
         boxShadow: '0 4px 20px rgba(0, 0, 0, 0.2)',
         position: 'relative',
+        overflow: 'hidden',
       }}
       onMouseEnter={(e) => {
         e.currentTarget.style.borderColor = 'rgba(59, 130, 246, 0.35)'
@@ -61,6 +66,47 @@ export function ProjectCard({ project, onOpen, onPin, onClone, onDelete }: Proje
         e.currentTarget.style.boxShadow = '0 4px 20px rgba(0, 0, 0, 0.2)'
       }}
     >
+      {/* Thumbnail preview -- first extracted page of the project's first
+          drawing, so a card actually shows what the project looks like
+          instead of a generic icon, matching SteelGenie's project cards. */}
+      <div
+        style={{
+          margin: '-24px -24px 0',
+          height: '120px',
+          backgroundColor: '#0B1220',
+          borderBottom: '1px solid rgba(59,130,246,0.1)',
+          borderRadius: '12px 12px 0 0',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          overflow: 'hidden',
+          position: 'relative',
+        }}
+      >
+        {project.thumbnail_url ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={project.thumbnail_url}
+            alt=""
+            style={{ width: '100%', height: '100%', objectFit: 'cover', opacity: 0.9 }}
+          />
+        ) : (
+          <FileImage size={22} color="#334155" />
+        )}
+        {project.is_example && (
+          <span
+            style={{
+              position: 'absolute', top: '8px', left: '8px', padding: '2px 8px',
+              backgroundColor: 'rgba(139, 92, 246, 0.85)', borderRadius: '5px',
+              fontSize: '9px', fontWeight: 700, color: '#FFFFFF', letterSpacing: '0.4px',
+              textTransform: 'uppercase',
+            }}
+          >
+            Example
+          </span>
+        )}
+      </div>
+
       {/* Top row */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <span
@@ -206,8 +252,8 @@ export function ProjectCard({ project, onOpen, onPin, onClone, onDelete }: Proje
           marginTop: '4px',
         }}
       >
-        <span style={{ fontSize: '11px', color: '#475569' }}>
-          Created {formatDate(project.created_at)}
+        <span style={{ fontSize: '11px', color: '#475569' }} title={`Created ${formatDate(project.created_at)}`}>
+          Modified {relativeTime(project.updated_at || project.created_at)}
         </span>
         <button
           onClick={() => onOpen(project)}

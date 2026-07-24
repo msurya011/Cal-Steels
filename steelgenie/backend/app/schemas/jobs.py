@@ -32,7 +32,10 @@ class AnalyseRequest(BaseModel):
     detect_unlabeled: bool = False
     detect_braces: bool = True
     ocr_dpi: int = 400
-    floor_elevation_ft: float = 12.0
+    # No default -- Top of Steel varies per drawing and must always be
+    # entered by the user for that specific sheet. A caller that omits this
+    # gets a 422 instead of silently landing every sheet at the same height.
+    floor_elevation_ft: float
 
 
 class BuildRequest(BaseModel):

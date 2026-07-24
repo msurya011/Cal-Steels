@@ -13,6 +13,8 @@ import {
   Square,
   MinusSquare,
   Sparkles,
+  Play,
+  Loader2,
 } from 'lucide-react'
 import { useWorkspaceStore } from '../../../../lib/stores/workspaceStore'
 import { sectionsApi } from '../../../../lib/api'
@@ -32,16 +34,32 @@ interface Member {
   piecemark?: string | null
 }
 
+interface ActivePage {
+  id: string
+  idx?: number
+  title?: string | null
+  sheet_no?: string | null
+  status?: string
+}
+
 interface MemberExplorerProps {
   members: Member[]
   bulkUpdateMembers: (args: { ids: string[]; update: any }) => Promise<any>
   bulkDeleteMembers: (ids: string[]) => Promise<any>
+  activePage?: ActivePage | null
+  onClean?: () => void
+  onBuild?: () => void
+  isBuilding?: boolean
 }
 
 export function MemberExplorer({
   members,
   bulkUpdateMembers,
   bulkDeleteMembers,
+  activePage,
+  onClean,
+  onBuild,
+  isBuilding,
 }: MemberExplorerProps) {
   const {
     selection,
@@ -61,12 +79,14 @@ export function MemberExplorer({
     toggleLayerVisibility,
   } = useWorkspaceStore()
 
-  // Tree collapse states
+  // Tree collapse states -- collapsed by default (SteelGenie shows category
+  // totals first; you drill in via the chevron rather than always seeing
+  // every member listed out).
   const [expandedKinds, setExpandedKinds] = useState<Record<string, boolean>>({
-    beam: true,
-    column: true,
-    brace: true,
-    joist: true,
+    beam: false,
+    column: false,
+    brace: false,
+    joist: false,
   })
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({})
 
@@ -144,6 +164,12 @@ export function MemberExplorer({
     Object.values(sections).forEach((mList) => list.push(...mList))
     return list
   }
+
+  // Badge count shown next to each category total -- members with a
+  // resolved section designation (i.e. not still "Unlabelled"), matching
+  // SteelGenie's category badges (e.g. "Columns (80) [78]").
+  const getKindLabeledCount = (kind: string): number =>
+    getKindMembers(kind).filter((m) => !!m.section).length
 
   const getKindSelectionState = (kind: string) => {
     const mList = getKindMembers(kind)
@@ -291,8 +317,92 @@ export function MemberExplorer({
         boxSizing: 'border-box',
       }}
     >
+      {/* Active page header + Clean/Build actions */}
+      {activePage && (
+        <div style={{ padding: '12px 16px 0 16px' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '8px 10px',
+              backgroundColor: '#1F2937',
+              border: '1px solid rgba(59, 130, 246, 0.12)',
+              borderRadius: '6px',
+              marginBottom: '8px',
+            }}
+          >
+            <span
+              style={{
+                fontSize: '12px',
+                fontWeight: 700,
+                color: '#E2E8F0',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+              title={activePage.title || undefined}
+            >
+              Page {(activePage.idx ?? 0) + 1}
+              {activePage.title ? ` | ${activePage.title}` : ''}
+            </span>
+            <ChevronDown size={13} color="#64748B" style={{ flexShrink: 0, marginLeft: '6px' }} />
+          </div>
+
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+            <button
+              onClick={onClean}
+              disabled={!onClean || members.length === 0}
+              title="Delete all extracted members on this page and reset it"
+              style={{
+                flex: 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '6px',
+                padding: '7px 0',
+                backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                border: '1px solid rgba(239, 68, 68, 0.4)',
+                borderRadius: '6px',
+                color: members.length === 0 ? 'rgba(239,68,68,0.4)' : '#F87171',
+                fontSize: '12px',
+                fontWeight: 700,
+                cursor: members.length === 0 ? 'not-allowed' : 'pointer',
+              }}
+            >
+              <Trash2 size={13} />
+              Clean
+            </button>
+            <button
+              onClick={onBuild}
+              disabled={!onBuild || isBuilding}
+              title="Extract members from this page"
+              style={{
+                flex: 1,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '6px',
+                padding: '7px 0',
+                backgroundColor: 'rgba(16, 185, 129, 0.12)',
+                border: '1px solid rgba(16, 185, 129, 0.5)',
+                borderRadius: '6px',
+                color: '#34D399',
+                fontSize: '12px',
+                fontWeight: 700,
+                cursor: isBuilding ? 'wait' : 'pointer',
+                opacity: isBuilding ? 0.7 : 1,
+              }}
+            >
+              {isBuilding ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+              {isBuilding ? 'Building…' : 'Build'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Search Input Box */}
-      <div style={{ padding: '12px 16px 8px 16px', position: 'relative' }}>
+      <div style={{ padding: activePage ? '0 16px 8px 16px' : '12px 16px 8px 16px', position: 'relative' }}>
         <div style={{ position: 'relative' }}>
           <Search
             size={14}
@@ -417,100 +527,85 @@ export function MemberExplorer({
           if (kindMembersCount === 0 && searchQuery) return null
 
           const isKindExpanded = expandedKinds[kind]
-          const kindSelectionState = getKindSelectionState(kind)
           const isKindHidden = layers.classVisibility[kind] === false
-          const isKindIsolated = isolation && isolation.kind === kind
 
           return (
             <div key={kind} style={{ marginBottom: '12px' }}>
-              {/* Kind Group Header Row */}
+              {/* Kind Group Header Row -- label+count, labeled-count badge,
+                  visibility check, chevron on the right (matches SteelGenie's
+                  Members panel: "Columns (80) [78] ✓ >"). Bulk-select and
+                  isolate are still one click away via the section rows once
+                  expanded, just not cluttering the collapsed summary row. */}
               <div
+                onClick={() => toggleKindCollapse(kind)}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
-                  padding: '4px 6px',
-                  borderRadius: '4px',
+                  padding: '7px 8px',
+                  borderRadius: '5px',
                   backgroundColor: 'rgba(255,255,255,0.02)',
                   gap: '8px',
+                  cursor: 'pointer',
                 }}
               >
-                {/* Expand / Collapse Chevron */}
-                <button
-                  onClick={() => toggleKindCollapse(kind)}
-                  style={{
-                    background: 'none',
-                    border: 'none',
-                    padding: 0,
-                    color: '#64748B',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                  }}
-                >
-                  {isKindExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                </button>
-
-                {/* Bulk Select Checkbox */}
-                <button
-                  onClick={() => handleToggleKindSelect(kind)}
-                  style={{
-                    background: 'none',
-                    border: 'none',
-                    padding: 0,
-                    color: kindSelectionState !== 'none' ? '#3B82F6' : '#64748B',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                  }}
-                >
-                  {kindSelectionState === 'all' && <CheckSquare size={14} />}
-                  {kindSelectionState === 'some' && <MinusSquare size={14} />}
-                  {kindSelectionState === 'none' && <Square size={14} />}
-                </button>
-
-                {/* Label & count */}
                 <span
                   style={{
                     fontWeight: 700,
                     fontSize: '12px',
                     color: '#E2E8F0',
                     flex: 1,
-                    cursor: 'pointer',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
                   }}
-                  onClick={() => toggleKindCollapse(kind)}
                 >
                   {getCategoryLabel(kind)} ({kindMembersCount})
                 </span>
 
-                {/* Visibility Eye */}
+                {kindMembersCount > 0 && (
+                  <span
+                    style={{
+                      fontSize: '11px',
+                      fontWeight: 800,
+                      color: '#0F172A',
+                      backgroundColor: '#F59E0B',
+                      borderRadius: '10px',
+                      padding: '1px 8px',
+                      minWidth: '18px',
+                      textAlign: 'center',
+                    }}
+                    title={`${getKindLabeledCount(kind)} of ${kindMembersCount} labeled`}
+                  >
+                    {getKindLabeledCount(kind)}
+                  </span>
+                )}
+
+                {/* Visibility check -- filled/green when the whole category
+                    is shown, hollow when hidden. Click without expanding. */}
                 <button
-                  onClick={() => toggleLayerVisibility(kind)}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    toggleLayerVisibility(kind)
+                  }}
                   style={{
                     background: 'none',
                     border: 'none',
                     padding: 0,
-                    color: isKindHidden ? '#EF4444' : '#64748B',
+                    color: isKindHidden ? '#475569' : '#10B981',
                     cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
                   }}
-                  title="Toggle category visibility"
+                  title={isKindHidden ? 'Hidden — click to show' : 'Visible — click to hide'}
                 >
-                  {isKindHidden ? <EyeOff size={13} /> : <Eye size={13} />}
+                  <Check size={14} />
                 </button>
 
-                {/* Isolation Target */}
-                <button
-                  onClick={() => setIsolation(isKindIsolated ? null : { kind })}
-                  style={{
-                    background: 'none',
-                    border: 'none',
-                    padding: 0,
-                    color: isKindIsolated ? '#F59E0B' : '#64748B',
-                    cursor: 'pointer',
-                  }}
-                  title="Isolate category"
-                >
-                  <Target size={13} />
-                </button>
+                <ChevronRight
+                  size={14}
+                  color="#64748B"
+                  style={{ transform: isKindExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s' }}
+                />
               </div>
 
               {/* Section Sub-tree */}

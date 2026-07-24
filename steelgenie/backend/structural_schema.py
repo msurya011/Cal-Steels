@@ -257,7 +257,8 @@ def build_structural_model(
     scale_ratio: float,
     source: str,
     page: int,
-    floor_elevation_ft: float = 14.0,
+    *,
+    floor_elevation_ft: float,
     base_elevation_ft: float = 0.0,
 ) -> dict:
     """
@@ -271,10 +272,11 @@ def build_structural_model(
         source:             filename of the source drawing
         page:               0-indexed page number
         floor_elevation_ft: Y elevation for beams/joists/braces (top of storey).
-                            Auto-derived from page index by the /model endpoint:
-                            (page_index + 1) * FLOOR_HEIGHT_FT
+                            No default -- this is the page's actual Top of
+                            Steel, always entered by the user for that sheet.
         base_elevation_ft:  Y elevation for column bases (bottom of storey).
-                            Auto-derived: page_index * FLOOR_HEIGHT_FT
+                            Defaults to 0.0 (ground) -- a coordinate origin,
+                            not a guessed T.O.S. value.
     """
     ppf   = _ppf(scale_ratio)
     w_ft  = page_width_pts  / ppf

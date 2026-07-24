@@ -19,6 +19,20 @@ class ProjectCreate(BaseModel):
     folder_id: Optional[UUID] = None
 
 
+class FolderCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class FolderOut(BaseModel):
+    id: UUID
+    owner_id: UUID
+    company_id: Optional[UUID] = None
+    name: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     number: Optional[str] = None
@@ -43,6 +57,8 @@ class ProjectOut(BaseModel):
     description: Optional[str] = None
     pinned: bool = False
     share_scope: str = "private"
+    is_example: bool = False
+    thumbnail_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

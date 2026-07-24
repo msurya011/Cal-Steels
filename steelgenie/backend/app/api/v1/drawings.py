@@ -9,6 +9,7 @@ from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, status
+from pydantic import BaseModel
 
 from app.core.config import get_settings
 from app.core.tenancy import AuthUser
@@ -23,6 +24,73 @@ router = APIRouter(tags=["drawings"])
 
 _ALLOWED_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 _ALLOWED_EXTS = {".pdf", ".jpg", ".jpeg", ".png"}
+
+# Standard paper sizes in inches (width x height, landscape)
+PAPER_SIZES_IN = {
+    "ANSI A": (11.0, 8.5),
+    "ANSI B": (17.0, 11.0),
+    "ANSI C": (22.0, 17.0),
+    "ANSI D": (34.0, 22.0),
+    "ANSI E": (44.0, 34.0),
+    "ARCH D": (36.0, 24.0),
+    "ARCH E": (48.0, 36.0),
+}
+_BLANK_PAGE_MARGIN_IN = 1.0  # printable-area inset used for the drawable-area estimate
+
+
+class BlankPagesRequest(BaseModel):
+    page_count: int = 1
+    paper_size: str = "ANSI D"
+    scale_label: str = '1/4" = 1\'-0"'
+    scale_num: float = 48.0  # real-world inches per drawing inch (1/4"=1'-0" -> 48)
+
+
+@router.post("/projects/{project_id}/pages/blank", response_model=List[PageOut], status_code=status.HTTP_201_CREATED)
+async def create_blank_pages(project_id: UUID, body: BlankPagesRequest, user: AuthUser):
+    """Create a 'Blank Project' drawing with N empty sheets (no PDF/image),
+    ready for the workspace's manual member-drawing tools. Mirrors the
+    reference product's 'Blank Project' new-project mode."""
+    db = get_db()
+
+    p = db.table("projects").select("id,owner_id").eq("id", str(project_id)).maybe_single().execute()
+    if not p or not p.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if p.data["owner_id"] != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    if body.page_count < 1 or body.page_count > 50:
+        raise HTTPException(status_code=400, detail="page_count must be between 1 and 50")
+
+    drawing_row = {
+        "project_id": str(project_id),
+        "filename": "Blank Sheets",
+        "storage_key": "",
+        "page_count": body.page_count,
+        "file_size": 0,
+        "status": "ready",
+    }
+    resp = db.table("drawings").insert(drawing_row).execute()
+    drawing_id = resp.data[0]["id"]
+
+    pages = []
+    for idx in range(body.page_count):
+        page_row = {
+            "drawing_id": drawing_id,
+            "idx": idx,
+            "sheet_no": f"S-{idx + 1:03d}",
+            "title": f"Blank Sheet {idx + 1}",
+            "scale_num": body.scale_num,
+            "scale_label": body.scale_label,
+            "tos_ft": None,
+            "status": "not_started",
+            "paper_size": body.paper_size,
+            "thumb_key": None,
+            "image_key": None,
+        }
+        r = db.table("pages").insert(page_row).execute()
+        pages.append(dict(r.data[0]))
+
+    return pages
 
 
 @router.post("/projects/{project_id}/drawings", response_model=DrawingOut, status_code=status.HTTP_201_CREATED)

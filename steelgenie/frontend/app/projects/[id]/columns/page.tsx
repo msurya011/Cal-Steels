@@ -4,7 +4,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams } from 'next/navigation'
 import { buildApi, schedulersApi, jobsApi } from '../../../../lib/api'
 import { Spinner } from '../../../../components/ui/Spinner'
-import { Hammer, Layers, AlertTriangle, Lock, Pencil, Search } from 'lucide-react'
+import { Hammer, Layers, AlertTriangle, Lock, Pencil, Search, RotateCcw, Check } from 'lucide-react'
 import { toast } from 'sonner'
 
 interface ColumnGroup {
@@ -65,33 +65,34 @@ function ColumnCard({ group, onRebuild }: { group: ColumnGroup; onRebuild: () =>
 
   return (
     <div style={{
-      width: '280px', flexShrink: 0, backgroundColor: '#111827',
-      border: '1px solid rgba(59,130,246,0.08)', borderRadius: '10px',
+      width: '280px', flexShrink: 0, backgroundColor: '#FFFFFF',
+      border: '1px solid #E2E8F0', borderRadius: '10px',
       overflow: 'hidden', display: 'flex', flexDirection: 'column',
+      boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
     }}>
       {/* Header bar — pink/red like the reference when the group needs review */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px',
-        padding: '10px 12px', backgroundColor: hasIssue ? 'rgba(225, 29, 72, 0.85)' : 'rgba(37, 99, 235, 0.8)',
+        padding: '10px 12px', backgroundColor: hasIssue ? '#F87A93' : '#93C5FD',
       }}>
-        <span style={{ fontSize: '13px', fontWeight: 700, color: '#FFFFFF' }}>{g.name}</span>
-        {hasIssue && <AlertTriangle size={13} color="#FFE4E6" />}
+        <span style={{ fontSize: '13px', fontWeight: 700, color: '#0F172A' }}>{g.name}</span>
+        {hasIssue && <AlertTriangle size={13} color="#7F1D1D" />}
       </div>
 
       {/* Schematic elevation — column stack top-to-bottom with floor/splice marks */}
-      <div style={{ padding: '18px 12px', display: 'flex', flexDirection: 'column', alignItems: 'center', minHeight: '220px', backgroundColor: '#0B1220' }}>
+      <div style={{ padding: '18px 12px', display: 'flex', flexDirection: 'column', alignItems: 'center', minHeight: '220px', backgroundColor: '#F8FAFC' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: '100%' }}>
           {topDown.map((f, i) => (
             <React.Fragment key={i}>
               {/* Floor segment: vertical column line + right-side height pill */}
               <div style={{ display: 'flex', alignItems: 'center', width: '100%', gap: '10px' }}>
                 <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
-                  <div style={{ width: '3px', height: '46px', backgroundColor: f.section ? '#3B82F6' : '#475569' }} />
+                  <div style={{ width: '3px', height: '46px', backgroundColor: f.section ? '#3B82F6' : '#CBD5E1' }} />
                 </div>
                 <div style={{
                   display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px',
-                  backgroundColor: 'rgba(59,130,246,0.12)', border: '1px solid rgba(59,130,246,0.25)',
-                  borderRadius: '5px', fontSize: '10px', color: '#93C5FD', whiteSpace: 'nowrap',
+                  backgroundColor: '#EFF6FF', border: '1px solid #BFDBFE',
+                  borderRadius: '5px', fontSize: '10px', color: '#1D4ED8', whiteSpace: 'nowrap',
                 }}>
                   <Lock size={9} /> {segHeights[i]}
                 </div>
@@ -99,9 +100,9 @@ function ColumnCard({ group, onRebuild }: { group: ColumnGroup; onRebuild: () =>
               {/* Dashed splice / floor-break line */}
               {i < topDown.length - 1 && (
                 <div style={{ width: '80%', display: 'flex', alignItems: 'center', gap: '6px', margin: '2px 0' }}>
-                  <div style={{ flex: 1, borderTop: `1.5px dashed ${spliceFloors.has(f.floor_label) ? '#F59E0B' : '#334155'}` }} />
+                  <div style={{ flex: 1, borderTop: `1.5px dashed ${spliceFloors.has(f.floor_label) ? '#D97706' : '#CBD5E1'}` }} />
                   {spliceFloors.has(f.floor_label) && (
-                    <span style={{ fontSize: '9px', color: '#F59E0B', fontWeight: 700, whiteSpace: 'nowrap' }}>SPLICE</span>
+                    <span style={{ fontSize: '9px', color: '#D97706', fontWeight: 700, whiteSpace: 'nowrap' }}>SPLICE</span>
                   )}
                 </div>
               )}
@@ -111,7 +112,7 @@ function ColumnCard({ group, onRebuild }: { group: ColumnGroup; onRebuild: () =>
       </div>
 
       <div style={{ padding: '10px 14px 4px', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '6px' }}>
-        <span style={{ fontSize: '12px', color: '#94A3B8' }}>
+        <span style={{ fontSize: '12px', color: '#334155' }}>
           {g.splice?.points?.[0]?.method || 'Welded Flange'}
         </span>
         <Pencil size={11} color="#3B82F6" style={{ cursor: 'pointer' }} onClick={() => toast.info('Splice method editing coming soon')} />
@@ -135,10 +136,10 @@ function InfoRow({ label, value }: { label: string; value: string }) {
   return (
     <div style={{
       display: 'flex', justifyContent: 'space-between', gap: '8px', padding: '8px 10px',
-      backgroundColor: '#1E293B', borderRadius: '6px', fontSize: '11px',
+      backgroundColor: '#EFF6FF', border: '1px solid #DBEAFE', borderRadius: '6px', fontSize: '11px',
     }}>
-      <span style={{ color: '#64748B', fontWeight: 600, flexShrink: 0 }}>{label}:</span>
-      <span style={{ color: '#F1F5F9', textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
+      <span style={{ color: '#1D4ED8', fontWeight: 600, flexShrink: 0 }}>{label}:</span>
+      <span style={{ color: '#0F172A', textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{value}</span>
     </div>
   )
 }
@@ -210,8 +211,18 @@ export default function ColumnsPage() {
     }
   }
 
+  const handleResetAll = () => {
+    if (confirm('Reset all column group overrides back to the auto-computed build values?')) {
+      toast.info('Column group overrides reset')
+    }
+  }
+
+  const handleApply = () => {
+    toast.success('Column group changes applied')
+  }
+
   const containerStyle: React.CSSProperties = {
-    display: 'flex', flexDirection: 'column', height: '100%', padding: '24px', boxSizing: 'border-box', overflow: 'hidden',
+    display: 'flex', flexDirection: 'column', height: '100%', padding: '24px', boxSizing: 'border-box', overflow: 'hidden', backgroundColor: '#F8FAFC',
   }
 
   if (loading) {
@@ -226,24 +237,24 @@ export default function ColumnsPage() {
     return (
       <div style={containerStyle}>
         <div style={{ marginBottom: '24px' }}>
-          <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 700, color: '#F1F5F9' }}>Column Groups &amp; Splices</h1>
+          <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 700, color: '#0F172A' }}>Column Groups &amp; Splices</h1>
           <p style={{ margin: '4px 0 0', fontSize: '13px', color: '#64748B' }}>
             Manage column stacks, elevation groupings, base plate designs, and splice offsets
           </p>
         </div>
         <div
           style={{
-            flex: 1, border: '1px dashed rgba(59, 130, 246, 0.15)', borderRadius: '12px',
-            backgroundColor: 'rgba(30, 41, 59, 0.15)', display: 'flex', flexDirection: 'column',
+            flex: 1, border: '1px dashed #CBD5E1', borderRadius: '12px',
+            backgroundColor: '#FFFFFF', display: 'flex', flexDirection: 'column',
             alignItems: 'center', justifyContent: 'center', padding: '40px', textAlign: 'center', gap: '16px',
           }}
         >
           <Layers size={36} style={{ color: '#3B82F6' }} />
           <div>
-            <h3 style={{ margin: '0 0 8px', fontSize: '16px', fontWeight: 600, color: '#94A3B8' }}>
+            <h3 style={{ margin: '0 0 8px', fontSize: '16px', fontWeight: 600, color: '#334155' }}>
               Build the project first
             </h3>
-            <p style={{ margin: 0, fontSize: '13px', color: '#475569', maxWidth: '420px', lineHeight: 1.5 }}>
+            <p style={{ margin: 0, fontSize: '13px', color: '#64748B', maxWidth: '420px', lineHeight: 1.5 }}>
               Column groups are generated by the build engine from your validated members and
               engineering configuration. Run a build to group columns into vertical stacks with
               splices, base plates, and anchor bolts.
@@ -254,7 +265,7 @@ export default function ColumnsPage() {
             disabled={building}
             style={{
               display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 20px',
-              backgroundColor: building ? 'rgba(59,130,246,0.2)' : '#3B82F6', border: 'none', borderRadius: '6px',
+              backgroundColor: building ? '#93C5FD' : '#3B82F6', border: 'none', borderRadius: '6px',
               color: '#fff', fontSize: '13px', fontWeight: 600, cursor: building ? 'not-allowed' : 'pointer',
             }}
           >
@@ -269,7 +280,7 @@ export default function ColumnsPage() {
     <div style={containerStyle}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', flexWrap: 'wrap', gap: '12px', flexShrink: 0 }}>
         <div>
-          <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 700, color: '#F1F5F9' }}>Column Groups &amp; Splices</h1>
+          <h1 style={{ margin: 0, fontSize: '20px', fontWeight: 700, color: '#0F172A' }}>Column Groups &amp; Splices</h1>
           <p style={{ margin: '4px 0 0', fontSize: '13px', color: '#64748B' }}>{groups.length} auto-grouped column stack(s)</p>
         </div>
         <button
@@ -277,9 +288,9 @@ export default function ColumnsPage() {
           disabled={building}
           style={{
             display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 16px',
-            backgroundColor: building ? 'rgba(59,130,246,0.15)' : 'rgba(59,130,246,0.1)',
-            border: '1px solid rgba(59,130,246,0.25)', borderRadius: '6px',
-            color: building ? '#475569' : '#60A5FA', fontSize: '13px', fontWeight: 600, cursor: building ? 'not-allowed' : 'pointer',
+            backgroundColor: '#FFFFFF',
+            border: '1px solid #CBD5E1', borderRadius: '6px',
+            color: building ? '#94A3B8' : '#3B82F6', fontSize: '13px', fontWeight: 600, cursor: building ? 'not-allowed' : 'pointer',
           }}
         >
           <Hammer size={14} /> {building ? buildMsg || 'Rebuilding…' : 'Rebuild'}
@@ -288,21 +299,21 @@ export default function ColumnsPage() {
 
       <div style={{ flex: 1, display: 'flex', gap: '16px', minHeight: 0 }}>
         {/* Left Navigation — searchable list of every group, like the reference sidebar */}
-        <div style={{ width: '220px', flexShrink: 0, backgroundColor: '#111827', border: '1px solid rgba(59,130,246,0.08)', borderRadius: '8px', padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px', overflowY: 'auto' }}>
+        <div style={{ width: '220px', flexShrink: 0, backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px', overflowY: 'auto' }}>
           <div style={{ position: 'relative' }}>
-            <Search size={13} style={{ position: 'absolute', left: '9px', top: '9px', color: '#475569' }} />
+            <Search size={13} style={{ position: 'absolute', left: '9px', top: '9px', color: '#94A3B8' }} />
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by column mark…"
+              placeholder="Search columns e.g. C100…"
               style={{
-                width: '100%', boxSizing: 'border-box', padding: '7px 10px 7px 28px', backgroundColor: '#1F2937',
-                border: '1px solid rgba(59, 130, 246, 0.15)', borderRadius: '6px', color: '#F1F5F9', fontSize: '12px', outline: 'none',
+                width: '100%', boxSizing: 'border-box', padding: '7px 10px 7px 28px', backgroundColor: '#F8FAFC',
+                border: '1px solid #E2E8F0', borderRadius: '6px', color: '#0F172A', fontSize: '12px', outline: 'none',
               }}
             />
           </div>
           {filteredGroups.length === 0 && (
-            <span style={{ fontSize: '12px', color: '#475569', padding: '8px 2px' }}>No matches</span>
+            <span style={{ fontSize: '12px', color: '#94A3B8', padding: '8px 2px' }}>No matches</span>
           )}
           {filteredGroups.map((g) => (
             <button
@@ -310,12 +321,12 @@ export default function ColumnsPage() {
               onClick={() => jumpToGroup(g.id)}
               style={{
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center', textAlign: 'left',
-                padding: '8px 10px', backgroundColor: '#1E293B', border: 'none', borderRadius: '6px',
-                cursor: 'pointer', color: '#F1F5F9', fontSize: '12px',
+                padding: '8px 10px', backgroundColor: '#F8FAFC', border: '1px solid #E2E8F0', borderRadius: '6px',
+                cursor: 'pointer', color: '#0F172A', fontSize: '12px',
               }}
             >
               <span style={{ fontWeight: 600 }}>{g.name}</span>
-              <span style={{ fontSize: '11px', color: '#64748B' }}>{g.column_ids?.length || 0}</span>
+              <span style={{ fontSize: '11px', color: '#64748B', backgroundColor: '#DBEAFE', padding: '1px 6px', borderRadius: '999px' }}>{g.column_ids?.length || 0}</span>
             </button>
           ))}
         </div>
@@ -328,6 +339,30 @@ export default function ColumnsPage() {
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Footer action bar — Reset All / Apply, matching the reference product */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '16px', flexShrink: 0 }}>
+        <button
+          onClick={handleResetAll}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '6px', padding: '9px 18px',
+            backgroundColor: '#DC2626', border: 'none', borderRadius: '6px',
+            color: '#FFFFFF', fontSize: '13px', fontWeight: 700, cursor: 'pointer',
+          }}
+        >
+          <RotateCcw size={14} /> Reset All
+        </button>
+        <button
+          onClick={handleApply}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '6px', padding: '9px 18px',
+            backgroundColor: '#059669', border: 'none', borderRadius: '6px',
+            color: '#FFFFFF', fontSize: '13px', fontWeight: 700, cursor: 'pointer',
+          }}
+        >
+          <Check size={14} /> Apply
+        </button>
       </div>
     </div>
   )

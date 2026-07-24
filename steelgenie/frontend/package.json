@@ -10,11 +10,11 @@
   },
   "dependencies": {
     "@supabase/ssr": "^0.10.3",
-    "@supabase/supabase-js": "^2.105.4",
-    "@tanstack/react-query": "^5.101.2",
+    "@supabase/supabase-js": "^2.110.8",
+    "@tanstack/react-query": "^5.101.4",
     "@tanstack/react-table": "^8.21.3",
     "@types/three": "^0.185.0",
-    "lucide-react": "^1.23.0",
+    "lucide-react": "^1.26.0",
     "next": "^16.2.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -27,6 +27,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "puppeteer": "^25.3.0",
     "typescript": "^5"
   }
 }

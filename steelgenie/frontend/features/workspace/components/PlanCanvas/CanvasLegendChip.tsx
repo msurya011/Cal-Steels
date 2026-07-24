@@ -7,6 +7,10 @@ interface Member {
   section: string | null
   confidence?: number | null
   status?: string
+  sequence?: number | string | null
+  weight_lbs?: number | null
+  labor_code?: string | null
+  paint?: string | null
 }
 
 interface CanvasLegendChipProps {
@@ -47,32 +51,29 @@ export function CanvasLegendChip({ members }: CanvasLegendChipProps) {
         { label: 'Needs Review', key: 'need_review', color: '#F59E0B' },
       ]
     }
-    if (layers.colorMode === 'confidence') {
+    if (layers.colorMode === 'weight') {
       return [
-        { label: 'High (>90%)', key: '>90%', color: '#10B981' },
-        { label: 'Med (>70%)', key: '>', color: '#3B82F6' }, // wait, store parses: '>70%'
-        { label: 'Med (>70%)', key: '>70%', color: '#3B82F6' },
-        { label: 'Low (>50%)', key: '>50%', color: '#F59E0B' },
+        { label: '< 100 lb', key: '< 100 lb', color: '#10B981' },
+        { label: '100–300 lb', key: '100–300 lb', color: '#3B82F6' },
+        { label: '300–600 lb', key: '300–600 lb', color: '#F59E0B' },
+        { label: '> 600 lb', key: '> 600 lb', color: '#EF4444' },
       ]
     }
-    if (layers.colorMode === 'section') {
-      return getTopSections().map((sec) => {
+    if (layers.colorMode === 'sequence' || layers.colorMode === 'labor_code' || layers.colorMode === 'paint') {
+      const field = layers.colorMode === 'sequence' ? 'sequence' : layers.colorMode === 'labor_code' ? 'labor_code' : 'paint'
+      const fallback = field === 'sequence' ? 'Unsequenced' : field === 'labor_code' ? 'Unassigned' : 'Unpainted'
+      const counts: Record<string, number> = {}
+      members.forEach((m: any) => {
+        const v = m[field] !== null && m[field] !== undefined && m[field] !== '' ? String(m[field]) : fallback
+        counts[v] = (counts[v] || 0) + 1
+      })
+      const top = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k]) => k)
+      return top.map((v) => {
+        if (v === fallback) return { label: fallback, key: v, color: '#64748B' }
         let hash = 0
-        for (let i = 0; i < sec.length; i++) {
-          hash = sec.charCodeAt(i) + ((hash << 5) - hash)
-        }
-        const colors = [
-          '#3B82F6',
-          '#EF4444',
-          '#10B981',
-          '#F59E0B',
-          '#8B5CF6',
-          '#EC4899',
-          '#06B6D4',
-          '#14B8A6',
-        ]
-        const color = colors[Math.abs(hash) % colors.length]
-        return { label: sec, key: sec, color }
+        for (let i = 0; i < v.length; i++) hash = v.charCodeAt(i) + ((hash << 5) - hash)
+        const colors = ['#3B82F6', '#EF4444', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#06B6D4', '#14B8A6']
+        return { label: v, key: v, color: colors[Math.abs(hash) % colors.length] }
       })
     }
     return []

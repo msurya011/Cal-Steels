@@ -13,9 +13,15 @@ export interface ColumnSymbolProps {
   onClick: (e: React.MouseEvent) => void
   onMouseEnter: () => void
   onMouseLeave: () => void
-  onDragEnd?: (id: string, x: number, y: number) => void
+  onDragEnd?: (id: string, dx: number, dy: number) => void
+  snapPoint?: (x: number, y: number, ignorePt?: { x: number; y: number } | null) => { x: number; y: number; snapped: boolean }
 }
 
+// Matches the real SteelGenie overlay style (verified live against
+// app.steelgenie.com): a thin stroked cross-section symbol plus the profile
+// text sitting directly next to it. No background pill, no category label
+// ("Column"), no translucent highlight box, no confidence halo -- status is
+// conveyed only through stroke color/weight, exactly like the reference.
 export function ColumnSymbol({
   member: m,
   renderProps,
@@ -28,8 +34,11 @@ export function ColumnSymbol({
   onClick,
   onMouseEnter,
   onMouseLeave,
-  onDragEnd
+  onDragEnd,
+  snapPoint
 }: ColumnSymbolProps) {
+  const { setDraggingMember, draggingMemberId } = useWorkspaceStore()
+  const isDraggingThis = draggingMemberId === m.id
   const { color, opacity } = renderProps
   const geo = m.geometry
   const flags: string[] = geo.error_flags || []
@@ -38,19 +47,32 @@ export function ColumnSymbol({
   const isVerified = m.status === 'verified'
   const filterStyle = isSelected || isZoomTarget ? 'url(#glow-select)' : undefined
 
-  // Position in percent (0-100)
-  const cx = geo.x * 100
-  const cy = geo.y * 100
+  // Position in percent (0-100).
+  //
+  // Stage 6 Part 2 (2026-07-17, live-verified against real SteelGenie): the
+  // backend snaps a detected symbol's structural position onto the nearest
+  // grid line (geo.x/geo.y) so beam connectivity/3D math has a clean
+  // intersection to work with -- but that snap can be a few real inches
+  // away from where the symbol is ACTUALLY drawn on the sheet. Rendering at
+  // the snapped point is what made markers look "close but not quite on"
+  // the real symbol. geo.raw_x/raw_y (now that the backend persists them --
+  // they were previously silently dropped) is the true detected center, so
+  // the visual marker uses that when available and only falls back to the
+  // snapped point for older data that predates this fix.
+  const hasRaw = geo.raw_x !== undefined && geo.raw_x !== null && geo.raw_y !== undefined && geo.raw_y !== null
+  const cx = (hasRaw ? geo.raw_x : geo.x) * 100
+  const cy = (hasRaw ? geo.raw_y : geo.y) * 100
 
   // Drag logic
   const groupRef = useRef<SVGGElement>(null)
-  
+  const snapIndicatorRef = useRef<SVGCircleElement>(null)
+
   const handlePointerDown = (e: React.PointerEvent) => {
     if (!onDragEnd || isSuggested) return
     e.stopPropagation()
     const svg = groupRef.current?.ownerSVGElement
     if (!svg) return
-    
+
     // We want pointer capture to track mouse reliably
     ;(e.target as Element).setPointerCapture(e.pointerId)
 
@@ -58,18 +80,56 @@ export function ColumnSymbol({
     let currentY = cy
 
     const handlePointerMove = (ev: PointerEvent) => {
-      const pt = svg.createSVGPoint()
-      pt.x = ev.clientX
-      pt.y = ev.clientY
-      const ctm = svg.getScreenCTM()
-      if (ctm) {
-        const svgPt = pt.matrixTransform(ctm.inverse())
+      // Convert screen coordinates into the 0-100 percent space every
+      // element is positioned in, using the SVG's own on-screen bounding
+      // box. The overlay has no viewBox, so its user-unit space is raw CSS
+      // pixels -- createSVGPoint/getScreenCTM would hand back pixel values
+      // where percent values are expected, causing wild jumps.
+      const rect = svg.getBoundingClientRect()
+      if (rect.width && rect.height) {
+        let svgPt = {
+          x: ((ev.clientX - rect.left) / rect.width) * 100,
+          y: ((ev.clientY - rect.top) / rect.height) * 100,
+        }
+
+        let isSnapped = false
+        if (snapPoint) {
+           const snapped = snapPoint(svgPt.x / 100, svgPt.y / 100)
+           if (snapped.snapped) {
+               svgPt.x = snapped.x * 100
+               svgPt.y = snapped.y * 100
+               isSnapped = true
+           }
+        }
+
         if (groupRef.current) {
-          const dx = svgPt.x - cx
-          const dy = svgPt.y - cy
+          let dx = svgPt.x - cx
+          let dy = svgPt.y - cy
+
+          // Shift key constraint: horizontal or vertical translation only
+          if (ev.shiftKey) {
+            if (Math.abs(dx) > Math.abs(dy)) {
+              dy = 0
+              svgPt.y = cy
+            } else {
+              dx = 0
+              svgPt.x = cx
+            }
+          }
+
           groupRef.current.setAttribute('transform', `translate(${dx}, ${dy})`)
           currentX = svgPt.x
           currentY = svgPt.y
+          
+          if (snapIndicatorRef.current) {
+            if (isSnapped) {
+              snapIndicatorRef.current.setAttribute('cx', `${svgPt.x - dx}%`)
+              snapIndicatorRef.current.setAttribute('cy', `${svgPt.y - dy}%`)
+              snapIndicatorRef.current.style.display = 'block'
+            } else {
+              snapIndicatorRef.current.style.display = 'none'
+            }
+          }
         }
       }
     }
@@ -78,42 +138,39 @@ export function ColumnSymbol({
       ;(ev.target as Element)?.releasePointerCapture(ev.pointerId)
       window.removeEventListener('pointermove', handlePointerMove)
       window.removeEventListener('pointerup', handlePointerUp)
+      setDraggingMember(null, null, null)
       if (groupRef.current) {
         groupRef.current.removeAttribute('transform')
       }
+      if (snapIndicatorRef.current) snapIndicatorRef.current.style.display = 'none'
       if (Math.abs(currentX - cx) > 0.1 || Math.abs(currentY - cy) > 0.1) {
-        onDragEnd(m.id, currentX / 100, currentY / 100)
+        onDragEnd(m.id, (currentX - cx) / 100, (currentY - cy) / 100)
       } else {
-        // If we didn't drag far enough, treat as a click
         onClick(e as any)
       }
     }
 
     window.addEventListener('pointermove', handlePointerMove)
     window.addEventListener('pointerup', handlePointerUp)
+    setDraggingMember(m.id, null, null)
   }
 
-  const { selectedRatio, imageNaturalWidth } = useWorkspaceStore()
-  // Labels always shown, SteelGenie-style — plain text is light enough not to
-  // need progressive zoom disclosure now that the chip background is gone.
-  const showChip = true
-
-  // Symbol sizing based on true physical depth and scale ratio
-  const depthIn = geo.depth_in ?? 10
-  let sPct = 1.0
-  if (selectedRatio && imageNaturalWidth) {
-    // 150 DPI rendering: physical pixels for the given column depth
-    const sizePx = (depthIn * 150) / selectedRatio
-    // Clamp the pixel size for readability (min 12px, max 45px)
-    const clampedPx = Math.max(12, Math.min(45, sizePx))
-    sPct = (clampedPx / imageNaturalWidth) * 100
-  } else {
-    // Fallback if no scale is set on the page yet
-    sPct = Math.min(2.0, Math.max(0.5, (geo.w ? geo.w * 100 : 0) || 1.0))
-  }
-  const s = sPct
-  const ft = s * 0.22 
+  // ── Symbol sizing ──────────────────────────────────────────────────────────
+  // Small, fixed visual size by default -- geo.w/geo.h are the AI-detected
+  // TEXT label bounding box, not the physical symbol size, so they're
+  // ignored here, same as before.
+  //
+  // Stage 6 Part 2: for a real BOX/footing outline, SteelGenie draws the
+  // marker AT THE ACTUAL SIZE of the detected shape, not a generic square --
+  // geo.sym_w/sym_h (the real bounding box, as a fraction of the page, now
+  // propagated from the backend's detection bbox) gives us that. I/H column
+  // icons stay the small fixed schematic size verified earlier against the
+  // real app -- only BOX uses the real detected size.
   const symbol = geo.symbol || 'I'
+  const hasRealSize = symbol === 'BOX' && typeof geo.sym_w === 'number' && typeof geo.sym_h === 'number' && geo.sym_w > 0 && geo.sym_h > 0
+  const sW = hasRealSize ? geo.sym_w * 100 : 0.5
+  const sH = hasRealSize ? geo.sym_h * 100 : 0.5
+  const ft = sW * 0.22   // flange thickness ≈ 22% of depth — matches real wide-flange proportions
 
   let stroke = color
   let dash: string | undefined
@@ -123,26 +180,25 @@ export function ColumnSymbol({
     else if (isVerified) { stroke = '#10B981' }
     else if (isLowConf || m.status === 'need_review') { stroke = '#F59E0B'; dash = '4,3' }
   }
-  const sw = (isHovered ? 3.0 : 2.0) + (isSelected ? 1.5 : 0)
-  // Use transparent instead of none so pointer events are still captured
-  const fillCol = 'transparent'
+  const sw = (isHovered ? 2.2 : 1.4) + (isSelected ? 1.0 : 0)
 
-  // Base case (rotation 0 = horizontal web, vertical flanges)
-  const f1 = { x: cx - s / 2, y: cy - s / 2, w: ft, h: s }
-  const f2 = { x: cx + s / 2 - ft, y: cy - s / 2, w: ft, h: s }
-  const web = { x: cx - s / 2 + ft, y: cy - ft / 2, w: s - 2 * ft, h: ft }
+  // Stroke-only flanges/web -- matches the thin line weight seen on the real
+  // reference, rather than solid-filled shapes that read as heavier blobs.
+  const f1 = { x: cx - sW / 2, y: cy - sH / 2, w: ft, h: sH }
+  const f2 = { x: cx + sW / 2 - ft, y: cy - sH / 2, w: ft, h: sH }
+  const web = { x: cx - sW / 2 + ft, y: cy - ft / 2, w: sW - 2 * ft, h: ft }
 
-  const rectEl = (r: { x: number; y: number; w: number; h: number }, key: string, isSolid: boolean = false) => (
+  const rectEl = (r: { x: number; y: number; w: number; h: number }, key: string) => (
     <rect
       key={key}
       x={`${r.x}%`} y={`${r.y}%`} width={`${r.w}%`} height={`${r.h}%`}
-      fill={isSolid ? stroke : fillCol}
-      stroke={isSolid ? 'none' : stroke}
-      strokeWidth={isSolid ? 0 : sw}
-      strokeDasharray={isSolid ? undefined : dash}
+      fill="none"
+      stroke={stroke}
+      strokeWidth={sw}
+      strokeDasharray={dash}
       strokeLinejoin="round"
       className={isZoomTarget ? 'pulsing-member' : ''}
-      style={{ transition: 'all 0.1s ease', filter: filterStyle }}
+      style={{ transition: isDraggingThis ? 'none' : 'all 0.1s ease', filter: filterStyle }}
     />
   )
 
@@ -156,157 +212,119 @@ export function ColumnSymbol({
       onMouseLeave={onMouseLeave}
       style={{ pointerEvents: 'all', cursor: isSuggested ? 'pointer' : 'grab', opacity: isSuggested ? opacity * 0.65 : opacity, touchAction: 'none' }}
     >
-      {/* Confidence Halo */}
-      {layers.aids.confidenceHalo && isLowConf && !isSuggested && (
-        <rect
-          x={`${cx - s / 2 - 0.6}%`} y={`${cy - s / 2 - 0.6}%`}
-          width={`${s + 1.2}%`} height={`${s + 1.2}%`}
-          fill="none" stroke="#F59E0B" strokeWidth={2} strokeDasharray="4,4"
-          className="pulsing-halo"
-        />
-      )}
-
-      {/* Suggested ghost ring */}
+      {/* Suggested ghost ring — the only "extra" affordance kept, since a
+          suggested/unconfirmed column genuinely has no real symbol yet. */}
       {isSuggested && (
         <circle
-          cx={`${cx}%`} cy={`${cy}%`} r={isHovered ? 14 : 12}
-          fill="none" stroke="#94A3B8" strokeWidth={1.5} strokeDasharray="4,4"
+          cx={`${cx}%`} cy={`${cy}%`} r={isHovered ? 10 : 8}
+          fill="none" stroke="#94A3B8" strokeWidth={1.2} strokeDasharray="3,3"
           className="pulsing-halo"
         />
       )}
 
-      {/* Selection outline */}
+      {/* Selection outline — editing aid, not part of the base drawing style */}
       {isSelected && (
         <rect
-          x={`${cx - s / 2 - 0.4}%`}
-          y={`${cy - s / 2 - 0.4}%`}
-          width={`${s + 0.8}%`}
-          height={`${s + 0.8}%`}
+          x={`${cx - sW / 2 - 0.4}%`}
+          y={`${cy - sH / 2 - 0.4}%`}
+          width={`${sW + 0.8}%`}
+          height={`${sH + 0.8}%`}
           fill="none"
           stroke="#22C55E"
-          strokeWidth={1.5}
+          strokeWidth={1.2}
           strokeDasharray="2,2"
         />
       )}
 
-      {/* Validation Overlay: Snap Vector Line from Raw to Snapped */}
-      {layers.aids.columnProjections !== false && geo.raw_x !== undefined && geo.raw_y !== undefined && (Math.abs(geo.raw_x - geo.x) > 0.0001 || Math.abs(geo.raw_y - geo.y) > 0.0001) && (
+      {/* Validation overlay: snap vector from the visual marker (the real
+          detected position) to the grid-snapped structural point used for
+          beam-connectivity/3D math. Points AWAY from the marker now, since
+          the marker itself moved to the real position (Stage 6 Part 2) --
+          previously this pointed the other direction, which collapsed to a
+          zero-length line once cx/cy became the raw point. */}
+      {layers.aids.columnProjections !== false && hasRaw && (Math.abs(geo.raw_x - geo.x) > 0.0001 || Math.abs(geo.raw_y - geo.y) > 0.0001) && (
         <g style={{ pointerEvents: 'none' }}>
           <line
-            x1={`${geo.raw_x * 100}%`}
-            y1={`${geo.raw_y * 100}%`}
-            x2={`${cx}%`}
-            y2={`${cy}%`}
+            x1={`${cx}%`}
+            y1={`${cy}%`}
+            x2={`${geo.x * 100}%`}
+            y2={`${geo.y * 100}%`}
             stroke="#EF4444"
-            strokeWidth={1.2}
+            strokeWidth={1}
             strokeDasharray="3,3"
-            opacity={0.8}
-          />
-          <circle
-            cx={`${geo.raw_x * 100}%`}
-            cy={`${geo.raw_y * 100}%`}
-            r={2}
-            fill="#EF4444"
-            opacity={0.8}
+            opacity={0.7}
           />
         </g>
       )}
 
-      {/* Always-on visibility halo — a solid colored disc behind the symbol,
-          in the SAME color as the column's status, so it reads as "there is
-          definitely a column here" even when the outline symbol itself is a
-          thin dashed line (need-review columns) that's easy to lose in a
-          dense drawing. This is rendered on top of beam lines by the parent
-          (columns are painted last), so it's never buried at a convergence
-          point. Deliberately more opaque than before — the whole point is
-          that a first-time viewer should spot every column at a glance. */}
-      {!isSuggested && (
-        <circle
-          cx={`${cx}%`}
-          cy={`${cy}%`}
-          r={Math.max(s * 0.9, 1.6)}
-          fill={stroke}
-          fillOpacity={0.32}
-          stroke={stroke}
-          strokeOpacity={0.7}
-          strokeWidth={1}
-          style={{ pointerEvents: 'none' }}
-        />
-      )}
-
-      {/* Steel symbol with precise rotation */}
+      {/* Cross-section symbol — thin stroke only, precise rotation */}
       <g style={{ transformOrigin: 'center', transformBox: 'fill-box', transform: `rotate(${m.rotation || 0}deg)` }}>
         {symbol === 'BOX' ? (
-          rectEl({ x: cx - s / 2, y: cy - s / 2, w: s, h: s }, 'box')
+          rectEl({ x: cx - sW / 2, y: cy - sH / 2, w: sW, h: sH }, 'box')
         ) : symbol === 'PIPE' ? (
           <circle
-            cx={`${cx}%`} cy={`${cy}%`} r={s / 2}
-            fill={fillCol} stroke={stroke} strokeWidth={sw} strokeDasharray={dash}
+            cx={`${cx}%`} cy={`${cy}%`} r={Math.max(sW, sH) / 2}
+            fill="none" stroke={stroke} strokeWidth={sw} strokeDasharray={dash}
             className={isZoomTarget ? 'pulsing-member' : ''}
-            style={{ transition: 'all 0.1s ease', filter: filterStyle }}
+            style={{ transition: isDraggingThis ? 'none' : 'all 0.1s ease', filter: filterStyle }}
           />
         ) : (
           <>
-            {rectEl(f1, 'f1', true)}
-            {rectEl(f2, 'f2', true)}
-            {rectEl(web, 'web', true)}
+            {rectEl(f1, 'f1')}
+            {rectEl(f2, 'f2')}
+            {rectEl(web, 'web')}
           </>
         )}
       </g>
 
-      {/* Matched Profile Section Link Icon */}
-      {isSelected && m.section && (
-        <text
-          x={`${cx - s / 2 - 1}%`}
-          y={`${cy + s / 2 + 1.5}%`}
-          fontSize="5px"
-          style={{ userSelect: 'none', fill: '#10B981' }}
-        >
-          🔗
-        </text>
-      )}
-
-      {/* Node marker — bold solid square centered exactly on the column's grid
-          point (cx/cy = the snapped grid-line intersection), so it reads
-          clearly as "the column sits here on the line" even at a glance. */}
+      {/* Node marker — tiny fixed dot at the exact grid intersection, matching
+          the small connection-point icon in the reference (not a scaled
+          confidence indicator). */}
       {!isSuggested && (
         <rect
-          x={`${cx - 0.55}%`}
-          y={`${cy - 0.55}%`}
-          width="1.1%"
-          height="1.1%"
+          x={`${cx - 0.3}%`}
+          y={`${cy - 0.3}%`}
+          width="0.6%"
+          height="0.6%"
           fill={stroke}
-          stroke="#0B1220"
-          strokeWidth={1.4}
           style={{ pointerEvents: 'none' }}
         />
       )}
 
-      {/* Label — plain text, no chip background, SteelGenie-style */}
-      {showChip && labelText && (() => {
-        const text = `${hasError && !isSuggested ? '⚠ ' : ''}${labelText}`
-        const labelColor = isSuggested ? '#94A3B8' : hasError ? '#EF4444' : isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : '#10B981'
-        const labelY = cy - s / 2 - 2.2
-        return (
-          <text
-            x={`${cx}%`}
-            y={`${labelY}%`}
-            fill={labelColor}
-            fontSize="7px"
-            fontWeight="700"
-            textAnchor="middle"
-            style={{
-              userSelect: 'none',
-              paintOrder: 'stroke',
-              stroke: '#0B1220',
-              strokeWidth: 2.2,
-              pointerEvents: 'none',
-            }}
-          >
-            {text}
-          </text>
-        )
-      })()}
+      {/* Profile label — plain text next to the symbol, color-coded by status.
+          No pill background, no category text, no warning glyph -- a flagged
+          column is communicated by the stroke color alone (red), matching
+          the reference's restraint. */}
+      {labelText && (
+        <text
+          x={`${cx}%`}
+          y={`${cy - sH / 2 - 1.2}%`}
+          fill={stroke}
+          fontSize="6px"
+          fontWeight="600"
+          textAnchor="middle"
+          style={{
+            userSelect: 'none',
+            paintOrder: 'stroke',
+            stroke: '#0B1220',
+            strokeWidth: 2,
+            pointerEvents: 'none',
+          }}
+        >
+          {labelText}
+        </text>
+      )}
+      
+      {/* Dynamic Snap Indicator */}
+      <circle
+        ref={snapIndicatorRef}
+        r={6}
+        fill="none"
+        stroke="#3B82F6"
+        strokeWidth={2.5}
+        strokeDasharray="2,2"
+        style={{ display: 'none', pointerEvents: 'none', zIndex: 50 }}
+      />
     </g>
   )
 }

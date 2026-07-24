@@ -27,7 +27,7 @@ def _generate_kiss_content(project_name: str, items: list[dict]) -> str:
     for item in items:
         piecemark = item.get("piecemark", "UNK")
         category = (item.get("category") or "BEAM").upper()
-        
+
         # Simple structural kind classification
         if "COLUMN" in category:
             cat = "COLUMN"
@@ -35,14 +35,14 @@ def _generate_kiss_content(project_name: str, items: list[dict]) -> str:
             cat = "BRACE"
         else:
             cat = "BEAM"
-            
+
         section = item.get("section", "UNK")
         grade = item.get("grade", "A992")
         length_in = item.get("length_in") or 0.0
         qty = item.get("qty", 1)
-        
+
         lines.append(f"{piecemark},{cat},{section},{grade},{length_in},{qty}")
-        
+
     lines.append("*MATERIAL")
     lines.append("*PLATE")
     lines.append("*BOLT")
@@ -79,20 +79,20 @@ def _generate_epm_csv_content(items: list[dict]) -> str:
 async def export_kiss(project_id: UUID, user: AuthUser):
     """Export the project Bill of Materials in standard fabrication KISS format."""
     db = get_db()
-    
+
     # Get project name
     p_resp = db.table("projects").select("name").eq("id", str(project_id)).maybe_single().execute()
     if not p_resp or not p_resp.data:
         raise HTTPException(status_code=404, detail="Project not found")
-        
+
     project_name = p_resp.data.get("name", "Project")
-    
+
     # Get BOM items
     bom_resp = db.table("bom_items").select("*").eq("project_id", str(project_id)).execute()
     items = bom_resp.data or []
-    
+
     kiss_content = _generate_kiss_content(project_name, items)
-    
+
     return Response(
         content=kiss_content,
         media_type="text/plain",
@@ -104,13 +104,13 @@ async def export_kiss(project_id: UUID, user: AuthUser):
 async def export_epm(project_id: UUID, user: AuthUser):
     """Export the project Bill of Materials in Tekla EPM compatible spreadsheet format."""
     db = get_db()
-    
+
     # Get BOM items
     bom_resp = db.table("bom_items").select("*").eq("project_id", str(project_id)).execute()
     items = bom_resp.data or []
-    
+
     epm_csv = _generate_epm_csv_content(items)
-    
+
     return Response(
         content=epm_csv,
         media_type="text/csv",

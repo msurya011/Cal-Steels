@@ -9,11 +9,17 @@ __pycache__/
 
 # Next.js
 frontend/.next/
+*.tsbuildinfo
 
-# Optional
+# Build & Logs
 dist/
 build/
 *.log
+*.txt
 
-#uploads
+# Temporary local DB files & Uploads
+local_db.json*.tmp
+local_db.json.bak
+local_db.json.corrupt_backup
 uploads/
+_mount_write_test.txt

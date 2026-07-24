@@ -745,7 +745,8 @@ class ReconstructionResult:
 
 def run_reconstruction(
     members:           list,
-    floor_elevation_ft: float = 14.0,
+    *,
+    floor_elevation_ft: float,
     base_elevation_ft:  float = 0.0,
 ) -> ReconstructionResult:
     """
@@ -753,8 +754,10 @@ def run_reconstruction(
 
     Args:
         members:            List of member dicts from structural_schema._convert_member
-        floor_elevation_ft: Y elevation for beams/joists/girders
-        base_elevation_ft:  Y elevation for column bases
+        floor_elevation_ft: Y elevation for beams/joists/girders. No default --
+                            always the page's actual, user-entered Top of Steel.
+        base_elevation_ft:  Y elevation for column bases. Defaults to 0.0
+                            (ground origin), not a guessed T.O.S.
 
     Returns:
         ReconstructionResult with fully processed model data

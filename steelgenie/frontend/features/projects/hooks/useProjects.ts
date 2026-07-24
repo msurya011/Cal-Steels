@@ -50,6 +50,27 @@ export function useProjects() {
     },
   })
 
+  // Query: Folders (for the dashboard's folder rail / "New Folder")
+  const { data: folders = [], isLoading: foldersLoading } = useQuery({
+    queryKey: ['folders'],
+    queryFn: projectsApi.listFolders,
+  })
+
+  const createFolderMutation = useMutation({
+    mutationFn: projectsApi.createFolder,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['folders'] })
+    },
+  })
+
+  const deleteFolderMutation = useMutation({
+    mutationFn: projectsApi.deleteFolder,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['folders'] })
+      queryClient.invalidateQueries({ queryKey: ['projects'] })
+    },
+  })
+
   return {
     projects,
     isLoading,
@@ -60,5 +81,9 @@ export function useProjects() {
     deleteProject: deleteMutation.mutateAsync,
     pinProject: pinMutation.mutateAsync,
     cloneProject: cloneMutation.mutateAsync,
+    folders,
+    foldersLoading,
+    createFolder: createFolderMutation.mutateAsync,
+    deleteFolder: deleteFolderMutation.mutateAsync,
   }
 }

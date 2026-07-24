@@ -137,6 +137,10 @@ _STRUCT_LABEL_RE = re.compile(
     r'\b(COL\b|HSS\d|W\d{1,2}[Xx]|TS\d|MC\d|BF\s*[-–]\s*\d)',
     re.I)
 _OPENING_REGION_RE = re.compile(r'\bOPENING\b', re.I)
+_VOID_LABEL_RE = re.compile(
+    r'\b(?:VOID|SHAFT|EV|ELEVATOR|OPNG|OPEN)\b|\bE\.\s*V\.?(?!\w)|\bELEV\.?(?!\w)',
+    re.I
+)
 
 # ── Brace enrichment constants ────────────────────────────────────────────────
 # Maximum distance (pts) from brace midpoint to associate a section callout.
@@ -672,18 +676,21 @@ def _endpoints_on_nodes(cand: dict, nodes: list) -> tuple:
 
 def extract_opening_regions(page) -> list:
     """
-    Return (cx, cy) of every 'OPENING' / 'OPEN' text block on the page.
+    Return (cx, cy, snap_limit) of every opening/void/shaft/elevator label block on the page.
 
     In framing plans, floor openings (stairwells, elevator shafts, mechanical
     penetrations) are conventionally marked with diagonal X-lines drawn across
     the void.  These lines must not be classified as structural braces.
-    Any diagonal whose midpoint falls within OPENING_SNAP_PT of an OPENING
-    label is rejected by the classifier.
+    Any diagonal whose midpoint falls within the associated snap limit of an opening
+    or void label is rejected by the classifier.
     """
     out = []
     for b in page.get_text("blocks"):
-        if _OPENING_REGION_RE.search(b[4]):
-            out.append(((b[0] + b[2]) / 2, (b[1] + b[3]) / 2))
+        txt = b[4]
+        if _OPENING_REGION_RE.search(txt):
+            out.append(((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 150.0))
+        elif _VOID_LABEL_RE.search(txt):
+            out.append(((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 50.0))
     return out
 
 
@@ -953,12 +960,21 @@ def classify(candidates: list,
         # ── Opening annotation rejection ──────────────────────────────────────
         # Floor openings (stairwells, elevator shafts) are drawn with diagonal
         # X-graphic lines to indicate the void.  If the candidate midpoint lies
-        # within OPENING_SNAP_PT of any OPENING text label, reject it.
+        # within the associated snap limit of any opening or void label, reject it.
         if opening_regions:
             _cx = (c["x1"] + c["x2"]) / 2
             _cy = (c["y1"] + c["y2"]) / 2
-            if any(math.hypot(_cx - ox, _cy - oy) < OPENING_SNAP_PT
-                   for ox, oy in opening_regions):
+            rejected_by_opening = False
+            for item in opening_regions:
+                if len(item) == 3:
+                    ox, oy, snap = item
+                else:
+                    ox, oy = item
+                    snap = OPENING_SNAP_PT
+                if math.hypot(_cx - ox, _cy - oy) < snap:
+                    rejected_by_opening = True
+                    break
+            if rejected_by_opening:
                 c["confidence"]    = "REJECT"
                 c["reject_reason"] = "opening_annotation"
                 results.append(c)

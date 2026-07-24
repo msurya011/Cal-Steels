@@ -1,14 +1,18 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '../../features/auth/hooks/useAuth'
 import { useProjects } from '../../features/projects/hooks/useProjects'
 import { ProjectCard } from '../../features/projects/components/ProjectCard'
+import { ProjectRow } from '../../features/projects/components/ProjectRow'
 import { CreateProjectModal } from '../../features/projects/components/CreateProjectModal'
 import { Spinner } from '../../components/ui/Spinner'
-import { Plus, Search, LogOut } from 'lucide-react'
+import { Plus, Search, LogOut, LayoutGrid, List, FolderPlus, Folder, X } from 'lucide-react'
 import { toast } from 'sonner'
+
+type DashboardTab = 'mine' | 'company' | 'examples'
+type ViewMode = 'grid' | 'table'
 
 export default function ProjectsPage() {
   const router = useRouter()
@@ -20,16 +24,72 @@ export default function ProjectsPage() {
     pinProject,
     cloneProject,
     deleteProject,
+    folders,
+    createFolder,
+    deleteFolder,
   } = useProjects()
 
   const [search, setSearch] = useState('')
   const [showModal, setShowModal] = useState(false)
+  const [tab, setTab] = useState<DashboardTab>('mine')
+  const [viewMode, setViewMode] = useState<ViewMode>('grid')
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null)
+
+  // Persist view mode + last tab across visits, like a real product would.
+  useEffect(() => {
+    const savedView = typeof window !== 'undefined' ? localStorage.getItem('dashboard_view_mode') : null
+    if (savedView === 'grid' || savedView === 'table') setViewMode(savedView)
+  }, [])
+  useEffect(() => {
+    if (typeof window !== 'undefined') localStorage.setItem('dashboard_view_mode', viewMode)
+  }, [viewMode])
+
+  // Tab split: My Projects (owned, non-example) / Company Projects (shared
+  // to the company, not mine) / Examples (is_example flag). Mirrors
+  // SteelGenie's My Projects / Company Projects / Examples tabs.
+  const tabbedProjects = useMemo(() => {
+    return projects.filter((p: any) => {
+      if (p.is_example) return tab === 'examples'
+      if (tab === 'examples') return false
+      const isMine = !user?.id || p.owner_id === user.id
+      if (tab === 'mine') return isMine
+      // company: shared scope and not the current user's own project
+      return p.share_scope === 'company' && !isMine
+    })
+  }, [projects, tab, user])
+
+  const folderFiltered = useMemo(() => {
+    if (!activeFolderId) return tabbedProjects
+    return tabbedProjects.filter((p: any) => p.folder_id === activeFolderId)
+  }, [tabbedProjects, activeFolderId])
 
   // Filter projects by search
-  const filteredProjects = projects.filter((p: any) =>
+  const filteredProjects = folderFiltered.filter((p: any) =>
     p.name.toLowerCase().includes(search.toLowerCase()) ||
     (p.number && p.number.toLowerCase().includes(search.toLowerCase()))
   )
+
+  const handleNewFolder = async () => {
+    const name = window.prompt('Folder name')
+    if (!name || !name.trim()) return
+    try {
+      await createFolder(name.trim())
+      toast.success('Folder created')
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to create folder')
+    }
+  }
+
+  const handleDeleteFolder = async (id: string) => {
+    if (!confirm('Delete this folder? Projects inside it will move back to Unfiled.')) return
+    try {
+      await deleteFolder(id)
+      if (activeFolderId === id) setActiveFolderId(null)
+      toast.success('Folder deleted')
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to delete folder')
+    }
+  }
 
   const handleOpenProject = (project: any) => {
     router.push(`/projects/${project.id}`)
@@ -37,8 +97,9 @@ export default function ProjectsPage() {
 
   const handleCreate = async (data: any) => {
     try {
-      await createProject(data)
+      const project = await createProject(data)
       toast.success('Project created successfully')
+      return project
     } catch (err: any) {
       toast.error(err.message || 'Failed to create project')
       throw err
@@ -224,6 +285,86 @@ export default function ProjectsPage() {
           </button>
         </div>
 
+        {/* My Projects / Company Projects / Examples */}
+        <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', backgroundColor: 'rgba(30,41,59,0.4)', padding: '4px', borderRadius: '10px', width: 'fit-content' }}>
+          {([
+            ['mine', 'My Projects', projects.filter((p: any) => !p.is_example && (!user?.id || p.owner_id === user.id)).length],
+            ['company', 'Company Projects', projects.filter((p: any) => p.share_scope === 'company' && p.owner_id !== user?.id).length],
+            ['examples', 'Examples', projects.filter((p: any) => p.is_example).length],
+          ] as [DashboardTab, string, number][]).map(([id, label, count]) => (
+            <button
+              key={id}
+              onClick={() => { setTab(id); setActiveFolderId(null) }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 16px',
+                backgroundColor: tab === id ? '#3B82F6' : 'transparent',
+                border: 'none', borderRadius: '7px', cursor: 'pointer',
+                color: tab === id ? '#FFFFFF' : '#94A3B8', fontSize: '13px', fontWeight: 600,
+                transition: 'all 0.15s ease',
+              }}
+            >
+              {label}
+              <span style={{
+                fontSize: '10px', padding: '1px 6px', borderRadius: '999px',
+                backgroundColor: tab === id ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.06)',
+                color: tab === id ? '#FFFFFF' : '#64748B',
+              }}>
+                {count}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        {/* Folder rail */}
+        <div style={{ display: 'flex', gap: '8px', marginBottom: '24px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <button
+            onClick={() => setActiveFolderId(null)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 12px',
+              backgroundColor: activeFolderId === null ? 'rgba(59,130,246,0.15)' : 'transparent',
+              border: `1px solid ${activeFolderId === null ? 'rgba(59,130,246,0.35)' : 'rgba(59,130,246,0.1)'}`,
+              borderRadius: '999px', color: activeFolderId === null ? '#60A5FA' : '#64748B',
+              fontSize: '12px', fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            All
+          </button>
+          {folders.map((f: any) => (
+            <div
+              key={f.id}
+              style={{
+                display: 'flex', alignItems: 'center', gap: '4px', padding: '6px 10px 6px 12px',
+                backgroundColor: activeFolderId === f.id ? 'rgba(59,130,246,0.15)' : 'transparent',
+                border: `1px solid ${activeFolderId === f.id ? 'rgba(59,130,246,0.35)' : 'rgba(59,130,246,0.1)'}`,
+                borderRadius: '999px', color: activeFolderId === f.id ? '#60A5FA' : '#64748B',
+                fontSize: '12px', fontWeight: 600,
+              }}
+            >
+              <button
+                onClick={() => setActiveFolderId(f.id)}
+                style={{ display: 'flex', alignItems: 'center', gap: '5px', background: 'none', border: 'none', color: 'inherit', fontSize: 'inherit', fontWeight: 'inherit', cursor: 'pointer', padding: 0 }}
+              >
+                <Folder size={12} /> {f.name}
+              </button>
+              <X
+                size={11}
+                style={{ cursor: 'pointer', opacity: 0.6 }}
+                onClick={() => handleDeleteFolder(f.id)}
+              />
+            </div>
+          ))}
+          <button
+            onClick={handleNewFolder}
+            style={{
+              display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 12px',
+              backgroundColor: 'transparent', border: '1px dashed rgba(59,130,246,0.25)',
+              borderRadius: '999px', color: '#64748B', fontSize: '12px', fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            <FolderPlus size={12} /> New Folder
+          </button>
+        </div>
+
         {/* Search & Stats Bar */}
         <div style={{ display: 'flex', gap: '20px', marginBottom: '32px', flexWrap: 'wrap-reverse', alignItems: 'center' }}>
           {/* Search Input */}
@@ -250,18 +391,44 @@ export default function ProjectsPage() {
             />
           </div>
 
+          {/* Grid / Table view toggle */}
+          <div style={{ display: 'flex', backgroundColor: 'rgba(30,41,59,0.4)', border: '1px solid rgba(59,130,246,0.08)', borderRadius: '8px', padding: '3px' }}>
+            <button
+              onClick={() => setViewMode('grid')}
+              title="Grid view"
+              style={{
+                display: 'flex', alignItems: 'center', padding: '6px 10px', borderRadius: '6px', border: 'none',
+                backgroundColor: viewMode === 'grid' ? '#3B82F6' : 'transparent',
+                color: viewMode === 'grid' ? '#FFFFFF' : '#64748B', cursor: 'pointer',
+              }}
+            >
+              <LayoutGrid size={15} />
+            </button>
+            <button
+              onClick={() => setViewMode('table')}
+              title="Table view"
+              style={{
+                display: 'flex', alignItems: 'center', padding: '6px 10px', borderRadius: '6px', border: 'none',
+                backgroundColor: viewMode === 'table' ? '#3B82F6' : 'transparent',
+                color: viewMode === 'table' ? '#FFFFFF' : '#64748B', cursor: 'pointer',
+              }}
+            >
+              <List size={15} />
+            </button>
+          </div>
+
           {/* Mini Stats */}
           <div style={{ display: 'flex', gap: '12px', flex: '1 1 auto', justifyContent: 'flex-end' }}>
             <div style={{ padding: '8px 16px', backgroundColor: 'rgba(30, 41, 59, 0.4)', border: '1px solid rgba(59, 130, 246, 0.08)', borderRadius: '8px', textAlign: 'center' }}>
-              <span style={{ fontSize: '18px', fontWeight: 700, color: '#F1F5F9' }}>{projects.length}</span>
+              <span style={{ fontSize: '18px', fontWeight: 700, color: '#F1F5F9' }}>{filteredProjects.length}</span>
               <span style={{ fontSize: '11px', color: '#64748B', marginLeft: '6px' }}>Total</span>
             </div>
             <div style={{ padding: '8px 16px', backgroundColor: 'rgba(30, 41, 59, 0.4)', border: '1px solid rgba(59, 130, 246, 0.08)', borderRadius: '8px', textAlign: 'center' }}>
-              <span style={{ fontSize: '18px', fontWeight: 700, color: '#F59E0B' }}>{projects.filter((p: any) => p.status === 'in_progress').length}</span>
+              <span style={{ fontSize: '18px', fontWeight: 700, color: '#F59E0B' }}>{filteredProjects.filter((p: any) => p.status === 'in_progress').length}</span>
               <span style={{ fontSize: '11px', color: '#64748B', marginLeft: '6px' }}>Active</span>
             </div>
             <div style={{ padding: '8px 16px', backgroundColor: 'rgba(30, 41, 59, 0.4)', border: '1px solid rgba(59, 130, 246, 0.08)', borderRadius: '8px', textAlign: 'center' }}>
-              <span style={{ fontSize: '18px', fontWeight: 700, color: '#10B981' }}>{projects.filter((p: any) => p.status === 'completed').length}</span>
+              <span style={{ fontSize: '18px', fontWeight: 700, color: '#10B981' }}>{filteredProjects.filter((p: any) => p.status === 'completed').length}</span>
               <span style={{ fontSize: '11px', color: '#64748B', marginLeft: '6px' }}>Done</span>
             </div>
           </div>
@@ -300,14 +467,24 @@ export default function ProjectsPage() {
               </svg>
             </div>
             <h2 style={{ margin: '0 0 8px', fontSize: '18px', fontWeight: 600, color: '#94A3B8' }}>
-              {search ? 'No projects match your search' : 'No projects yet'}
+              {search
+                ? 'No projects match your search'
+                : tab === 'company'
+                ? 'Nothing shared to your company yet'
+                : tab === 'examples'
+                ? 'No example projects yet'
+                : 'No projects yet'}
             </h2>
             <p style={{ margin: '0 0 24px', fontSize: '14px', color: '#475569', maxWidth: '380px' }}>
               {search
                 ? 'Try editing your search query or clear the filter to view all projects.'
+                : tab === 'company'
+                ? 'Projects another teammate marks as shared to the company will show up here.'
+                : tab === 'examples'
+                ? 'Pre-built sample projects will appear here once added.'
                 : 'Create your first project to begin uploading and extracting structural plans.'}
             </p>
-            {!search && (
+            {!search && tab === 'mine' && (
               <button
                 onClick={() => setShowModal(true)}
                 style={{
@@ -326,10 +503,36 @@ export default function ProjectsPage() {
               </button>
             )}
           </div>
-        ) : (
+        ) : viewMode === 'grid' ? (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: '24px' }}>
             {filteredProjects.map((project: any) => (
               <ProjectCard
+                key={project.id}
+                project={project}
+                onOpen={handleOpenProject}
+                onPin={handlePin}
+                onClone={handleClone}
+                onDelete={handleDelete}
+              />
+            ))}
+          </div>
+        ) : (
+          <div style={{ border: '1px solid rgba(59,130,246,0.1)', borderRadius: '12px', overflow: 'hidden' }}>
+            <div style={{
+              display: 'grid', gridTemplateColumns: '48px 1fr 120px 130px 140px 110px 90px',
+              gap: '12px', padding: '10px 16px', backgroundColor: 'rgba(30,41,59,0.5)',
+              fontSize: '11px', fontWeight: 700, color: '#64748B', textTransform: 'uppercase', letterSpacing: '0.4px',
+            }}>
+              <span />
+              <span>Name</span>
+              <span>Status</span>
+              <span>Standard</span>
+              <span>Modified</span>
+              <span>Created</span>
+              <span />
+            </div>
+            {filteredProjects.map((project: any) => (
+              <ProjectRow
                 key={project.id}
                 project={project}
                 onOpen={handleOpenProject}
