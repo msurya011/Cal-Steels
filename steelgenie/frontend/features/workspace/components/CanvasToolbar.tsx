@@ -1,6 +1,6 @@
 import React, { useState } from 'react'
 import { useWorkspaceStore, ToolType } from '../../../lib/stores/workspaceStore'
-import { Pointer, Hand, Ruler, MapPin, Undo2, ZoomIn, ZoomOut, Maximize2, Zap } from 'lucide-react'
+import { Pointer, Hand, Ruler, MapPin, Undo2, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react'
 
 const SCALE_OPTIONS = [
   { label: '1/32" = 1\'-0"',  ratio: 384 },
@@ -58,9 +58,6 @@ export function CanvasToolbar({ onScaleChange, onRunAnalyse, isAnalysing }: Canv
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [setTool])
-  const [floorElevation, setFloorElevation] = useState('12.0')
-  const [detectUnlabeled, setDetectUnlabeled] = useState(false)
-
   const handleZoom = (direction: 'in' | 'out' | 'reset') => {
     if (direction === 'reset') {
       setZoom(1.0)
@@ -69,11 +66,6 @@ export function CanvasToolbar({ onScaleChange, onRunAnalyse, isAnalysing }: Canv
     } else {
       setZoom(Math.max(zoomLevel - 0.25, 0.5))
     }
-  }
-
-  const handleRunAnalyseClick = () => {
-    if (isAnalysing || !selectedRatio) return
-    onRunAnalyse(detectUnlabeled, parseFloat(floorElevation) || 12.0)
   }
 
   return (
@@ -188,60 +180,6 @@ export function CanvasToolbar({ onScaleChange, onRunAnalyse, isAnalysing }: Canv
           style={{ background: 'transparent', border: 'none', borderRadius: '6px', padding: '6px 10px', color: '#94A3B8', cursor: 'pointer' }}
         >
           <Maximize2 size={14} />
-        </button>
-      </div>
-
-      {/* Floor elevation & Extraction controls */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ fontSize: '11px', color: '#64748B', fontWeight: 600, textTransform: 'uppercase' }}>T.O.S (ft)</span>
-          <input
-            value={floorElevation}
-            onChange={(e) => setFloorElevation(e.target.value)}
-            style={{
-              width: '44px',
-              padding: '4px 8px',
-              backgroundColor: '#1B3A60',
-              border: '1px solid rgba(59, 130, 246, 0.15)',
-              borderRadius: '6px',
-              color: '#F1F5F9',
-              fontSize: '12px',
-              fontWeight: 600,
-              outline: 'none',
-              textAlign: 'center',
-            }}
-          />
-        </div>
-
-        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-          <input
-            type="checkbox"
-            checked={detectUnlabeled}
-            onChange={(e) => setDetectUnlabeled(e.target.checked)}
-            style={{ cursor: 'pointer' }}
-          />
-          <span style={{ fontSize: '11px', color: '#94A3B8', fontWeight: 500 }}>Unlabelled</span>
-        </label>
-
-        <button
-          onClick={handleRunAnalyseClick}
-          disabled={isAnalysing || !selectedRatio}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '6px',
-            padding: '5px 12px',
-            backgroundColor: isAnalysing || !selectedRatio ? 'rgba(59, 130, 246, 0.15)' : '#3B82F6',
-            border: 'none',
-            borderRadius: '6px',
-            color: isAnalysing || !selectedRatio ? '#475569' : '#FFFFFF',
-            fontSize: '12px',
-            fontWeight: 600,
-            cursor: isAnalysing || !selectedRatio ? 'not-allowed' : 'pointer',
-          }}
-        >
-          <Zap size={14} />
-          {isAnalysing ? 'Extracting...' : 'Extract'}
         </button>
       </div>
     </div>

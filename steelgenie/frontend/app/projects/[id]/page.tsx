@@ -207,7 +207,10 @@ export default function TakeoffWorkspacePage() {
     try {
       const res = await membersApi.analyse(page.id, {
         scale_ratio: page.scale_num,
-        detect_unlabeled: false,
+        // Extraction always finds both labeled AND unlabeled beams in one
+        // pass now (violet vs. pink is purely a color differentiation, not
+        // an opt-in) -- no separate "Unlabelled" toggle/step anymore.
+        detect_unlabeled: true,
         detect_braces: true,
         // 300 DPI: ~40% faster OCR on scanned sheets with acceptable accuracy.
         // Only affects raster pages; vector PDFs don't use OCR.

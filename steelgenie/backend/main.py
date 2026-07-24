@@ -2427,9 +2427,11 @@ def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
 
     def _dominant_band(pts, coord_idx, tol=15.0):
         """Keep only the points in the single densest coordinate band (the
-        printed grid edge); return their opposite-axis positions + labels."""
+        printed grid edge); return their opposite-axis positions + labels,
+        plus the size of that band (how many labels actually shared the
+        coordinate) so the caller can judge how confident this reading is."""
         if not pts:
-            return [], {}
+            return [], {}, 0
         buck: dict[int, list] = {}
         for p in pts:
             buck.setdefault(round(p[coord_idx] / tol), []).append(p)
@@ -2444,12 +2446,43 @@ def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
             if not out_pos or abs(v - out_pos[-1]) > 18:
                 out_pos.append(v)
                 out_lab[v] = p[0]
-        return out_pos, out_lab
+        return out_pos, out_lab, len(best)
 
-    # numbers share a Y (a row) -> vertical grid lines at their X
-    v_grid, v_lab = _dominant_band(nums, 2)
-    # letters share an X (a column) -> horizontal grid lines at their Y
-    h_grid, h_lab = _dominant_band(lets, 1)
+    # Which set of bubbles ("numbers" or "letters") labels the VERTICAL grid
+    # lines (printed in a row along the top/bottom, sharing one Y) versus the
+    # HORIZONTAL grid lines (printed in a column along a side, sharing one X)
+    # is a drawing-convention choice, not a fixed rule -- most sheets number
+    # the columns and letter the rows, but plenty do the opposite. Hard-coding
+    # "numbers = vertical" broke every foundation plan drawn the other way
+    # (grid detector would only ever find 1 usable point per axis and bail
+    # out to the much less accurate fallback). Instead, try BOTH band
+    # hypotheses for each label set and keep whichever reading actually found
+    # more labels sharing a coordinate -- that is the one describing how this
+    # specific sheet was drawn.
+    nums_as_row, nums_as_row_lab, nums_row_n = _dominant_band(nums, 2)   # row along top/bottom
+    nums_as_col, nums_as_col_lab, nums_col_n = _dominant_band(nums, 1)   # column along a side
+    lets_as_row, lets_as_row_lab, lets_row_n = _dominant_band(lets, 2)
+    lets_as_col, lets_as_col_lab, lets_col_n = _dominant_band(lets, 1)
+
+    nums_is_row = nums_row_n >= nums_col_n
+    lets_is_row = lets_row_n >= lets_col_n
+
+    if nums_is_row and not lets_is_row:
+        # Standard convention: numbers along the top -> vertical lines;
+        # letters along a side -> horizontal lines.
+        v_grid, v_lab = nums_as_row, nums_as_row_lab
+        h_grid, h_lab = lets_as_col, lets_as_col_lab
+    elif lets_is_row and not nums_is_row:
+        # Inverted convention: letters along the top -> vertical lines;
+        # numbers along a side -> horizontal lines.
+        v_grid, v_lab = lets_as_row, lets_as_row_lab
+        h_grid, h_lab = nums_as_col, nums_as_col_lab
+    else:
+        # Ambiguous (both read as "row" or both as "column") -- fall back to
+        # the historical assumption rather than guess.
+        v_grid, v_lab = nums_as_row, nums_as_row_lab
+        h_grid, h_lab = lets_as_col, lets_as_col_lab
+
     if len(v_grid) < 2 or len(h_grid) < 2:
         # Not enough grid to anchor to -- caller falls back to the old path.
         return []
@@ -2479,16 +2512,30 @@ def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
     MIN_FRAGS = 5
     MIN_SPAN = 16.0
 
+    # Threshold for the box-vs-cross check below. A genuine footing symbol's
+    # perpendicular edges (or inner detailing) are spread well beyond dash-
+    # pattern jitter (a couple of points); a bare gridline crossing has zero
+    # spread in the direction along its own line. 8pt sits safely between
+    # the two on every sheet scale this function is used at (search radius
+    # is itself scale-adjusted above).
+    MIN_ORTHO_SPREAD = 8.0
+
     out = []
     for gy in h_grid:
         for gx in v_grid:
             xs: list[float] = []
             ys: list[float] = []
+            hz_y: list[float] = []   # y-centers of roughly-horizontal fragments
+            vt_x: list[float] = []   # x-centers of roughly-vertical fragments
             n = 0
             for x1, y1, x2, y2, cx, cy in frags:
                 if abs(cx - gx) < R and abs(cy - gy) < R:
                     xs += [x1, x2]
                     ys += [y1, y2]
+                    if abs(x2 - x1) >= abs(y2 - y1):
+                        hz_y.append(cy)
+                    else:
+                        vt_x.append(cx)
                     n += 1
             if n < MIN_FRAGS:
                 continue
@@ -2497,6 +2544,31 @@ def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
             # Require real 2-D extent -- a bare wall/grid crossing is thin in
             # one axis (fragments strung along a single line).
             if sw < MIN_SPAN or sh < MIN_SPAN:
+                continue
+            # Require an actual BOX, not two crossing reference lines. A
+            # dashed gridline crossing another dashed gridline at this
+            # intersection produces fragments with real x-span (from the
+            # horizontal line) AND real y-span (from the vertical line), so
+            # sw/sh alone can't tell it apart from a genuine footing outline.
+            # The real signal: a footing's horizontal-oriented fragments
+            # (flange lines, inner square, hatching) sit at MANY different Y
+            # positions across the box, and its vertical-oriented fragments
+            # sit at MANY different X positions -- real spread in the
+            # direction perpendicular to each fragment's own run. A single
+            # reference line crossing this window contributes fragments that
+            # are all collinear with each other -- its horizontal-oriented
+            # dash pieces are all at the SAME Y (the one line), its
+            # vertical-oriented pieces all at the SAME X. This is what
+            # previously let a secondary/reference gridline (e.g. a half
+            # grid line drawn for wall alignment, not a column line) get
+            # flagged as a footing at every row it happened to cross, while
+            # still correctly keeping genuinely detailed footing symbols
+            # (nested squares, corner north-arrow/leader clutter, etc.)
+            # whose fragments are far too dense for a simple gap-clustering
+            # test to tell apart from one continuous line.
+            hz_spread = (max(hz_y) - min(hz_y)) if len(hz_y) >= 2 else 0.0
+            vt_spread = (max(vt_x) - min(vt_x)) if len(vt_x) >= 2 else 0.0
+            if hz_spread < MIN_ORTHO_SPREAD or vt_spread < MIN_ORTHO_SPREAD:
                 continue
             _vlab = v_lab.get(gx, "?")
             _hlab = h_lab.get(gy, "?")
@@ -3144,7 +3216,8 @@ def classify_member(profile: str,
                     cx: float = 0, cy: float = 0,
                     column_symbols: list = None,
                     v_grid: list = None,
-                    h_grid: list = None) -> str:
+                    h_grid: list = None,
+                    is_girt: bool = False) -> str:
     """
     Classify a steel section label as column / beam / brace.
 
@@ -3174,6 +3247,14 @@ def classify_member(profile: str,
         try:
             d1 = float(hss.group(1))
             d2 = float(hss.group(2))
+            # A GIRT is by definition a horizontal secondary framing member --
+            # never a column -- regardless of the HSS being square in section.
+            # Without this, square HSS girts (e.g. "HSS10X10X3/8 GIRT") were
+            # forced to "column" below and lost their real profile, then
+            # re-appeared as a phantom unlabeled "(beam?)" candidate on the
+            # same drawn line.
+            if is_girt:
+                return "beam"
             # Only perfectly square HSS (e.g. HSS6X6, HSS8X8) are columns;
             # all rectangular HSS spanning between grids are beams.
             return "column" if abs(d1 - d2) < 0.5 else "beam"
@@ -3441,6 +3522,11 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
                         # expected beam direction (wide text → H beam; tall → V)
                         "bbox_w": max(eff_w, 1.0),
                         "bbox_h": max(eff_h, 1.0),
+                        # "GIRT" appearing in the same text as the profile match
+                        # (e.g. "HSS10X10X3/8 GIRT") means this is a horizontal
+                        # secondary framing member, never a column — see
+                        # classify_member's is_girt override.
+                        "is_girt": "GIRT" in text.upper(),
                     })
                 break
 
@@ -3500,7 +3586,8 @@ def precompute_span_grids(profiles: list, plan_bounds: tuple,
     col_ys: list[float] = []
     for p in profiles:
         mt = classify_member(p["profile"], p["cx"], p["cy"],
-                             column_symbols=None, v_grid=None, h_grid=None)
+                             column_symbols=None, v_grid=None, h_grid=None,
+                             is_girt=p.get("is_girt", False))
         if mt == "column":
             col_xs.append(p["cx"])
             col_ys.append(p["cy"])
@@ -3672,6 +3759,12 @@ def build_members(profiles, page_w, page_h,
         candidates = []
         for s_idx, sym in enumerate(column_symbols):
             for p_idx, p in enumerate(profiles):
+                # A GIRT label is never a column, no matter how close it sits
+                # to a column symbol (e.g. a roof-edge girt framing right into
+                # a corner column) -- skip it so it falls through to Pass 2's
+                # classify_member, which now returns "beam" for is_girt.
+                if p.get("is_girt"):
+                    continue
                 d = math.hypot(p["cx"] - sym["cx"], p["cy"] - sym["cy"])
                 if d < SYMBOL_ASSOC_RADIUS:
                     candidates.append((d, s_idx, p_idx))
@@ -3715,7 +3808,8 @@ def build_members(profiles, page_w, page_h,
             pre_col_ys.append(p["cy"])
         else:
             mt = classify_member(p["profile"], p["cx"], p["cy"],
-                                 column_symbols=None, v_grid=None, h_grid=None)
+                                 column_symbols=None, v_grid=None, h_grid=None,
+                                 is_girt=p.get("is_girt", False))
             if mt == "column":
                 pre_col_xs.append(p["cx"])
                 pre_col_ys.append(p["cy"])
@@ -3772,6 +3866,7 @@ def build_members(profiles, page_w, page_h,
                 p["profile"], p["cx"], p["cy"],
                 column_symbols=None,
                 v_grid=v_grid, h_grid=h_grid,
+                is_girt=p.get("is_girt", False),
             )
 
         # ── Beam-line override ────────────────────────────────────────────────
@@ -3783,17 +3878,32 @@ def build_members(profiles, page_w, page_h,
         # column symbols (annotation boxes, beam flanges, etc.) that grab
         # nearby beam labels in Pass 1.
         _MIN_BEAM_PT = 60   # ≈ 6 ft at 1/8" — anything shorter is a tick/stub
-        # Definitive column sections — square HSS and PIPE are ALWAYS columns
-        # (a column viewed in plan often sits on a grid/wall line, so the line
-        # match must NOT demote it to a beam).  This is what keeps HSS6X6 columns
-        # on foundation / rotated sheets classified correctly.
+        # Definitive column sections — PIPE is ALWAYS a column (a column
+        # viewed in plan often sits on a grid/wall line, so the line match
+        # must NOT demote it to a beam).
         _pu = p["profile"].upper()
         _definitive_col = bool(re.match(r'PIPE', _pu))
         _hssm = re.match(r'HSS([\d.]+)[Xx]([\d.]+)', _pu)
+        _is_square_hss = False
         if _hssm:
             try:
                 if abs(float(_hssm.group(1)) - float(_hssm.group(2))) < 0.5:
-                    _definitive_col = True      # square HSS → column
+                    _is_square_hss = True
+                    # Square HSS is only "definitively" a column when a real
+                    # column SYMBOL (I/H mark / baseplate) was actually
+                    # matched to it in Pass 1 above -- that's graphical
+                    # confirmation, not a shape guess. Square HSS is routinely
+                    # used as a BEAM too (framing between two supports, with
+                    # or without a "GIRT" callout), so without that symbol
+                    # evidence a confirmed vector-line match below must be
+                    # allowed to override it, same as every other profile
+                    # type. This still keeps HSS6X6 columns on foundation /
+                    # rotated sheets classified correctly (those DO have a
+                    # matched symbol), it just stops forcing every square HSS
+                    # with no symbol at all to "column" regardless of a real
+                    # beam-length line match.
+                    if p_idx in symbol_matched_cols:
+                        _definitive_col = True      # square HSS w/ real symbol → column
             except ValueError:
                 pass
         if mtype == "column" and beam_line_map and not _definitive_col:
@@ -3802,6 +3912,20 @@ def build_members(profiles, page_w, page_h,
                 mtype = "beam"
                 if p_idx in symbol_matched_cols:
                     symbol_matched_cols.discard(p_idx)
+
+        # ── Square-HSS symbol override ────────────────────────────────────────
+        # A square HSS label can get claimed by Pass 1 purely because it sits
+        # close to a real column symbol -- beams routinely frame INTO a
+        # column, so their label often lands right next to one. That
+        # proximity alone doesn't make the label itself a column. If it also
+        # has its own confirmed, beam-length vector-line match, trust that
+        # structural evidence over the symbol proximity, exactly like the
+        # override above already does for every other profile type.
+        if mtype == "column" and _is_square_hss and p_idx in symbol_matched_cols and beam_line_map:
+            _hit = beam_line_map.get(p_idx)
+            if _hit and _hit.get("length_pt", 0) >= _MIN_BEAM_PT:
+                mtype = "beam"
+                symbol_matched_cols.discard(p_idx)
 
         # ── Section-type override ─────────────────────────────────────────────
         # Light W-sections (W10 weight<22, W12 weight<26) are NEVER used as
@@ -3821,6 +3945,33 @@ def build_members(profiles, page_w, page_h,
                 if _clearly_beam:
                     mtype = "beam"
                     symbol_matched_cols.discard(p_idx)
+
+        # Angle sections (L-shapes) and small HSS (nominal ≤ 3.5 in) are
+        # lacing / bracing / anchor ties -- never a primary building column
+        # in standard steel construction (real columns here run HSS6X6 and
+        # up, or W-shapes). These labels routinely sit right next to a real
+        # column (a brace frames directly into the column it's anchored to,
+        # or the text is even just part of a general note like "HSS3X3 & L3X3
+        # BRACING AT EA ROOF DAVIT ANCHOR" with no drawn member at all there),
+        # so classify_member's own shape-based default or a Pass-1 symbol-
+        # proximity match can tag them "column" with no real evidence. Applies
+        # regardless of symbol_matched_cols -- unlike the checks above, this
+        # one isn't conditioned on HOW it became "column", because an angle or
+        # a 3x3 HSS is never a column no matter which path produced that
+        # classification.
+        if mtype == "column":
+            _pu2 = p["profile"].upper()
+            _is_angle = bool(re.match(r'^L\d', _pu2))
+            _hsm2 = re.match(r'^HSS([\d.]+)[Xx]([\d.]+)', _pu2)
+            _is_small_hss = False
+            if _hsm2:
+                try:
+                    _is_small_hss = max(float(_hsm2.group(1)), float(_hsm2.group(2))) <= 3.5
+                except ValueError:
+                    pass
+            if _is_angle or _is_small_hss:
+                mtype = "beam"
+                symbol_matched_cols.discard(p_idx)
 
         render_cx, render_cy = p["cx"], p["cy"]
         snapped = False
@@ -4281,8 +4432,17 @@ def build_members(profiles, page_w, page_h,
         print(f"[DEDUP] Parallel-overlap pass removed {_po_dropped} doubled beam(s)")
     deduped_beams = _po_kept
 
-    deduped = deduped_beams + no_span_beams + \
-              [m for m in filtered if m["type"] != "beam"]
+    # `no_span_beams` already contains every non-beam member (columns, braces,
+    # footings) -- the loop above stashes it there via the
+    # `mem["type"] != "beam" or mem.get("bx1") is None` condition, which is
+    # true for ALL of them regardless of span. Re-adding
+    # `[m for m in filtered if m["type"] != "beam"]` here duplicated every
+    # single column (and brace/footing) a second time at its exact rendered
+    # position -- this is what produced an extra phantom column stacked on
+    # top of every real one on framing/roof plans (columns are gated purely
+    # by type here, not by anything page-specific, so the duplication hit
+    # every drawing, not just this one).
+    deduped = deduped_beams + no_span_beams
     print(f"[DEDUP] {len(members)} -> {len(deduped)} members "
           f"({len(members)-len(deduped)} removed)")
     return deduped
@@ -4797,6 +4957,16 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
     # (typical minimum steel bay is ~8 ft, so 4 ft is well inside one bay).
     COL_TOL = max(36.0, ppf * 0.5)
 
+    def _dist_to_segment(px, py, sx1, sy1, sx2, sy2):
+        """Perpendicular distance from (px, py) to the segment (sx1,sy1)-(sx2,sy2),
+        clamped to the segment's own extent (not its infinite-line extension)."""
+        sdx, sdy = sx2 - sx1, sy2 - sy1
+        seg_len_sq = sdx * sdx + sdy * sdy
+        if seg_len_sq < 1e-6:
+            return math.hypot(px - sx1, py - sy1)
+        t = max(0.0, min(1.0, ((px - sx1) * sdx + (py - sy1) * sdy) / seg_len_sq))
+        return math.hypot(px - (sx1 + t * sdx), py - (sy1 + t * sdy))
+
     def _at_col(ex, ey, is_h):
         """True if (ex, ey) is at a column position (grid intersection or symbol)."""
         if not _has_col_data:
@@ -4806,6 +4976,16 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
         # detector missed but a labeled beam confirms (the cause of unlabeled beams
         # dropping when fewer column symbols are detected).
         if any(math.hypot(ex - lex, ey - ley) < COL_TOL for lex, ley in _lab_ends):
+            return True
+        # A joist/secondary beam commonly bears MID-SPAN on a labeled girder --
+        # several joists frame into the same girder at different points along
+        # its length, not just at the girder's own two endpoints.  Treat lying
+        # on a labeled beam's drawn centreline (anywhere along its span, not
+        # just its ends) as an equally real support.  This is a general rule
+        # (any drawing with joists framing into girders), not specific to any
+        # one sheet.
+        if any(_dist_to_segment(ex, ey, lx1, ly1, lx2, ly2) < UNLABELED_PERP_TOL
+               for (lx1, ly1, lx2, ly2) in lab):
             return True
         # Longitudinal tolerance remains wide (COL_TOL) to bridge end gaps.
         # Perpendicular tolerance balances two failures: too WIDE re-admits
@@ -4858,9 +5038,89 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
     # Sort by length ASCENDING so individual bay-length beams are processed before
     # long, multi-bay grid lines or dimension strings.
     sorted_lns = sorted(all_struct_lns, key=lambda s: s[4])
+    # Chain gap: how far apart two drawn fragments can be and still be treated
+    # as one broken centreline (same tolerance used for labeled beams).
+    _unlab_chain_gap = max(15.0, ppf * 1.0)
     for (lx1, ly1, lx2, ly2, ln) in sorted_lns:
         if n >= CAP:
             break
+
+        # Collinear chaining — a real beam/joist is frequently drawn as several
+        # short SOLID segments broken at every crossing girder or bearing seat.
+        # Without this, each raw fragment became its own separate (beam?)
+        # candidate: a short stub that visually looked "cut midway" instead of
+        # running the full length of the actual member. Recover the true
+        # extent from the other drawn segments before applying the filters
+        # below — this mirrors the stitching already used for labeled beams
+        # in detect_beam_lines, applied here only to unlabeled candidates.
+        _orig_x1, _orig_y1, _orig_x2, _orig_y2 = lx1, ly1, lx2, ly2
+        lx1, ly1, lx2, ly2, ln = _extend_with_thin_segs(
+            lx1, ly1, lx2, ly2, all_struct_lns, gap_tol=_unlab_chain_gap)
+
+        # Cap the chain at the nearest REAL crossing girder — not at just any
+        # grid reference line. A joist can legitimately run through a grid
+        # row that has no actual beam drawn on it in this bay (e.g. straight
+        # from row D to row F with nothing physically crossing at row E), so
+        # capping on grid-line existence alone chopped those joists short —
+        # "cut midway" again, just from the opposite direction. What must be
+        # capped is chaining into a DIFFERENT, unrelated member that only
+        # coincidentally sits on the same infinite line several rows away
+        # (e.g. a joist here and a column line elsewhere). The correct,
+        # general test for that is: does a real labeled beam actually cross
+        # this fragment's axis between the original extent and the chained
+        # end? If yes, stop there (that is the true next support). If no
+        # labeled beam crosses, the extension is following one real member,
+        # so leave it alone.
+        _adx0, _ady0 = abs(_orig_x2 - _orig_x1), abs(_orig_y2 - _orig_y1)
+        if _ady0 > _adx0:      # vertical fragment -> look for crossing H beams
+            _lo, _hi = min(_orig_y1, _orig_y2), max(_orig_y1, _orig_y2)
+            _cx = (_orig_x1 + _orig_x2) / 2
+            _above, _below = [], []
+            for (ax1, ay1, ax2, ay2) in lab:
+                if abs(ay2 - ay1) > abs(ax2 - ax1):
+                    continue                      # not a horizontal beam
+                axlo, axhi = min(ax1, ax2), max(ax1, ax2)
+                if not (axlo - 5 <= _cx <= axhi + 5):
+                    continue                      # doesn't span this fragment's x
+                ay = (ay1 + ay2) / 2
+                if ay < _lo - 2:
+                    _above.append(ay)
+                elif ay > _hi + 2:
+                    _below.append(ay)
+            if _above:
+                _cap = max(_above)
+                if ly1 < _cap: ly1 = _cap
+                if ly2 < _cap: ly2 = _cap
+            if _below:
+                _cap = min(_below)
+                if ly1 > _cap: ly1 = _cap
+                if ly2 > _cap: ly2 = _cap
+            ln = math.hypot(lx2 - lx1, ly2 - ly1)
+        elif _adx0 > _ady0:    # horizontal fragment -> look for crossing V beams
+            _lo, _hi = min(_orig_x1, _orig_x2), max(_orig_x1, _orig_x2)
+            _cy = (_orig_y1 + _orig_y2) / 2
+            _left, _right = [], []
+            for (ax1, ay1, ax2, ay2) in lab:
+                if abs(ax2 - ax1) > abs(ay2 - ay1):
+                    continue                      # not a vertical beam
+                aylo, ayhi = min(ay1, ay2), max(ay1, ay2)
+                if not (aylo - 5 <= _cy <= ayhi + 5):
+                    continue                      # doesn't span this fragment's y
+                ax = (ax1 + ax2) / 2
+                if ax < _lo - 2:
+                    _left.append(ax)
+                elif ax > _hi + 2:
+                    _right.append(ax)
+            if _left:
+                _cap = max(_left)
+                if lx1 < _cap: lx1 = _cap
+                if lx2 < _cap: lx2 = _cap
+            if _right:
+                _cap = min(_right)
+                if lx1 > _cap: lx1 = _cap
+                if lx2 > _cap: lx2 = _cap
+            ln = math.hypot(lx2 - lx1, ly2 - ly1)
+
         adx, ady = abs(lx2 - lx1), abs(ly2 - ly1)
 
         # F1: orthogonal only + F2: reject near-full-plan-width/height lines
@@ -4921,6 +5181,22 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
         # Recompute midpoint + length after snap
         mx, my = (lx1 + lx2) / 2, (ly1 + ly2) / 2
         ln = math.hypot(lx2 - lx1, ly2 - ly1)
+
+        # F3b: re-validate minimum length AFTER the column-centreline snap.
+        # The snap above moves each endpoint independently toward its OWN
+        # nearest column/grid position -- usually this only stretches a
+        # face-to-face span out to centre-to-centre, but when both raw
+        # endpoints already sit near columns that are close together, the
+        # snap can pull them toward each other instead and collapse a
+        # candidate that only just cleared F3 down to a 3-4 ft stub. That is
+        # exactly what turned bearing-seat tick marks, detail-bubble leaders,
+        # and connection-symbol glyphs into spurious floating "(beam?)"
+        # fragments (visible as short disconnected segments in the 3D view,
+        # unrelated to any real beam/joist). Re-checking here — universally,
+        # on any drawing — closes that gap.
+        if ln / ppf < MIN_FT:
+            rejected_len += 1
+            continue
 
         # F5: midpoint dedup
         if any(math.hypot(mx - sx, my - sy) < DEDUP_R for sx, sy in seen):

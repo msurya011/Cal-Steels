@@ -370,7 +370,7 @@ export const BeamLine = React.memo(function BeamLine({
         fill="none"
         stroke={strokeColor}
         strokeWidth={strokeWidth}
-        strokeDasharray={isUnlabeled ? '4,4' : 'none'}
+        strokeDasharray="none"
         className={isZoomTarget ? 'pulsing-member' : ''}
         style={{ transition: isDraggingThis ? 'none' : 'all 0.15s ease', filter: filterStyle, opacity: 0.9, pointerEvents: 'none' }}
       />

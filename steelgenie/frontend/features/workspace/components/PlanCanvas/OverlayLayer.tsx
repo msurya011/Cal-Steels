@@ -227,7 +227,7 @@ export function OverlayLayer({
           // opposite of what this file had. Matches the 3D viewer's already
           // -confirmed lavender/red scheme too.
           const LABELED_BEAM_COLOR = '#8B5CF6' // Violet/purple for labeled beams, like SteelGenie
-          const UNLABELED_BEAM_COLOR = '#EF4444' // Red for unlabeled/flagged
+          const UNLABELED_BEAM_COLOR = '#EC4899' // Pink for unlabeled/flagged
 
           const hasSpan = geo.bx1 !== undefined && geo.bx1 !== null && geo.bx2 !== undefined && geo.bx2 !== null
           const markerColor = isUnlabeled ? UNLABELED_BEAM_COLOR : (isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : LABELED_BEAM_COLOR)
@@ -260,7 +260,7 @@ export function OverlayLayer({
                   fill={isHovered ? '#22C55E' : 'none'}
                   stroke={strokeColor}
                   strokeWidth={1.4}
-                  strokeDasharray={isUnlabeled ? "2,2" : "none"}
+                  strokeDasharray="none"
                   style={{ transition: 'all 0.15s ease', filter: filterStyle }}
                 />
                 {showText && labelText && !isUnlabeled && (
