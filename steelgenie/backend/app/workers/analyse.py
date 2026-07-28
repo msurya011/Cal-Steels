@@ -242,8 +242,12 @@ async def run_analyse(
             # every column/footing on every project was silently losing
             # this data at persistence time, before the frontend ever saw
             # it, which is why the overlay looked "close but not exact."
-            "raw_x": _raw_geo.get("raw_x"),
-            "raw_y": _raw_geo.get("raw_y"),
+            "bx1": _raw_geo.get("bx1") if _raw_geo.get("bx1") is not None else m.get("bx1", m.get("x")),
+            "by1": _raw_geo.get("by1") if _raw_geo.get("by1") is not None else m.get("by1", m.get("y")),
+            "bx2": _raw_geo.get("bx2") if _raw_geo.get("bx2") is not None else m.get("bx2", m.get("x")),
+            "by2": _raw_geo.get("by2") if _raw_geo.get("by2") is not None else m.get("by2", m.get("y")),
+            "raw_x": _raw_geo.get("raw_x") if (_raw_geo.get("raw_x") is not None and _raw_geo.get("raw_x") != 0) else m.get("x"),
+            "raw_y": _raw_geo.get("raw_y") if (_raw_geo.get("raw_y") is not None and _raw_geo.get("raw_y") != 0) else m.get("y"),
             "snap_offset_ft": _raw_geo.get("snap_offset_ft"),
             "symbol": _raw_geo.get("symbol"),
             "sym_w": _raw_geo.get("sym_w"),
@@ -271,10 +275,98 @@ async def run_analyse(
             "length_ft": m.get("length_ft"),
         })
 
+    # ── Foundation-Anchored Column Propagation ─────────────────────────────
+    is_fp = bool(result.get("is_foundation_plan"))
+    if not is_fp and project_id:
+        try:
+            drw_rows = db.table("drawings").select("id").eq("project_id", str(project_id)).execute().data or []
+            drw_ids = [d["id"] for d in drw_rows]
+            if drw_ids:
+                fp_pages = db.table("pages").select("id").in_("drawing_id", drw_ids).eq("is_foundation_plan", True).execute().data or []
+                if fp_pages:
+                    fp_page_ids = [p["id"] for p in fp_pages]
+                    fp_members_db = db.table("members").select("*").in_("page_id", fp_page_ids).in_("kind", ["column", "footing"]).execute().data or []
+                    if fp_members_db:
+                        foundation_cols = []
+                        for fpm in fp_members_db:
+                            geo = fpm.get("geometry") or {}
+                            foundation_cols.append({
+                                "x": geo.get("x") if geo.get("x") is not None else fpm.get("x"),
+                                "y": geo.get("y") if geo.get("y") is not None else fpm.get("y"),
+                                "grid_ref": geo.get("grid_ref"),
+                                "symbol": geo.get("symbol", "I"),
+                                "profile": fpm.get("section"),
+                            })
+                        
+                        from main import propagate_foundation_columns
+                        v_grid = result.get("v_grid") or []
+                        h_grid = result.get("h_grid") or []
+                        v_labels = result.get("v_labels") or {}
+                        h_labels = result.get("h_labels") or {}
+                        page_w = result.get("page_w") or 1000.0
+                        page_h = result.get("page_h") or 1000.0
+                        pts_pf = 72.0 / max(scale_ratio, 1) * 12.0
+
+                        raw_mem_format = []
+                        for mr in member_rows:
+                            geo = mr.get("geometry") or {}
+                            raw_mem_format.append({
+                                "type": mr["kind"],
+                                "x": geo.get("x", 0),
+                                "y": geo.get("y", 0),
+                                "profile": mr.get("section"),
+                            })
+                        
+                        plan_bounds = result.get("plan_bounds")
+                        propagated_raw = propagate_foundation_columns(
+                            raw_mem_format, foundation_cols,
+                            v_grid, h_grid, v_labels, h_labels,
+                            page_w, page_h, scale_ratio, pts_pf,
+                            plan_bounds=plan_bounds
+                        )
+
+                        non_col_rows = [mr for mr in member_rows if mr["kind"] != "column"]
+                        new_col_rows = []
+                        for pr in propagated_raw:
+                            if pr.get("type") == "column":
+                                gx = round(pr["x"], 4)
+                                gy = round(pr["y"], 4)
+                                geo_dict = pr.get("geometry") or {}
+                                geo_dict["x"] = gx
+                                geo_dict["y"] = gy
+                                geo_dict["raw_x"] = gx
+                                geo_dict["raw_y"] = gy
+                                geo_dict["bx1"] = gx
+                                geo_dict["by1"] = gy
+                                geo_dict["bx2"] = gx
+                                geo_dict["by2"] = gy
+                                new_col_rows.append({
+                                    "page_id": page_id,
+                                    "kind": "column",
+                                    "section": pr.get("profile"),
+                                    "grade": "A992",
+                                    "rotation": 0,
+                                    "status": "active",
+                                    "source": "ai",
+                                    "geometry": geo_dict,
+                                    "confidence": 0.9,
+                                    "length_ft": None,
+                                })
+                        member_rows = non_col_rows + new_col_rows
+                        logger.info("Propagated %d foundation columns onto page %s", len(new_col_rows), page_id)
+        except Exception as exc:
+            logger.exception("Error propagating foundation columns in analyse worker: %s", exc)
+
     # Column cross-validation + missing-column suggestions (Layer 3/4 of the
     # column plan): score detected columns against beam-endpoint support and
     # suggest ghost columns where beams converge with no column detected.
     member_rows = _postprocess_columns(member_rows, page_id)
+
+    # Clear old members for this page before inserting fresh extraction results
+    try:
+        db.table("members").delete().eq("page_id", page_id).execute()
+    except Exception as del_exc:
+        logger.warning("Failed to clear old members for page %s: %s", page_id, del_exc)
 
     if member_rows:
         # Insert in batches of 100

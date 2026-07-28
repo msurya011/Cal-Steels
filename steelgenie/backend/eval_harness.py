@@ -58,7 +58,7 @@ def _run_pipeline(case):
         return {"raster": True}
     pb = main.find_plan_boundary(page, pw, ph, text_dict=td)
     cs = main.detect_column_symbols(page)
-    vg, hg = main.extract_grid_lines(page, pw, ph, pb, text_dict=td)
+    vg, hg, vlab, hlab = main.extract_grid_lines(page, pw, ph, pb, text_dict=td)
     profs = main.extract_profiles(page, pw, ph, pb, text_dict=td)
     ppf = main.scale_to_pts_per_foot(case["scale"])
     bdirs = main.detect_beam_directions(page, profs, pb)

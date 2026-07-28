@@ -2509,16 +2509,13 @@ def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
     # holds on sheets drawn at other scales.
     _ipt = 72.0 / max(scale_ratio, 1)
     R = max(28.0, 40.0 * (_ipt / (72.0 / 96)))
-    MIN_FRAGS = 5
-    MIN_SPAN = 16.0
+    MIN_FRAGS = 3
+    MIN_SPAN = 6.0
+    MIN_ORTHO_SPREAD = 3.0
 
-    # Threshold for the box-vs-cross check below. A genuine footing symbol's
-    # perpendicular edges (or inner detailing) are spread well beyond dash-
-    # pattern jitter (a couple of points); a bare gridline crossing has zero
-    # spread in the direction along its own line. 8pt sits safely between
-    # the two on every sheet scale this function is used at (search radius
-    # is itself scale-adjusted above).
-    MIN_ORTHO_SPREAD = 8.0
+    # Column callout regex for real columns (C1, C2, BP1, BP2, HSS, PIPE, W...)
+    # Pier callouts (P24, P36, F5.0) are pier dimensions, NOT column labels.
+    _COL_TEXT_RE = _re.compile(r'^(?:C[0-9]{1,2}[A-Z]?|BP[0-9]{1,2}|HSS\d+.*|PIPE\d+.*|W\d+X\d+.*)$', _re.IGNORECASE)
 
     out = []
     for gy in h_grid:
@@ -2541,43 +2538,60 @@ def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
                 continue
             sw = max(xs) - min(xs)
             sh = max(ys) - min(ys)
-            # Require real 2-D extent -- a bare wall/grid crossing is thin in
-            # one axis (fragments strung along a single line).
             if sw < MIN_SPAN or sh < MIN_SPAN:
                 continue
-            # Require an actual BOX, not two crossing reference lines. A
-            # dashed gridline crossing another dashed gridline at this
-            # intersection produces fragments with real x-span (from the
-            # horizontal line) AND real y-span (from the vertical line), so
-            # sw/sh alone can't tell it apart from a genuine footing outline.
-            # The real signal: a footing's horizontal-oriented fragments
-            # (flange lines, inner square, hatching) sit at MANY different Y
-            # positions across the box, and its vertical-oriented fragments
-            # sit at MANY different X positions -- real spread in the
-            # direction perpendicular to each fragment's own run. A single
-            # reference line crossing this window contributes fragments that
-            # are all collinear with each other -- its horizontal-oriented
-            # dash pieces are all at the SAME Y (the one line), its
-            # vertical-oriented pieces all at the SAME X. This is what
-            # previously let a secondary/reference gridline (e.g. a half
-            # grid line drawn for wall alignment, not a column line) get
-            # flagged as a footing at every row it happened to cross, while
-            # still correctly keeping genuinely detailed footing symbols
-            # (nested squares, corner north-arrow/leader clutter, etc.)
-            # whose fragments are far too dense for a simple gap-clustering
-            # test to tell apart from one continuous line.
             hz_spread = (max(hz_y) - min(hz_y)) if len(hz_y) >= 2 else 0.0
             vt_spread = (max(vt_x) - min(vt_x)) if len(vt_x) >= 2 else 0.0
-            if hz_spread < MIN_ORTHO_SPREAD or vt_spread < MIN_ORTHO_SPREAD:
-                continue
             _vlab = v_lab.get(gx, "?")
             _hlab = h_lab.get(gy, "?")
             out.append({
                 "cx": gx, "cy": gy,
+                "grid_cx": gx, "grid_cy": gy,
                 "grid_ref": f"{_vlab}-{_hlab}",
                 "n_frags": n, "span_w": round(sw, 1), "span_h": round(sh, 1),
             })
-    print(f"[FOUNDATION] grid-anchored footings: {len(out)} "
+    for b in td.get("blocks", []):
+        for l in b.get("lines", []):
+            for s in l.get("spans", []):
+                txt = s["text"].strip()
+                if _COL_TEXT_RE.match(txt):
+                    tcx = (s["bbox"][0] + s["bbox"][2]) / 2.0
+                    tcy = (s["bbox"][1] + s["bbox"][3]) / 2.0
+                    if v_grid and h_grid:
+                        nearest_gx = min(v_grid, key=lambda g: abs(tcx - g))
+                        nearest_gy = min(h_grid, key=lambda g: abs(tcy - g))
+                        if abs(tcx - nearest_gx) <= 60.0 and abs(tcy - nearest_gy) <= 60.0:
+                            if not any(math.hypot(item["cx"] - nearest_gx, item["cy"] - nearest_gy) <= 25.0 for item in out):
+                                _vlab = v_lab.get(nearest_gx, "?")
+                                _hlab = h_lab.get(nearest_gy, "?")
+                                out.append({
+                                    "cx": nearest_gx, "cy": nearest_gy,
+                                    "grid_cx": nearest_gx, "grid_cy": nearest_gy,
+                                    "grid_ref": f"{_vlab}-{_hlab}",
+                                    "n_frags": 4, "span_w": 12.0, "span_h": 12.0,
+                                })
+    # Final strict 1-to-1 deduplication of column candidates
+    dedup_out = []
+    for item in out:
+        icx, icy = item["cx"], item["cy"]
+        igx = item.get("grid_cx", icx)
+        igy = item.get("grid_cy", icy)
+        
+        is_dup = False
+        for existing in dedup_out:
+            ecx, ecy = existing["cx"], existing["cy"]
+            egx = existing.get("grid_cx", ecx)
+            egy = existing.get("grid_cy", ecy)
+            
+            # Same grid intersection OR distance <= 45pt (~3.5ft)
+            if (igx == egx and igy == egy) or math.hypot(icx - ecx, icy - ecy) <= 45.0:
+                is_dup = True
+                break
+        if not is_dup:
+            dedup_out.append(item)
+
+    out = dedup_out
+    print(f"[FOUNDATION] grid-anchored footings (deduplicated 1-to-1): {len(out)} "
           f"(grid {len(v_grid)}x{len(h_grid)}, R={R:.0f}pt)")
     return out
 
@@ -2621,11 +2635,20 @@ def filter_foundation_symbols_by_marks(symbols: list, page, v_grid: list, h_grid
     if not (is_foundation_plan and symbols):
         return symbols
 
-    _MARK_RE = re.compile(r'^(?:[FPC]\d{1,3}[A-Z]?)$')
+    # Tolerates real-world mark punctuation seen on live sheets: a trailing
+    # comma from a "C4, BP1" style multi-mark callout ("C4," -> "C4"), and an
+    # optional decimal suffix like "F7.0" for footing elevation marks. The
+    # original exact-match pattern rejected both, which silently dropped
+    # every interior column whose only nearby marks used this formatting
+    # (interior columns get their type mark comma-separated from a footing/
+    # base-plate mark, e.g. "C4, BP1"; perimeter columns happened to also
+    # sit near cleanly-formatted pier marks like "P24" that passed, which is
+    # why only the perimeter appeared to be marked at all).
+    _MARK_RE = re.compile(r'^(?:[FPC]\d{1,3}(?:\.\d+)?[A-Z]?)$')
     _mark_positions: list[tuple[float, float]] = []
     try:
         for w in page.get_text("words"):
-            word_text = (w[4] or "").strip().upper()
+            word_text = (w[4] or "").strip().upper().rstrip(",;:")
             if _MARK_RE.match(word_text):
                 _mark_positions.append(((w[0] + w[2]) / 2, (w[1] + w[3]) / 2))
     except Exception:
@@ -5282,7 +5305,18 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     MIN_BEAMS = 2
     SNAP_IN = 6.0
     SNAP_PT = SNAP_IN * _ipt
-    DEDUP_IN = 6.0
+    # 2026-07-27: was 6.0in (~3.4pt at a typical 3/32"=1'-0" scale) -- far
+    # smaller than the physical footprint of a real column/footing symbol
+    # (typically 1-3 REAL FEET across). The raw shape detector frequently
+    # produces more than one sub-shape for a single physical symbol (e.g.
+    # the outer dashed footing outline and the inner "H"/pier tick get
+    # picked up as two separate candidates), and their centroids can easily
+    # sit 1-2 ft apart -- well outside a 6in dedup radius but nowhere near
+    # the 15ft+ spacing of genuinely distinct real columns. Raised to 24in
+    # (2ft): big enough to catch same-symbol duplicate detections, still an
+    # order of magnitude below any real column-to-column spacing, so two
+    # legitimately separate close columns are never merged.
+    DEDUP_IN = 24.0
     DEDUP_PT = DEDUP_IN * _ipt
 
     existing = [(m["x"] * page_w, m["y"] * page_h)
@@ -6010,6 +6044,263 @@ def extract_col_text_columns(page, page_w, page_h, members,
         print(f"[COLUMNS] emitted {len(added)} COL-text columns "
               f"(scale_ratio={scale_ratio}  SEARCH={20.0}\" real  SNAP={6.0}\" real)")
     return members
+
+
+# ── Foundation-Anchored Column Propagation ────────────────────────────────────
+_FOUNDATION_COLUMNS_CACHE: dict[str, list[dict]] = {}
+
+def get_foundation_columns_for_file(filename: str) -> list[dict]:
+    """Retrieve foundation plan column definitions cached or saved for this file/project."""
+    if not filename:
+        return []
+    norm_fn = os.path.basename(filename).strip().lower()
+    if norm_fn in _FOUNDATION_COLUMNS_CACHE:
+        return _FOUNDATION_COLUMNS_CACHE[norm_fn]
+    
+    # Try reading from local_db.json or saved_projects.json
+    try:
+        import json
+        saved_db_path = os.path.join(BASE_DIR, "saved_projects.json")
+        if not os.path.exists(saved_db_path):
+            saved_db_path = os.path.join(BASE_DIR, "local_db.json")
+        if os.path.exists(saved_db_path):
+            with open(saved_db_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            f_cols = []
+            projects_list = data.values() if isinstance(data, dict) else data
+            for proj in projects_list:
+                if not isinstance(proj, dict):
+                    continue
+                # MUST match current project filename to prevent cross-project leaks
+                proj_fn = os.path.basename(proj.get("filename") or proj.get("name") or "").strip().lower()
+                if proj_fn != norm_fn and norm_fn not in proj_fn and proj_fn not in norm_fn:
+                    continue
+                pages = proj.get("pages") or []
+                for p in pages:
+                    if p.get("is_foundation_plan"):
+                        for m in p.get("members", []):
+                            if m.get("type") in ("column", "footing"):
+                                geo = m.get("geometry") or {}
+                                f_cols.append({
+                                    "x": m.get("x"),
+                                    "y": m.get("y"),
+                                    "grid_ref": geo.get("grid_ref"),
+                                    "symbol": geo.get("symbol", "I"),
+                                    "profile": m.get("profile"),
+                                })
+            if f_cols:
+                _FOUNDATION_COLUMNS_CACHE[norm_fn] = f_cols
+                return f_cols
+    except Exception as exc:
+        print(f"[FOUNDATION PROPAGATION] Error reading saved projects: {exc}")
+    return []
+
+
+def propagate_foundation_columns(members: list, foundation_cols: list,
+                                 v_grid: list, h_grid: list,
+                                 v_labels: dict, h_labels: dict,
+                                 page_w: float, page_h: float,
+                                 scale_ratio: float = 96,
+                                 pts_per_foot: float = 0.0,
+                                 plan_bounds: tuple = None) -> list:
+    """
+    Propagate columns from the Foundation Plan onto a Framing Plan sheet.
+    The Foundation Plan is the SINGLE SOURCE OF TRUTH for column locations.
+    Any loose/imprecise column candidates on the framing plan near a foundation
+    column are replaced by the foundation column's exact grid location.
+    """
+    if not foundation_cols:
+        return members
+
+    _ipt = 72.0 / max(scale_ratio, 1)
+    SNAP_PT = 36.0 * _ipt  # 3 ft tolerance to align framing candidates with foundation grid
+    REPLACE_TOL = 36.0 * _ipt  # 3 ft tolerance for replacing imprecise framing candidates
+
+    # Separate framing plan members into non-columns and columns
+    other_members = [m for m in members if m.get("type") != "column"]
+    framing_cols = [m for m in members if m.get("type") == "column"]
+
+    # Active Framing Region Bounding Box:
+    # Restrict foundation column projection to the active framing region of THIS sheet.
+    active_min_x, active_min_y = 0.0, 0.0
+    active_max_x, active_max_y = page_w, page_h
+    has_framing_envelope = False
+
+    beam_x_pts, beam_y_pts = [], []
+    for m in other_members:
+        for kx in ("x", "lx", "sx", "bx1", "bx2"):
+            if m.get(kx) is not None:
+                beam_x_pts.append(m[kx] * page_w)
+        for ky in ("y", "ly", "sy", "by1", "by2"):
+            if m.get(ky) is not None:
+                beam_y_pts.append(m[ky] * page_h)
+
+    if beam_x_pts and beam_y_pts:
+        MARGIN_PT = 36.0 * _ipt  # 3 ft margin around framing envelope
+        active_min_x = max(0.0, min(beam_x_pts) - MARGIN_PT)
+        active_max_x = min(page_w, max(beam_x_pts) + MARGIN_PT)
+        active_min_y = max(0.0, min(beam_y_pts) - MARGIN_PT)
+        active_max_y = min(page_h, max(beam_y_pts) + MARGIN_PT)
+        has_framing_envelope = True
+
+    # Strict Plan Bounds Box
+    pb_x0 = plan_bounds[0] if plan_bounds else 0.0
+    pb_y0 = plan_bounds[1] if plan_bounds else 0.0
+    pb_x1 = plan_bounds[2] if plan_bounds else page_w
+    pb_y1 = plan_bounds[3] if plan_bounds else page_h
+
+    # Map grid labels on current sheet: label -> coordinate
+    label_to_v_grid = {str(lbl).strip().upper(): gx for gx, lbl in (v_labels or {}).items()}
+    label_to_h_grid = {str(lbl).strip().upper(): gy for gy, lbl in (h_labels or {}).items()}
+
+    # Guessed profile for framing columns if unlabeled
+    _COL_PROFILE_RE = re.compile(r'^(?:W\d{1,2}X\d{1,3}|HSS\d+(?:\.\d+)?X\d+(?:\.\d+)?X[\d./]+|PIPE\S*)$', re.IGNORECASE)
+    _col_profile_counts: dict[str, int] = {}
+    for m in members:
+        prof = (m.get("profile") or "").upper().strip()
+        if prof and _COL_PROFILE_RE.match(prof):
+            _col_profile_counts[prof] = _col_profile_counts.get(prof, 0) + 1
+    _guessed_profile = (max(_col_profile_counts, key=_col_profile_counts.get)
+                         if _col_profile_counts else "W12X40")
+
+    projected_cols = []
+    used_framing_col_indices = set()
+
+    for f_col in foundation_cols:
+        grid_ref = f_col.get("grid_ref")
+        px, py = None, None
+
+        # Strategy 1: Match by grid labels (e.g. "1-A", "2-B", "B-3")
+        if grid_ref and "-" in grid_ref:
+            parts = grid_ref.split("-", 1)
+            v_part = parts[0].strip().upper()
+            h_part = parts[1].strip().upper()
+            if v_part in label_to_v_grid and h_part in label_to_h_grid:
+                px = label_to_v_grid[v_part]
+                py = label_to_h_grid[h_part]
+            elif h_part in label_to_v_grid and v_part in label_to_h_grid:
+                px = label_to_v_grid[h_part]
+                py = label_to_h_grid[v_part]
+
+        # Strategy 2: Project normalized (x, y) relative position inside plan bounds and snap to grid
+        if px is None or py is None:
+            if f_col.get("x") is not None and f_col.get("y") is not None:
+                raw_px = f_col["x"] * page_w
+                raw_py = f_col["y"] * page_h
+                # Snap to closest vertical and horizontal grid lines
+                gx_match = min(v_grid, key=lambda g: abs(raw_px - g)) if v_grid else raw_px
+                gy_match = min(h_grid, key=lambda g: abs(raw_py - g)) if h_grid else raw_py
+                
+                # Use grid intersection if within SNAP_PT, else fallback to raw position
+                px = gx_match if v_grid and abs(raw_px - gx_match) <= SNAP_PT else raw_px
+                py = gy_match if h_grid and abs(raw_py - gy_match) <= SNAP_PT else raw_py
+
+        if px is None or py is None:
+            continue
+
+        # Strict Plan Box Filter: Never place any column outside plan_bounds (drawing box)
+        if not (pb_x0 - 5.0 <= px <= pb_x1 + 5.0 and pb_y0 - 5.0 <= py <= pb_y1 + 5.0):
+            continue
+
+        # Universal Framing Envelope & Connectivity Gate
+        if has_framing_envelope:
+            if not (active_min_x <= px <= active_max_x and active_min_y <= py <= active_max_y):
+                continue
+
+        CONNECT_RADIUS_PT = 36.0 * _ipt  # ~3 ft connectivity search radius
+        has_local_framing = False
+        for m in other_members:
+            # Check member endpoints / midpoints
+            for kx, ky in (("x", "y"), ("lx", "ly"), ("sx", "sy"), ("bx1", "by1"), ("bx2", "by2")):
+                mx_val, my_val = m.get(kx), m.get(ky)
+                if mx_val is not None and my_val is not None:
+                    if math.hypot(px - mx_val * page_w, py - my_val * page_h) <= CONNECT_RADIUS_PT:
+                        has_local_framing = True
+                        break
+            if has_local_framing:
+                break
+            # Check beam centerline segment distance
+            bx1, by1 = m.get("bx1"), m.get("by1")
+            bx2, by2 = m.get("bx2"), m.get("by2")
+            if bx1 is not None and by1 is not None and bx2 is not None and by2 is not None:
+                x1, y1 = bx1 * page_w, by1 * page_h
+                x2, y2 = bx2 * page_w, by2 * page_h
+                dx = x2 - x1
+                dy = y2 - y1
+                l2 = dx * dx + dy * dy
+                if l2 > 0:
+                    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / l2))
+                    proj_x = x1 + t * dx
+                    proj_y = y1 + t * dy
+                    if math.hypot(px - proj_x, py - proj_y) <= CONNECT_RADIUS_PT:
+                        has_local_framing = True
+                        break
+
+        # Universal rule: if a grid location has NO framing lines connecting on THIS sheet, do not project
+        if other_members and not has_local_framing:
+            continue
+
+        # Find any imprecise framing column near this foundation column and consume/replace it
+        matched_profile = f_col.get("profile") or _guessed_profile
+        for idx, fc in enumerate(framing_cols):
+            if idx in used_framing_col_indices:
+                continue
+            fc_x = fc["x"] * page_w
+            fc_y = fc["y"] * page_h
+            if math.hypot(px - fc_x, py - fc_y) <= REPLACE_TOL:
+                used_framing_col_indices.add(idx)
+                if fc.get("profile") and fc["profile"] != "COL":
+                    matched_profile = fc["profile"]
+
+        # Add the authoritative foundation column at (px, py) with point coordinates
+        norm_x = round(px / page_w, 4)
+        norm_y = round(py / page_h, 4)
+        projected_cols.append({
+            "profile": matched_profile,
+            "type": "column",
+            "length_ft": 0.0,
+            "beam_dir": None,
+            "bx1": norm_x,
+            "by1": norm_y,
+            "bx2": norm_x,
+            "by2": norm_y,
+            "x": norm_x,
+            "y": norm_y,
+            "lx": norm_x,
+            "ly": norm_y,
+            "sx": norm_x,
+            "sy": norm_y,
+            "rotation": 0,
+            "source": "foundation_projected",
+            "status": "active",
+            "geometry": {
+                "x": norm_x,
+                "y": norm_y,
+                "raw_x": norm_x,
+                "raw_y": norm_y,
+                "bx1": norm_x,
+                "by1": norm_y,
+                "bx2": norm_x,
+                "by2": norm_y,
+                "grid_ref": grid_ref,
+                "symbol": "I",
+                "category": "steel_column",
+                "projected_from_foundation": True,
+                "error_flags": [],
+            },
+            "w": 0.02, "h": 0.02,
+            "color": MEMBER_COLORS["column"],
+            "confirmed": True,
+            "is_column": True,
+            "size_unknown": False if matched_profile else True,
+        })
+
+    # Combine non-columns + projected foundation columns
+    result_members = other_members + projected_cols
+    if projected_cols:
+        print(f"[FOUNDATION PROPAGATION] Projected {len(projected_cols)} foundation columns onto framing plan (replaced {len(used_framing_col_indices)} imprecise framing columns)")
+
+    return result_members
 
 
 def clean_column_lines(v_grid, h_grid, column_symbols, tol=8.0):
@@ -7026,6 +7317,33 @@ async def analyse_pdf(req: AnalysisRequest):
                                            v_grid=v_grid, h_grid=h_grid,
                                            scale_ratio=_col_scale)
 
+        # ── Foundation-Anchored Column Propagation ─────────────────────────────
+        _norm_fn = os.path.basename(req.filename).strip().lower()
+        if _is_foundation_plan:
+            _f_cols = []
+            for _m in members:
+                if _m.get("type") in ("column", "footing"):
+                    _geo = _m.get("geometry") or {}
+                    _f_cols.append({
+                        "x": _m.get("x"),
+                        "y": _m.get("y"),
+                        "grid_ref": _geo.get("grid_ref"),
+                        "symbol": _geo.get("symbol", "I"),
+                        "profile": _m.get("profile"),
+                    })
+            if _f_cols:
+                _FOUNDATION_COLUMNS_CACHE[_norm_fn] = _f_cols
+                print(f"[FOUNDATION CACHE] Cached {len(_f_cols)} foundation columns for {_norm_fn}")
+        else:
+            _f_cols = get_foundation_columns_for_file(req.filename)
+            if _f_cols:
+                members = propagate_foundation_columns(
+                    members, _f_cols, v_grid, h_grid,
+                    v_labels, h_labels, page_w, page_h,
+                    scale_ratio=_col_scale, pts_per_foot=pts_per_foot,
+                    plan_bounds=plan_bounds
+                )
+
         # Unlabeled beams: geometry-detected candidates with no section callout.
         # Gated by detect_unlabeled flag (default OFF) so the UI stays clean
         # unless the user explicitly requests candidate overlay.
@@ -7159,37 +7477,18 @@ async def analyse_pdf(req: AnalysisRequest):
                     _xf = round(_px / page_w, 4)
                     _yf = round(_py / page_h, 4)
                     _grp = str(_uuid_mod.uuid4())
-                    # Footing record (the outline box in the drawing).
-                    _new_members.append({
-                        "profile": None, "type": "footing", "length_ft": 0.0,
-                        "beam_dir": None,
-                        "bx1": None, "by1": None, "bx2": None, "by2": None,
-                        "x": _xf, "y": _yf, "lx": _xf, "ly": _yf,
-                        "sx": _xf, "sy": _yf,
-                        "rotation": 0, "source": "grid_footing",
-                        "status": "need_review",
-                        "geometry": {
-                            "x": _xf, "y": _yf, "raw_x": _xf, "raw_y": _yf,
-                            "grid_ref": _f["grid_ref"], "symbol": "BOX",
-                            "category": "footing_isolated",
-                            "linked_group_id": _grp, "linked_role": "footing",
-                            "error_flags": [],
-                        },
-                        "w": 0.02, "h": 0.02,
-                        "color": MEMBER_COLORS.get("footing", MEMBER_COLORS["column"]),
-                        "confirmed": True, "is_column": False, "size_unknown": True,
-                    })
-                    # Column record (the steel column landing on the footing).
+                    # Emit ONLY ONE single clean Column record per footing site
                     _new_members.append({
                         "profile": None, "type": "column", "length_ft": 0.0,
                         "beam_dir": None,
-                        "bx1": None, "by1": None, "bx2": None, "by2": None,
+                        "bx1": _xf, "by1": _yf, "bx2": _xf, "by2": _yf,
                         "x": _xf, "y": _yf, "lx": _xf, "ly": _yf,
                         "sx": _xf, "sy": _yf,
                         "rotation": 0, "source": "grid_footing",
                         "status": "need_review",
                         "geometry": {
                             "x": _xf, "y": _yf, "raw_x": _xf, "raw_y": _yf,
+                            "bx1": _xf, "by1": _yf, "bx2": _xf, "by2": _yf,
                             "grid_ref": _f["grid_ref"], "symbol": "I",
                             "category": "footing_isolated",
                             "linked_group_id": _grp, "linked_role": "column",
@@ -7239,6 +7538,23 @@ async def analyse_pdf(req: AnalysisRequest):
                 _m["sx"],  _m["sy"]  = _rot_frac(_m.get("sx"),  _m.get("sy"))
                 _m["bx1"], _m["by1"] = _rot_frac(_m.get("bx1"), _m.get("by1"))
                 _m["bx2"], _m["by2"] = _rot_frac(_m.get("bx2"), _m.get("by2"))
+                # column/footing members (emit_symbol_columns, build_members'
+                # footing split) carry a NESTED "geometry" dict with their own
+                # raw_x/raw_y — the true detected symbol center BEFORE grid
+                # snapping, independent of x/y. The loop above only rotates
+                # top-level fields, so raw_x/raw_y was silently left in the
+                # unrotated coordinate space on every page with a PDF rotation
+                # flag. The frontend prefers raw_x/raw_y for the marker
+                # position and draws a correction line from it to x/y -- with
+                # raw_x/raw_y unrotated, markers landed in the wrong spot and
+                # the correction lines fanned out wildly across the whole
+                # sheet on any rotated page (any PDF, not just one drawing).
+                _geo = _m.get("geometry")
+                if isinstance(_geo, dict):
+                    if _geo.get("raw_x") is not None and _geo.get("raw_y") is not None:
+                        _geo["raw_x"], _geo["raw_y"] = _rot_frac(_geo.get("raw_x"), _geo.get("raw_y"))
+                    if _geo.get("x") is not None and _geo.get("y") is not None:
+                        _geo["x"], _geo["y"] = _rot_frac(_geo.get("x"), _geo.get("y"))
             print(f"[ANALYSE] Applied {page.rotation}° rotation transform "
                   f"to {len(members)} members (unrotated {_puw:.0f}x{_puh:.0f} "
                   f"-> display {_rw:.0f}x{_rh:.0f})")
