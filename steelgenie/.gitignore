@@ -22,4 +22,7 @@ local_db.json*.tmp
 local_db.json.bak
 local_db.json.corrupt_backup
 uploads/
-_mount_write_test.txt
+_mount_write_test.txt
+
+
+venv

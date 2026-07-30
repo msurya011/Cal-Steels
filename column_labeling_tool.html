@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Column Labeling Tool</title>
+<style>
+  :root {
+    --bg: #1e1f26;
+    --panel: #262834;
+    --accent: #4f8cff;
+    --accent2: #ff5c5c;
+    --text: #e8e9ee;
+    --muted: #9a9db0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+  #sidebar {
+    width: 320px;
+    background: var(--panel);
+    padding: 16px;
+    overflow-y: auto;
+    flex-shrink: 0;
+    border-right: 1px solid #33364a;
+  }
+  #sidebar h1 {
+    font-size: 18px;
+    margin: 0 0 4px 0;
+  }
+  #sidebar p.sub {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 0 0 16px 0;
+  }
+  .section {
+    margin-bottom: 18px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #33364a;
+  }
+  .section h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0 0 8px 0;
+  }
+  button {
+    background: #343750;
+    color: var(--text);
+    border: 1px solid #444765;
+    border-radius: 6px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 13px;
+    margin: 3px 3px 3px 0;
+  }
+  button:hover { background: #3d4160; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #6a9fff; }
+  button.danger { background: var(--accent2); border-color: var(--accent2); color: #fff; }
+  button.danger:hover { background: #ff7a7a; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  input[type=file] { color: var(--text); font-size: 12px; width: 100%; }
+  #pageNav { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  #pageIndicator { font-size: 13px; min-width: 70px; text-align: center; }
+  #zoomRow { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  #zoomLabel { font-size: 12px; color: var(--muted); min-width: 40px; }
+  #boxList {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 260px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+  #boxList li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 8px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+    background: #2f3247;
+  }
+  #boxList li:hover { background: #3a3d58; }
+  #boxList li button { padding: 2px 8px; margin: 0; font-size: 11px; }
+  #stats { font-size: 13px; line-height: 1.6; }
+  #stats b { color: var(--accent); }
+  .hint {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+    background: #2a2c3d;
+    border-radius: 6px;
+    padding: 10px;
+  }
+  #canvasWrap {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+    background: #111218;
+    position: relative;
+  }
+  #canvasHolder {
+    position: relative;
+    margin: 20px;
+  }
+  canvas { display: block; cursor: crosshair; }
+  #emptyState {
+    margin: auto;
+    text-align: center;
+    color: var(--muted);
+    padding: 40px;
+  }
+  #emptyState h2 { color: var(--text); font-weight: 500; }
+  .badge {
+    display: inline-block;
+    background: var(--accent);
+    color: #fff;
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 11px;
+    margin-left: 6px;
+  }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <h1>Column Labeling Tool</h1>
+  <p class="sub">Mark real column locations on plan sheets to build training data.</p>
+
+  <div class="section">
+    <h2>1. Load a sheet</h2>
+    <input type="file" id="fileInput" accept="application/pdf,image/*">
+    <div class="hint" style="margin-top:8px;">Load a PDF (any foundation / framing / roof plan) or a plain image. Multi-page PDFs let you flip between pages below.</div>
+    <div id="pageNav" style="display:none;">
+      <button id="prevPage">◀ Prev</button>
+      <span id="pageIndicator">Page 1 / 1</span>
+      <button id="nextPage">Next ▶</button>
+    </div>
+    <div id="zoomRow" style="display:none;">
+      <span id="zoomLabel">Zoom</span>
+      <button id="zoomOut">−</button>
+      <button id="zoomIn">+</button>
+      <button id="zoomReset">Reset</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>2. Mark columns</h2>
+    <div class="hint">Click and drag a small box around each real column symbol. Draw it just big enough to enclose the symbol — tight boxes train better than loose ones.</div>
+    <div style="margin-top:8px;">
+      <button id="undoBox">Undo last box</button>
+      <button id="clearPage" class="danger">Clear this page</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>This page</h2>
+    <ul id="boxList"></ul>
+  </div>
+
+  <div class="section">
+    <h2>Progress</h2>
+    <div id="stats">
+      Pages labeled: <b id="statPages">0</b><br>
+      Total columns marked: <b id="statTotal">0</b>
+    </div>
+  </div>
+
+  <div class="section" style="border-bottom:none;">
+    <h2>3. Export</h2>
+    <button id="exportJson" class="primary">Download labels (JSON)</button>
+    <button id="exportYolo" class="primary">Download labels (YOLO format)</button>
+    <div class="hint" style="margin-top:8px;">YOLO format gives you one .txt file per page plus the page images, ready to hand to a YOLO training run. JSON is a plain record of everything you marked, useful for review or re-import later.</div>
+  </div>
+</div>
+
+<div id="canvasWrap">
+  <div id="emptyState">
+    <h2>No sheet loaded yet</h2>
+    <p>Load a PDF or image on the left to start marking columns.</p>
+  </div>
+  <div id="canvasHolder" style="display:none;">
+    <canvas id="canvas"></canvas>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const fileInput   = document.getElementById('fileInput');
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d');
+const canvasHolder= document.getElementById('canvasHolder');
+const emptyState  = document.getElementById('emptyState');
+const pageNav     = document.getElementById('pageNav');
+const zoomRow     = document.getElementById('zoomRow');
+const pageIndicator = document.getElementById('pageIndicator');
+const boxListEl   = document.getElementById('boxList');
+const statPages   = document.getElementById('statPages');
+const statTotal   = document.getElementById('statTotal');
+
+let pdfDoc = null;          // pdf.js document, null if a plain image was loaded
+let staticImage = null;     // Image object, used when a plain image was loaded
+let currentPageNum = 1;
+let totalPages = 1;
+let baseWidth = 0, baseHeight = 0;  // natural render size at zoom = 1
+let zoom = 1.0;
+let sourceName = "sheet";
+
+// annotations[pageNum] = { w, h, boxes: [{x,y,w,h}] }  -- all in NATURAL (zoom=1) pixel coords
+let annotations = {};
+
+let drawing = false;
+let startX = 0, startY = 0;
+let curBox = null;
+
+function ensurePage(pageNum) {
+  if (!annotations[pageNum]) annotations[pageNum] = { w: baseWidth, h: baseHeight, boxes: [] };
+  return annotations[pageNum];
+}
+
+async function renderPdfPage(num) {
+  const page = await pdfDoc.getPage(num);
+  const viewport1 = page.getViewport({ scale: 1.0 });
+  baseWidth = viewport1.width;
+  baseHeight = viewport1.height;
+  const viewport = page.getViewport({ scale: zoom });
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const renderCtx = { canvasContext: ctx, viewport: viewport };
+  await page.render(renderCtx).promise;
+  ensurePage(num);
+  redrawBoxes();
+}
+
+function renderStaticImage() {
+  canvas.width = staticImage.naturalWidth * zoom;
+  canvas.height = staticImage.naturalHeight * zoom;
+  ctx.drawImage(staticImage, 0, 0, canvas.width, canvas.height);
+  ensurePage(1);
+  redrawBoxes();
+}
+
+async function renderCurrent() {
+  if (pdfDoc) {
+    await renderPdfPage(currentPageNum);
+  } else if (staticImage) {
+    renderStaticImage();
+  }
+  pageIndicator.textContent = `Page ${currentPageNum} / ${totalPages}`;
+  updateBoxList();
+  updateStats();
+}
+
+function redrawBoxes() {
+  const rec = ensurePage(currentPageNum);
+  ctx.strokeStyle = "#ff5c5c";
+  ctx.lineWidth = 2;
+  ctx.font = "12px sans-serif";
+  rec.boxes.forEach((b, i) => {
+    const x = b.x * zoom, y = b.y * zoom, w = b.w * zoom, h = b.h * zoom;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = "#ff5c5c";
+    ctx.fillRect(x, y - 14, 18, 14);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(i + 1, x + 3, y - 3);
+  });
+  if (curBox) {
+    ctx.strokeStyle = "#4f8cff";
+    ctx.strokeRect(curBox.x, curBox.y, curBox.w, curBox.h);
+  }
+}
+
+function updateBoxList() {
+  const rec = ensurePage(currentPageNum);
+  boxListEl.innerHTML = "";
+  rec.boxes.forEach((b, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>Column ${i + 1}</span>`;
+    const delBtn = document.createElement('button');
+    delBtn.textContent = "Delete";
+    delBtn.onclick = () => {
+      rec.boxes.splice(i, 1);
+      redrawBoxes();
+      updateBoxList();
+      updateStats();
+    };
+    li.appendChild(delBtn);
+    boxListEl.appendChild(li);
+  });
+}
+
+function updateStats() {
+  let pagesLabeled = 0, total = 0;
+  Object.values(annotations).forEach(rec => {
+    if (rec.boxes.length > 0) pagesLabeled++;
+    total += rec.boxes.length;
+  });
+  statPages.textContent = pagesLabeled;
+  statTotal.textContent = total;
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  startX = e.clientX - rect.left;
+  startY = e.clientY - rect.top;
+  drawing = true;
+  curBox = { x: startX, y: startY, w: 0, h: 0 };
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!drawing) return;
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  curBox = {
+    x: Math.min(startX, mx),
+    y: Math.min(startY, my),
+    w: Math.abs(mx - startX),
+    h: Math.abs(my - startY)
+  };
+  renderCurrentQuiet();
+});
+
+canvas.addEventListener('mouseup', () => {
+  if (!drawing) return;
+  drawing = false;
+  if (curBox && curBox.w > 3 && curBox.h > 3) {
+    const rec = ensurePage(currentPageNum);
+    rec.boxes.push({
+      x: curBox.x / zoom,
+      y: curBox.y / zoom,
+      w: curBox.w / zoom,
+      h: curBox.h / zoom
+    });
+  }
+  curBox = null;
+  redrawFromRaster();
+  updateBoxList();
+  updateStats();
+});
+
+// Redraw the underlying page image, then overlay boxes -- used after a box
+// is finalized so a deleted/added box doesn't leave stray pixels behind.
+async function redrawFromRaster() {
+  if (pdfDoc) {
+    const page = await pdfDoc.getPage(currentPageNum);
+    const viewport = page.getViewport({ scale: zoom });
+    await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+  } else if (staticImage) {
+    ctx.drawImage(staticImage, 0, 0, canvas.width, canvas.height);
+  }
+  redrawBoxes();
+}
+
+// Cheap redraw while dragging: just re-render from raster + boxes each move.
+// pdf.js render calls are a bit heavy per-mousemove on large pages, so this
+// is intentionally simple rather than double-buffered -- fine for labeling.
+let quietPending = false;
+function renderCurrentQuiet() {
+  if (quietPending) return;
+  quietPending = true;
+  requestAnimationFrame(async () => {
+    await redrawFromRaster();
+    quietPending = false;
+  });
+}
+
+document.getElementById('undoBox').onclick = () => {
+  const rec = ensurePage(currentPageNum);
+  rec.boxes.pop();
+  redrawFromRaster();
+  updateBoxList();
+  updateStats();
+};
+
+document.getElementById('clearPage').onclick = () => {
+  if (!confirm("Clear all boxes on this page?")) return;
+  const rec = ensurePage(currentPageNum);
+  rec.boxes = [];
+  redrawFromRaster();
+  updateBoxList();
+  updateStats();
+};
+
+document.getElementById('prevPage').onclick = async () => {
+  if (currentPageNum > 1) { currentPageNum--; await renderCurrent(); }
+};
+document.getElementById('nextPage').onclick = async () => {
+  if (currentPageNum < totalPages) { currentPageNum++; await renderCurrent(); }
+};
+document.getElementById('zoomIn').onclick = async () => { zoom = Math.min(zoom * 1.25, 6); await renderCurrent(); };
+document.getElementById('zoomOut').onclick = async () => { zoom = Math.max(zoom / 1.25, 0.2); await renderCurrent(); };
+document.getElementById('zoomReset').onclick = async () => { zoom = 1.0; await renderCurrent(); };
+
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  sourceName = file.name.replace(/\.[^.]+$/, "");
+  annotations = {};
+  zoom = 1.0;
+  currentPageNum = 1;
+
+  if (file.type === "application/pdf") {
+    const buf = await file.arrayBuffer();
+    pdfDoc = await pdfjsLib.getDocument({ data: buf }).promise;
+    staticImage = null;
+    totalPages = pdfDoc.numPages;
+    pageNav.style.display = "flex";
+  } else {
+    pdfDoc = null;
+    totalPages = 1;
+    staticImage = await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.src = URL.createObjectURL(file);
+    });
+    pageNav.style.display = "none";
+  }
+  zoomRow.style.display = "flex";
+  emptyState.style.display = "none";
+  canvasHolder.style.display = "block";
+  await renderCurrent();
+});
+
+function downloadFile(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('exportJson').onclick = () => {
+  const out = {
+    source: sourceName,
+    exported_at: new Date().toISOString(),
+    pages: Object.entries(annotations).map(([pageNum, rec]) => ({
+      page: Number(pageNum),
+      image_width: rec.w,
+      image_height: rec.h,
+      columns: rec.boxes.map(b => ({
+        x: Math.round(b.x), y: Math.round(b.y),
+        w: Math.round(b.w), h: Math.round(b.h),
+        // normalized center + size, 0-1 -- the YOLO convention, included
+        // here too so the JSON is self-sufficient for either use.
+        x_center_norm: +(((b.x + b.w / 2) / rec.w).toFixed(6)),
+        y_center_norm: +(((b.y + b.h / 2) / rec.h).toFixed(6)),
+        w_norm: +((b.w / rec.w).toFixed(6)),
+        h_norm: +((b.h / rec.h).toFixed(6)),
+      }))
+    }))
+  };
+  downloadFile(`${sourceName}_labels.json`, JSON.stringify(out, null, 2), "application/json");
+};
+
+document.getElementById('exportYolo').onclick = () => {
+  // One .txt per labeled page: "0 x_center y_center w h" (all normalized,
+  // class 0 = column -- the only class this tool labels right now).
+  const entries = Object.entries(annotations).filter(([, rec]) => rec.boxes.length > 0);
+  if (entries.length === 0) {
+    alert("No columns marked yet on any page.");
+    return;
+  }
+  entries.forEach(([pageNum, rec]) => {
+    const lines = rec.boxes.map(b => {
+      const xc = (b.x + b.w / 2) / rec.w;
+      const yc = (b.y + b.h / 2) / rec.h;
+      const w  = b.w / rec.w;
+      const h  = b.h / rec.h;
+      return `0 ${xc.toFixed(6)} ${yc.toFixed(6)} ${w.toFixed(6)} ${h.toFixed(6)}`;
+    });
+    downloadFile(`${sourceName}_p${pageNum}.txt`, lines.join("\n"), "text/plain");
+  });
+  alert(`Downloaded ${entries.length} label file(s), one per labeled page. Match each .txt with the same page rendered as an image (same filename, .jpg/.png) when you set up training.`);
+};
+</script>
+</body>
+</html>

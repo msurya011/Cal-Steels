@@ -363,7 +363,19 @@ export const BeamLine = React.memo(function BeamLine({
         />
       )}
 
-      {/* Base Beam line */}
+      {/* Base Beam line.
+          mixBlendMode: 'multiply' (not a plain opaque stroke) -- the beam
+          overlay sits in an SVG layer drawn on top of the base PDF page
+          image, so wherever a beam's real-world line crosses a detail-
+          reference bubble (or any other dark linework baked into the
+          drawing) a plain opaque stroke fully painted over it, making the
+          bubble unreadable underneath. Multiply lets the underlying ink
+          show through: over the white sheet the beam still reads at its
+          full color (white is the identity color for multiply), but over
+          a bubble's black outline/divider/arrow the result darkens toward
+          that linework instead of hiding it, so the bubble stays legible
+          right through the beam. Purely a paint-compositing change --
+          doesn't touch which beams are drawn or their real geometry. */}
       <line
         ref={lineRef}
         x1={`${x1}%`} y1={`${y1}%`} x2={`${x2}%`} y2={`${y2}%`}
@@ -372,7 +384,7 @@ export const BeamLine = React.memo(function BeamLine({
         strokeWidth={strokeWidth}
         strokeDasharray="none"
         className={isZoomTarget ? 'pulsing-member' : ''}
-        style={{ transition: isDraggingThis ? 'none' : 'all 0.15s ease', filter: filterStyle, opacity: 0.9, pointerEvents: 'none' }}
+        style={{ transition: isDraggingThis ? 'none' : 'all 0.15s ease', filter: filterStyle, opacity: 0.9, mixBlendMode: 'multiply', pointerEvents: 'none' }}
       />
 
       {/* Endpoint drag handles -- shown on hover/select so the beam can be

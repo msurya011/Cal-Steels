@@ -148,6 +148,8 @@ def _page_pt_size(page: dict, db: Any) -> tuple[float, float]:
     return 3400.0, 2200.0
 
 
+_SCHEDULE_RECORDS_CACHE: dict[str, list] = {}
+
 def _collect_schedule_records(pages: list[dict], db: Any) -> list:
     """
     Open every page in this project's PDFs and, for any page that mentions a
@@ -156,6 +158,20 @@ def _collect_schedule_records(pages: list[dict], db: Any) -> list:
     collect the resulting records. Cheap text pre-check (is_schedule_page)
     before the more expensive table-extraction call, same pattern as the
     is_foundation_plan text-sniff already used elsewhere in this codebase.
+
+    2026-07-28 (user-reported: opening the 3D view took 5+ minutes and hung
+    at 95% on a ~15-page project): this function used to open and re-scan
+    EVERY page's source PDF from scratch on every single call --
+    sync_global_columns() calls it unconditionally on every /model/merged
+    request (every time the 3D view is opened), so clicking "3D" repeatedly
+    re-ran a full fitz.open() + text scan (+ full table-extraction pass on
+    any schedule page) for every page in the project, every time, with
+    nothing cached across requests. Per-page results are deterministic for
+    a given page (same PDF content in, same schedule records out), so this
+    caches them in-memory per page_id -- same pattern already used by
+    _PAGE_PT_SIZE_CACHE just above. First 3D-view open after new pages are
+    extracted still pays the real cost; every subsequent open reuses the
+    cached result instead of re-opening every PDF in the project again.
     """
     try:
         from app.services.storage import get_storage, LocalStorageAdapter
@@ -176,15 +192,30 @@ def _collect_schedule_records(pages: list[dict], db: Any) -> list:
     if not isinstance(storage, LocalStorageAdapter):
         return []
 
-    drawing_ids = list({p["drawing_id"] for p in pages if p.get("drawing_id")})
+    # Split out pages whose schedule records are already cached from this
+    # process's lifetime -- only the uncached remainder needs a PDF opened.
+    uncached_pages = []
+    records = []
+    for page in pages:
+        page_id_str = str(page.get("id"))
+        cached = _SCHEDULE_RECORDS_CACHE.get(page_id_str)
+        if cached is not None:
+            records.extend(cached)
+        else:
+            uncached_pages.append(page)
+
+    if not uncached_pages:
+        return records
+
+    drawing_ids = list({p["drawing_id"] for p in uncached_pages if p.get("drawing_id")})
     drawing_rows = {
         d["id"]: d for d in
         (db.table("drawings").select("*").in_("id", drawing_ids).execute().data or [])
     }
 
-    records = []
     docs_cache: dict[str, Any] = {}
-    for page in pages:
+    for page in uncached_pages:
+        page_id_str = str(page.get("id"))
         drawing = drawing_rows.get(page.get("drawing_id"))
         if not drawing:
             continue
@@ -196,8 +227,10 @@ def _collect_schedule_records(pages: list[dict], db: Any) -> list:
                 docs_cache[drawing["id"]] = doc
             pdf_page = doc[page["idx"]]
             if not is_schedule_page(pdf_page):
+                _SCHEDULE_RECORDS_CACHE[page_id_str] = []
                 continue
             page_records = parse_column_schedule_page(pdf_page, page_idx=page["idx"])
+            _SCHEDULE_RECORDS_CACHE[page_id_str] = page_records
             records.extend(page_records)
         except Exception as exc:
             logger.debug("Schedule parse failed for page %s: %s", page.get("id"), exc)

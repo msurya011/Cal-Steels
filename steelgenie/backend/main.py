@@ -2122,6 +2122,35 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
             frag_idx.append(i)
             frag_pts.append((p1.x, p1.y, p2.x, p2.y))
 
+        # Performance (2026-07-28, user-reported multi-minute extraction on
+        # large sheets): same O(n^2) issue as the EPS-cluster fix above --
+        # this loop compared every fragment's endpoints against every other
+        # fragment's endpoints (4 hypot() calls per pair). On a foundation
+        # plan, `frag_idx` is every unfilled single-line drawing object on
+        # the whole sheet (dash ticks, hatch lines, footing outlines), which
+        # can run into the thousands -- this was the single largest
+        # contributor to the 12M+ hypot() calls measured on one profiled
+        # sheet. Spatial-grid bucket the fragment ENDPOINTS (cell size =
+        # _FRAG_EPS) so only fragments with an endpoint in the same/adjacent
+        # cell are ever distance-checked. Produces the identical fusion
+        # result as the brute-force version -- same _FRAG_EPS threshold,
+        # same 4-endpoint-pair test, same flood-fill/union semantics.
+        _frag_grid: dict = {}
+        for _fi, (fx0, fy0, fx1, fy1) in enumerate(frag_pts):
+            for (fx, fy) in ((fx0, fy0), (fx1, fy1)):
+                _fk = (int(fx // _FRAG_EPS), int(fy // _FRAG_EPS))
+                _frag_grid.setdefault(_fk, set()).add(_fi)
+
+        def _frag_candidates(idx):
+            fx0, fy0, fx1, fy1 = frag_pts[idx]
+            seen_cand = set()
+            for (fx, fy) in ((fx0, fy0), (fx1, fy1)):
+                gx, gy = int(fx // _FRAG_EPS), int(fy // _FRAG_EPS)
+                for dgx in (-1, 0, 1):
+                    for dgy in (-1, 0, 1):
+                        seen_cand.update(_frag_grid.get((gx + dgx, gy + dgy), ()))
+            return seen_cand
+
         _fused = [False] * len(frag_idx)
         for a in range(len(frag_idx)):
             if _fused[a]:
@@ -2132,7 +2161,7 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
             while queue:
                 cur = queue.pop()
                 cx0, cy0, cx1, cy1 = frag_pts[cur]
-                for b in range(len(frag_idx)):
+                for b in _frag_candidates(cur):
                     if _fused[b]:
                         continue
                     bx0, by0, bx1, by1 = frag_pts[b]
@@ -2203,6 +2232,39 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
     # well under real footing-to-footing spacing (multiple feet = tens of pt)
     # so this doesn't risk merging two adjacent real footings together.
     EPS = 30 if is_foundation_plan else 15
+
+    # Performance (2026-07-28, user-reported: full extraction taking 3-4
+    # minutes on a large/complex sheet): the flood-fill below used to scan
+    # ALL of `raw` for every point popped from the queue -- worst case
+    # O(len(raw)^2) distance checks. Profiled live on a real drawing: over
+    # 12 MILLION math.hypot() calls from this loop alone on a single
+    # mid-size sheet, and this was the single largest cost in the entire
+    # analyse_pdf pipeline by a wide margin. A bigger/denser sheet (more
+    # raw vector sub-paths) scales quadratically, which is exactly what
+    # turns a big drawing into a multi-minute extraction.
+    #
+    # Fix: bucket every raw candidate into an EPS-sized spatial grid first.
+    # Any two points within EPS of each other must fall in the same or an
+    # immediately-adjacent grid cell (cell size == EPS), so the neighbor
+    # search only has to check the 3x3 block of cells around a point instead
+    # of every other point on the sheet. This produces the EXACT SAME
+    # clusters as the brute-force version -- same EPS threshold, same
+    # flood-fill/union semantics -- it only changes how neighbors are found,
+    # not which points count as neighbors.
+    _grid: dict = {}
+    for _idx, _r in enumerate(raw):
+        _key = (int(_r[0] // EPS), int(_r[1] // EPS))
+        _grid.setdefault(_key, []).append(_idx)
+
+    def _grid_neighbors(idx):
+        px, py = raw[idx][0], raw[idx][1]
+        gx, gy = int(px // EPS), int(py // EPS)
+        for dgx in (-1, 0, 1):
+            for dgy in (-1, 0, 1):
+                for j in _grid.get((gx + dgx, gy + dgy), ()):
+                    if not used[j] and math.hypot(px - raw[j][0], py - raw[j][1]) < EPS:
+                        yield j
+
     symbols = []
     used = [False] * len(raw)
     for i in range(len(raw)):
@@ -2213,13 +2275,10 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
         queue = [i]
         while queue:
             cur_idx = queue.pop()
-            cx_cur, cy_cur = raw[cur_idx][0], raw[cur_idx][1]
-            for j in range(len(raw)):
-                if not used[j]:
-                    if math.hypot(cx_cur - raw[j][0], cy_cur - raw[j][1]) < EPS:
-                        used[j] = True
-                        cluster_idx.append(j)
-                        queue.append(j)
+            for j in _grid_neighbors(cur_idx):
+                used[j] = True
+                cluster_idx.append(j)
+                queue.append(j)
 
         ref_cx, ref_cy, rotation, symbol_type, depth_in = refine_column_geometry(
             drawings, [raw[k][3] for k in cluster_idx], scale_ratio)
@@ -3083,12 +3142,35 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
         # band (real grid bubbles cluster tightly on ONE of these two axes;
         # noise doesn't cluster tightly on either).
         if len(best_x) >= len(best_y):
-            buckets, best = buckets_x, best_x
+            buckets, best, axis_idx, lo, hi, span = buckets_x, best_x, 1, bx0, bx1, plan_w
         else:
-            buckets, best = buckets_y, best_y
+            buckets, best, axis_idx, lo, hi, span = buckets_y, best_y, 2, by0, by1, plan_h
 
         threshold = max(min_count, min_frac * len(best))
-        kept = [p for grp in buckets.values() if len(grp) >= threshold for p in grp]
+        candidate_groups = [grp for grp in buckets.values() if len(grp) >= threshold]
+
+        # Band SIZE alone isn't enough to pick the real grid-bubble row: on
+        # a dense framing/roof plan, a repeated per-bay callout (joist
+        # spacing, deck gauge, etc.) prints once per bay just like grid
+        # labels do, and can easily out-number the true bubble row (found
+        # live on a roof framing sheet: a joist-spacing row of 14 numbers
+        # at mid-sheet beat the real 12-number grid-label row printed at
+        # the true top edge, so the old "biggest band wins" rule kept the
+        # noise and dropped the real grid entirely -- V grid came back
+        # empty on a sheet where the bubbles were clearly visible).
+        # Real grid bubbles are always printed AT the plan's actual edge;
+        # an interior per-bay callout is not, no matter how many times it
+        # repeats. Prefer whichever candidate band(s) sit within the outer
+        # 15% of the plan on this axis (checking both edges, since some
+        # sheets label both the near and far side) over one that's merely
+        # bigger but sits deeper inside the plan.
+        EDGE_MARGIN = 0.15 * span
+        edge_groups = [
+            grp for grp in candidate_groups
+            if (sum(p[axis_idx] for p in grp) / len(grp)) <= lo + EDGE_MARGIN
+            or (sum(p[axis_idx] for p in grp) / len(grp)) >= hi - EDGE_MARGIN
+        ]
+        kept = [p for grp in (edge_groups or candidate_groups) for p in grp]
         # Never let the filter manufacture a false "no grid" result when the
         # raw candidate set was small to begin with and simply didn't form a
         # clean single band — fall back to returning everything untouched
@@ -4092,20 +4174,12 @@ def build_members(profiles, page_w, page_h,
                         _perp_dist = math.hypot(
                             p["cx"] - (_vx1 + _tc * _vdx),
                             p["cy"] - (_vy1 + _tc * _vdy))
-                        # detect_beam_lines already enforces a strict LABEL_R.
-                        # Do not second-guess it unless it's outrageously far.
-                        if _perp_dist > 250.0:
-                            # Suspicious — run span sanity check
-                            _sv_ok = _span_valid(
-                                _vx1 / page_w, _vy1 / page_h,
-                                _vx2 / page_w, _vy2 / page_h,
-                                p["cx"] / page_w, p["cy"] / page_h,
-                                beam_dir)
-                            if not _sv_ok:
-                                _perp_ok = False
-                                print(f"[BUILD] Rejected false vector match for "
-                                      f"{p['profile']} (perp={_perp_dist:.0f} pt, "
-                                      f"span_valid=False) — using grid fallback")
+                        # Tight perpendicular distance limit (35 pt ≈ 3.5 ft) so distant margin callouts
+                        # or leader notes (e.g. W18x143 in margin) are rejected in favor of the real beam callout (W8x35).
+                        if _perp_dist > 35.0:
+                            _perp_ok = False
+                            print(f"[BUILD] Rejected distant vector match for "
+                                  f"{p['profile']} (perp={_perp_dist:.1f} pt > 35pt) — distant note callout")
 
                     if _perp_ok:
                         _use_line_hit = True
@@ -4956,8 +5030,8 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
     ppf = pts_per_foot if pts_per_foot > 0 else 9.0
     pb0x, pb0y, pb1x, pb1y = plan_bounds
     plan_w, plan_h = pb1x - pb0x, pb1y - pb0y
-    MAX_H_FRAC = 0.75   # tightened from 0.85 — long dimension lines span ~80 %
-    MAX_V_FRAC = 0.75
+    MAX_H_FRAC = 0.70   # multi-bay beams span up to 65% of plan width; sheet borders span >75%
+    MAX_V_FRAC = 0.70
     DEDUP_R    = 40.0
     CAP        = 200
     MIN_FT     = 5.0    # F3: beams shorter than 5 ft are stubs / conn. plates
@@ -5033,6 +5107,15 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
     # above to bridge columns the symbol detector missed.
     _lab_ends = [(a, b) for (a, b, c, d) in lab] + [(c, d) for (a, b, c, d) in lab]
 
+    # Active framing bounding box: lines extending outside the beam framing envelope
+    # (e.g. vertical grid line extensions shooting down into margins) are rejected.
+    _lab_xs = [a for (a, b, c, d) in lab] + [c for (a, b, c, d) in lab]
+    _lab_ys = [b for (a, b, c, d) in lab] + [d for (a, b, c, d) in lab]
+    _framing_min_x = min(_lab_xs) - 15.0 if _lab_xs else 0.0
+    _framing_max_x = max(_lab_xs) + 15.0 if _lab_xs else page_w
+    _framing_min_y = min(_lab_ys) - 15.0 if _lab_ys else 0.0
+    _framing_max_y = max(_lab_ys) + 15.0 if _lab_ys else page_h
+
     seen_lines = []
     def _covered(lx1, ly1, lx2, ly2):
         """True if this line coincides with an already extracted beam."""
@@ -5062,8 +5145,8 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
     # long, multi-bay grid lines or dimension strings.
     sorted_lns = sorted(all_struct_lns, key=lambda s: s[4])
     # Chain gap: how far apart two drawn fragments can be and still be treated
-    # as one broken centreline (same tolerance used for labeled beams).
-    _unlab_chain_gap = max(15.0, ppf * 1.0)
+    # as one broken centreline (bridges gaps created by text callouts like (+14'-10 5/8")).
+    _unlab_chain_gap = max(45.0, ppf * 5.0)
     for (lx1, ly1, lx2, ly2, ln) in sorted_lns:
         if n >= CAP:
             break
@@ -5162,6 +5245,21 @@ def add_unlabeled_lines_universal(members, all_struct_lns, plan_bounds,
         else:
             rejected_dir += 1
             continue                          # diagonal → skip
+
+        # Reject grid extension lines and margin lines extending outside the active structural framing boundary
+        if _lab_xs and _lab_ys:
+            mid_x = (lx1 + lx2) / 2.0
+            mid_y = (ly1 + ly2) / 2.0
+            if mid_x < _framing_min_x - 5.0 or mid_x > _framing_max_x + 5.0 or mid_y < _framing_min_y - 5.0 or mid_y > _framing_max_y + 5.0:
+                continue
+            if is_h:
+                if lx1 < _framing_min_x - 10.0 or lx2 > _framing_max_x + 10.0 or ly1 < _framing_min_y - 10.0 or ly1 > _framing_max_y + 10.0:
+                    continue
+            else:
+                if ly1 < _framing_min_y - 10.0 or ly2 > _framing_max_y + 10.0 or lx1 < _framing_min_x - 10.0 or lx1 > _framing_max_x + 10.0:
+                    continue
+                if min(ly1, ly2) >= _framing_max_y - 15.0 or max(ly1, ly2) <= _framing_min_y + 15.0:
+                    continue
 
         # F3: minimum structural length
         if ln / ppf < MIN_FT:
@@ -6051,11 +6149,14 @@ _FOUNDATION_COLUMNS_CACHE: dict[str, list[dict]] = {}
 
 def get_foundation_columns_for_file(filename: str) -> list[dict]:
     """Retrieve foundation plan column definitions cached or saved for this file/project."""
-    if not filename:
-        return []
-    norm_fn = os.path.basename(filename).strip().lower()
-    if norm_fn in _FOUNDATION_COLUMNS_CACHE:
+    norm_fn = os.path.basename(filename or "").strip().lower()
+    if norm_fn and norm_fn in _FOUNDATION_COLUMNS_CACHE:
         return _FOUNDATION_COLUMNS_CACHE[norm_fn]
+    
+    if _FOUNDATION_COLUMNS_CACHE:
+        # Fallback to the active session's cached foundation columns
+        latest_key = list(_FOUNDATION_COLUMNS_CACHE.keys())[-1]
+        return _FOUNDATION_COLUMNS_CACHE[latest_key]
     
     # Try reading from local_db.json or saved_projects.json
     try:
@@ -6071,10 +6172,6 @@ def get_foundation_columns_for_file(filename: str) -> list[dict]:
             for proj in projects_list:
                 if not isinstance(proj, dict):
                     continue
-                # MUST match current project filename to prevent cross-project leaks
-                proj_fn = os.path.basename(proj.get("filename") or proj.get("name") or "").strip().lower()
-                if proj_fn != norm_fn and norm_fn not in proj_fn and proj_fn not in norm_fn:
-                    continue
                 pages = proj.get("pages") or []
                 for p in pages:
                     if p.get("is_foundation_plan"):
@@ -6089,7 +6186,8 @@ def get_foundation_columns_for_file(filename: str) -> list[dict]:
                                     "profile": m.get("profile"),
                                 })
             if f_cols:
-                _FOUNDATION_COLUMNS_CACHE[norm_fn] = f_cols
+                if norm_fn:
+                    _FOUNDATION_COLUMNS_CACHE[norm_fn] = f_cols
                 return f_cols
     except Exception as exc:
         print(f"[FOUNDATION PROPAGATION] Error reading saved projects: {exc}")
@@ -6167,33 +6265,48 @@ def propagate_foundation_columns(members: list, foundation_cols: list,
     used_framing_col_indices = set()
 
     for f_col in foundation_cols:
-        grid_ref = f_col.get("grid_ref")
         px, py = None, None
+        grid_ref = f_col.get("grid_ref")
+        is_explicit_grid_match = False
+        
+        # Strategy 1: Flexible Grid Reference Matching (e.g. "1-A", "A-1", "1/A", "A/1", "1 A", "A1", "GRID 1-A")
+        if grid_ref:
+            g_str = str(grid_ref).strip().upper()
+            m_grid = re.search(r'([A-Z0-9.]+)\s*[-/_\s]?\s*([A-Z0-9.]+)', g_str)
+            if m_grid:
+                p1, p2 = m_grid.group(1), m_grid.group(2)
+                if p1 in label_to_v_grid and p2 in label_to_h_grid:
+                    px = label_to_v_grid[p1]
+                    py = label_to_h_grid[p2]
+                    is_explicit_grid_match = True
+                elif p2 in label_to_v_grid and p1 in label_to_h_grid:
+                    px = label_to_v_grid[p2]
+                    py = label_to_h_grid[p1]
+                    is_explicit_grid_match = True
 
-        # Strategy 1: Match by grid labels (e.g. "1-A", "2-B", "B-3")
-        if grid_ref and "-" in grid_ref:
-            parts = grid_ref.split("-", 1)
-            v_part = parts[0].strip().upper()
-            h_part = parts[1].strip().upper()
-            if v_part in label_to_v_grid and h_part in label_to_h_grid:
-                px = label_to_v_grid[v_part]
-                py = label_to_h_grid[h_part]
-            elif h_part in label_to_v_grid and v_part in label_to_h_grid:
-                px = label_to_v_grid[h_part]
-                py = label_to_h_grid[v_part]
-
-        # Strategy 2: Project normalized (x, y) relative position inside plan bounds and snap to grid
+        # Strategy 2: Project relative position inside plan bounds and snap to grid
         if px is None or py is None:
             if f_col.get("x") is not None and f_col.get("y") is not None:
                 raw_px = f_col["x"] * page_w
                 raw_py = f_col["y"] * page_h
-                # Snap to closest vertical and horizontal grid lines
-                gx_match = min(v_grid, key=lambda g: abs(raw_px - g)) if v_grid else raw_px
-                gy_match = min(h_grid, key=lambda g: abs(raw_py - g)) if h_grid else raw_py
                 
-                # Use grid intersection if within SNAP_PT, else fallback to raw position
-                px = gx_match if v_grid and abs(raw_px - gx_match) <= SNAP_PT else raw_px
-                py = gy_match if h_grid and abs(raw_py - gy_match) <= SNAP_PT else raw_py
+                # Dynamic snap radius: proportional to bay spacing or default ~6ft
+                v_sorted = sorted(v_grid) if v_grid else []
+                h_sorted = sorted(h_grid) if h_grid else []
+                v_spans = [v_sorted[k+1] - v_sorted[k] for k in range(len(v_sorted)-1)] if len(v_sorted) > 1 else []
+                h_spans = [h_sorted[k+1] - h_sorted[k] for k in range(len(h_sorted)-1)] if len(h_sorted) > 1 else []
+                v_bay = (sum(v_spans) / len(v_spans)) if v_spans else 72.0
+                h_bay = (sum(h_spans) / len(h_spans)) if h_spans else 72.0
+                
+                GRID_SNAP_X = max(SNAP_PT, v_bay * 0.45)
+                GRID_SNAP_Y = max(SNAP_PT, h_bay * 0.45)
+                
+                gx_match = min(v_grid, key=lambda g: abs(raw_px - g)) if v_grid else None
+                gy_match = min(h_grid, key=lambda g: abs(raw_py - g)) if h_grid else None
+                
+                if gx_match is not None and abs(raw_px - gx_match) <= GRID_SNAP_X and gy_match is not None and abs(raw_py - gy_match) <= GRID_SNAP_Y:
+                    px = gx_match
+                    py = gy_match
 
         if px is None or py is None:
             continue
@@ -6207,7 +6320,7 @@ def propagate_foundation_columns(members: list, foundation_cols: list,
             if not (active_min_x <= px <= active_max_x and active_min_y <= py <= active_max_y):
                 continue
 
-        CONNECT_RADIUS_PT = 36.0 * _ipt  # ~3 ft connectivity search radius
+        CONNECT_RADIUS_PT = 72.0 * _ipt  # ~6 ft connectivity search radius (covers corner spandrels)
         has_local_framing = False
         for m in other_members:
             # Check member endpoints / midpoints
@@ -6236,8 +6349,8 @@ def propagate_foundation_columns(members: list, foundation_cols: list,
                         has_local_framing = True
                         break
 
-        # Universal rule: if a grid location has NO framing lines connecting on THIS sheet, do not project
-        if other_members and not has_local_framing:
+        # Universal rule: project if matched by explicit grid ref OR if local framing exists nearby
+        if other_members and not (has_local_framing or is_explicit_grid_match):
             continue
 
         # Find any imprecise framing column near this foundation column and consume/replace it
@@ -7603,6 +7716,24 @@ async def analyse_pdf(req: AnalysisRequest):
             # math both stay exactly as they are; see analyse.py for where
             # this gets persisted onto the page row.
             "is_foundation_plan": _is_foundation_plan,
+            # These five were computed above for this page's own extraction
+            # but never surfaced past this function -- app/workers/analyse.py
+            # (the REAL persistence path behind /api/v1/pages/{page_id}/
+            # analyse) needs exactly these to re-run
+            # propagate_foundation_columns() with this sheet's actual grid/
+            # page geometry. Without them, every caller downstream of this
+            # dict falls back to empty grids and a hardcoded 1000x1000 "page
+            # size" default, which silently breaks the foundation->framing
+            # column propagation feature on every project, not just one --
+            # points get compared against the wrong plan-bounds box and
+            # almost all of them get rejected as "outside the sheet".
+            "v_grid":      v_grid,
+            "h_grid":      h_grid,
+            "v_labels":    {round(x, 2): lbl for x, lbl in (v_labels or {}).items()},
+            "h_labels":    {round(y, 2): lbl for y, lbl in (h_labels or {}).items()},
+            "page_w":      page_w,
+            "page_h":      page_h,
+            "plan_bounds": list(plan_bounds) if plan_bounds else None,
         }
     except Exception as e:
         import traceback; traceback.print_exc()

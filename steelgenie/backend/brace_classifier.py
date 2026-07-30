@@ -1025,6 +1025,58 @@ def classify(candidates: list,
             results[idx]["confidence"]    = "REJECT"
             results[idx]["reject_reason"] = "annotation_xpair"
 
+    # ── Post-processing: shaft/opening X-pair rejection (large symbols) ───────
+    # The annotation_xpair pass above only catches SMALL mirrored X-pairs
+    # (bbox < XPAIR_MIN_BAY_FT in both axes, MEDIUM tier only) -- built for
+    # small annotation symbols like section markers and north arrows. A large
+    # elevator/stair SHAFT opening is drawn with the exact same mirrored-X
+    # graphic convention (two diagonals sharing one bounding box, corner to
+    # corner) but can easily span a full bay or more, clearing both the
+    # XPAIR_MIN_BAY_FT size gate and the HIGH-tier length threshold -- so it
+    # was slipping through as a real HIGH-confidence brace. The
+    # opening_annotation text-proximity check above is the intended catch for
+    # this, but only within OPENING_SNAP_PT of the label text, which a large
+    # shaft's own diagonal midpoint can easily sit outside of.
+    #
+    # Root-cause signal instead of a wider/riskier snap radius: standard
+    # structural drafting convention draws a real X-BRACE in ELEVATION, never
+    # in PLAN view -- a plan view only ever uses this exact "perfect mirror
+    # X, same bounding box" graphic for a floor/roof opening symbol. So on a
+    # framing_plan/roof_plan/foundation_plan page specifically (never on
+    # braced_frame_elevation, where a mirrored X-pair is exactly what a real
+    # X-brace looks like), ANY perfectly-mirrored diagonal pair -- regardless
+    # of size or confidence tier -- is rejected. This is deliberately NOT
+    # gated by size the way annotation_xpair is, and deliberately does not
+    # touch elevation pages, so it can't reject a real brace pair drawn in
+    # elevation while still catching large shaft symbols the text-proximity
+    # check misses.
+    if page_context in ("framing_plan", "roof_plan", "foundation_plan"):
+        _live_idx = [i for i, c in enumerate(results)
+                     if c.get("confidence") in ("HIGH", "MEDIUM")]
+        _shaft_reject = set()
+        for ii in range(len(_live_idx)):
+            i = _live_idx[ii]
+            a = results[i]
+            for jj in range(ii + 1, len(_live_idx)):
+                j = _live_idx[jj]
+                b = results[j]
+                cxa = (a["x1"] + a["x2"]) / 2;  cya = (a["y1"] + a["y2"]) / 2
+                cxb = (b["x1"] + b["x2"]) / 2;  cyb = (b["y1"] + b["y2"]) / 2
+                if math.hypot(cxa - cxb, cya - cyb) > NODE_SNAP_PT:
+                    continue
+                ax0, ax1 = min(a["x1"], a["x2"]), max(a["x1"], a["x2"])
+                ay0, ay1 = min(a["y1"], a["y2"]), max(a["y1"], a["y2"])
+                bx0, bx1 = min(b["x1"], b["x2"]), max(b["x1"], b["x2"])
+                by0, by1 = min(b["y1"], b["y2"]), max(b["y1"], b["y2"])
+                if (abs(ax0 - bx0) > NODE_SNAP_PT or abs(ax1 - bx1) > NODE_SNAP_PT
+                        or abs(ay0 - by0) > NODE_SNAP_PT or abs(ay1 - by1) > NODE_SNAP_PT):
+                    continue
+                _shaft_reject.add(i)
+                _shaft_reject.add(j)
+        for idx in _shaft_reject:
+            results[idx]["confidence"]    = "REJECT"
+            results[idx]["reject_reason"] = "shaft_opening_xpair"
+
     return results
 
 

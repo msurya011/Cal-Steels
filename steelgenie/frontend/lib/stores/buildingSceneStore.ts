@@ -866,6 +866,73 @@ class BuildingSceneStore {
   }
 
   /**
+   * Fully replace every column-type SceneMember with the latest set from a
+   * merged-model fetch.
+   *
+   * Root-cause fix (2026-07-28, "column line is not rendering" / only the
+   * first extracted floor's columns ever appeared in the 3D model): unlike
+   * beams, columns are not one row per page/floor -- they come from the
+   * backend's Global Column Database (sync_global_columns in
+   * registration.py), which is fully recomputed on every merged-model call
+   * and returns one member per PHYSICAL column, each tagged with
+   * source_page_id = its canonical (always foundation-plan-anchored, per the
+   * position-anchoring fix) page -- i.e. every column's page_id is always
+   * the SAME single page regardless of how many floors now contribute
+   * beam/joist evidence to its top_elev_ft.
+   *
+   * loadModel()'s incremental path used to bucket ALL members (columns
+   * included) by page_id and hand each bucket to addPageMembers(), which
+   * no-ops for a page already in pageLoadedSet. Since a column's page_id
+   * was always that one already-loaded foundation-plan page, extracting
+   * floor 2, floor 3, etc. (which grows each column's real top_elev_ft
+   * further) never got past that early-return: the freshly-recomputed,
+   * taller column set was silently dropped every time, so only whatever
+   * height existed at the very first load ever rendered -- exactly the
+   * reported symptom of columns only showing up for the initial floor.
+   *
+   * Columns aren't page-scoped data; treat them as a single project-wide
+   * table and always replace the whole set on every fetch, independent of
+   * per-page load tracking (which stays correct and unchanged for
+   * beams/braces/joists, which genuinely are one row per floor).
+   */
+  replaceColumns(rawColumns: RawMember[]) {
+    for (const m of [...this.members.values()]) {
+      if (m.type === 'column') this._eraseSceneMember(m)
+    }
+
+    for (const raw of rawColumns) {
+      const x1 = raw.start[0], y1 = raw.start[1], z1 = raw.start[2]
+      const x2 = raw.end[0],   y2 = raw.end[1],   z2 = raw.end[2]
+      const colorKey = getMemberColor(raw, this.colorMode, null)
+      const sm: SceneMember = {
+        globalId:      raw.id,
+        memberIds:     [raw.member_id, ...(raw.merged_member_ids || [])],
+        pageIds:       [raw.page_id],
+        x1, z1, x2, z2,
+        y1, y2,
+        elevation:     raw.start[1],
+        type:          raw.type,
+        profile:       raw.profile,
+        piecemark:     raw.piecemark,
+        unlabeled:     raw.unlabeled || false,
+        floorId:       raw.floor_id || null,
+        floorName:     raw.floor_name || null,
+        colorGroupKey: colorKey,
+        bufferIndex:   -1,
+        status:        raw.status ?? null,
+        weight_lbs:    raw.weight_lbs ?? null,
+        sequence:      raw.sequence ?? null,
+        labor_code:    raw.labor_code ?? null,
+        paint:         raw.paint ?? null,
+      }
+      this._appendSceneMember(sm)
+    }
+
+    this.markDirty()
+    this.notify()
+  }
+
+  /**
    * Add grid lines for a page (idempotent by grid id).
    */
   addPageGrids(rawGrids: RawGridLine[]) {

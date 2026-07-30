@@ -307,6 +307,21 @@ async def run_analyse(
                         page_h = result.get("page_h") or 1000.0
                         pts_pf = 72.0 / max(scale_ratio, 1) * 12.0
 
+                        # propagate_foundation_columns() (main.py) decides whether a
+                        # foundation column belongs on THIS sheet by checking it
+                        # against real framing here -- both its "active framing
+                        # envelope" bounding box and its per-column connectivity
+                        # radius check walk each member's endpoints (lx/ly, sx/sy,
+                        # bx1/by1, bx2/by2), not just one point. Only copying x/y
+                        # here collapsed every beam down to its midpoint, which
+                        # shrank the envelope to a fraction of the sheet's real
+                        # framed area and made columns near a beam's END (not its
+                        # middle) fail the connectivity check -- on a real framing
+                        # plan this silently rejected almost every real foundation
+                        # column, leaving only the handful whose midpoint-only
+                        # neighbors happened to still be close enough. Carrying
+                        # the full endpoint set through fixes this for any project,
+                        # not just one sheet.
                         raw_mem_format = []
                         for mr in member_rows:
                             geo = mr.get("geometry") or {}
@@ -314,9 +329,17 @@ async def run_analyse(
                                 "type": mr["kind"],
                                 "x": geo.get("x", 0),
                                 "y": geo.get("y", 0),
+                                "lx": geo.get("lx"),
+                                "ly": geo.get("ly"),
+                                "sx": geo.get("sx"),
+                                "sy": geo.get("sy"),
+                                "bx1": geo.get("bx1"),
+                                "by1": geo.get("by1"),
+                                "bx2": geo.get("bx2"),
+                                "by2": geo.get("by2"),
                                 "profile": mr.get("section"),
                             })
-                        
+
                         plan_bounds = result.get("plan_bounds")
                         propagated_raw = propagate_foundation_columns(
                             raw_mem_format, foundation_cols,

@@ -1,1 +1,322 @@
-[{"cx": 2513.941162109375, "cy": 1467.6064453125, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 2513.941162109375, "cy": 1247.0819702148438, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 2513.941162109375, "cy": 1028.0325927734375, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 2513.941162109375, "cy": 808.2831726074219, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 2513.941162109375, "cy": 508.98541259765625, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 2161.8421630859375, "cy": 1245.2763061523438, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 2131.0887451171875, "cy": 759.5900268554688, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 573.1656494140625, "cy": 1138.71044921875, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 1195.7348022460938, "cy": 1385.9140014648438, "category": "steel_column", "outcome": "accepted", "stage": "validation_engine", "ctx_score": 0.53, "ctx_signals": {"grid_intersection": 0.0, "footing_relationship": 0.13, "mark_match": 0.0, "beam_connectivity": 0.15, "schedule_match": 0.0}, "has_label_match": true, "beam_end_count": 2, "off_grid": true, "classifier_confidence": 0.65, "reason": "Accepted: category=steel_column; verified I/H flange+web pattern; off grid; matched profile label 'W18X143'; 2 beam ends frame in; confidence 0.53"}, {"cx": 1474.7658081054688, "cy": 1383.6637573242188, "category": "steel_column", "outcome": "accepted", "stage": "validation_engine", "ctx_score": 0.53, "ctx_signals": {"grid_intersection": 0.0, "footing_relationship": 0.13, "mark_match": 0.0, "beam_connectivity": 0.15, "schedule_match": 0.0}, "has_label_match": true, "beam_end_count": 2, "off_grid": true, "classifier_confidence": 0.65, "reason": "Accepted: category=steel_column; verified I/H flange+web pattern; off grid; matched profile label 'W18X143'; 2 beam ends frame in; confidence 0.53"}, {"cx": 1753.7968139648438, "cy": 1383.6637573242188, "category": "steel_column", "outcome": "accepted", "stage": "validation_engine", "ctx_score": 0.53, "ctx_signals": {"grid_intersection": 0.0, "footing_relationship": 0.13, "mark_match": 0.0, "beam_connectivity": 0.15, "schedule_match": 0.0}, "has_label_match": true, "beam_end_count": 2, "off_grid": true, "classifier_confidence": 0.65, "reason": "Accepted: category=steel_column; verified I/H flange+web pattern; off grid; matched profile label 'W18X143'; 2 beam ends frame in; confidence 0.53"}, {"cx": 2032.8278198242188, "cy": 1383.6637573242188, "category": "steel_column", "outcome": "accepted", "stage": "validation_engine", "ctx_score": 0.53, "ctx_signals": {"grid_intersection": 0.0, "footing_relationship": 0.13, "mark_match": 0.0, "beam_connectivity": 0.15, "schedule_match": 0.0}, "has_label_match": true, "beam_end_count": 2, "off_grid": true, "classifier_confidence": 0.65, "reason": "Accepted: category=steel_column; verified I/H flange+web pattern; off grid; matched profile label 'W18X143'; 2 beam ends frame in; confidence 0.53"}, {"cx": 2311.8587646484375, "cy": 1385.9140014648438, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 1}, {"cx": 1142.1975708007812, "cy": 712.3903503417969, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 1700.2595825195312, "cy": 712.3903503417969, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 1}, {"cx": 2192.76708984375, "cy": 836.0890197753906, "category": "steel_column", "outcome": "rejected", "stage": "min_beams", "beam_end_count": 0}, {"cx": 2118.3372802734375, "cy": 868.3139038085938, "category": "steel_column", "outcome": "accepted", "stage": "validation_engine", "ctx_score": 0.53, "ctx_signals": {"grid_intersection": 0.0, "footing_relationship": 0.13, "mark_match": 0.0, "beam_connectivity": 0.15, "schedule_match": 0.0}, "has_label_match": true, "beam_end_count": 2, "off_grid": true, "classifier_confidence": 0.65, "reason": "Accepted: category=steel_column; verified I/H flange+web pattern; off grid; matched profile label 'W12X19'; 2 beam ends frame in; confidence 0.53"}]
+[
+    {
+        "cx": 2513.941162109375,
+        "cy": 1247.0819702148438,
+        "category": "steel_column",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.267,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.13,
+            "mark_match": 0.06166783461807987,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.65,
+        "reason": "Accepted: category=steel_column; verified I/H flange+web pattern; off grid; confidence 0.27"
+    },
+    {
+        "cx": 2513.941162109375,
+        "cy": 1145.0955810546875,
+        "category": "footing_isolated",
+        "outcome": "rejected",
+        "stage": "validation_engine",
+        "ctx_score": 0.184,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.018745620182200412,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.45,
+        "reason": "Rejected: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; off grid; confidence 0.18"
+    },
+    {
+        "cx": 2212.3253173828125,
+        "cy": 1263.9149780273438,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.258,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.09337771548703572,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.45,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; off grid; confidence 0.26"
+    },
+    {
+        "cx": 2281.9423828125,
+        "cy": 1263.9149780273438,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.242,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.07673440784863347,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.45,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; off grid; confidence 0.24"
+    },
+    {
+        "cx": 2109.9246826171875,
+        "cy": 1342.2510986328125,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.249,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.0842676944639103,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.45,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; off grid; confidence 0.25"
+    },
+    {
+        "cx": 2350.4149169921875,
+        "cy": 1178.7523193359375,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.532,
+        "ctx_signals": {
+            "grid_intersection": 0.18048037302861258,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.18640504555010512,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": false,
+        "classifier_confidence": 0.45,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; on grid 8-5; confidence 0.53"
+    },
+    {
+        "cx": 1936.6700439453125,
+        "cy": 1342.2220458984375,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.415,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.24982480728801681,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.45,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; off grid; confidence 0.41"
+    },
+    {
+        "cx": 2214.813232421875,
+        "cy": 1353.2105102539062,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.415,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.24982480728801681,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.45,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; off grid; confidence 0.41"
+    },
+    {
+        "cx": 2350.857177734375,
+        "cy": 830.2674865722656,
+        "category": "steel_column",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.455,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.13,
+            "mark_match": 0.24982480728801681,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.65,
+        "reason": "Accepted: category=steel_column; verified I/H flange+web pattern; off grid; confidence 0.46"
+    },
+    {
+        "cx": 1486.403564453125,
+        "cy": 668.9684829711914,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.534,
+        "ctx_signals": {
+            "grid_intersection": 0.19991448591039096,
+            "footing_relationship": 0.13999999999999999,
+            "mark_match": 0.11930623686054659,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": false,
+        "classifier_confidence": 0.7,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan + real F/P/C mark nearby; on grid 5-2; confidence 0.53"
+    },
+    {
+        "cx": 2323.4964599609375,
+        "cy": 1422.802230834961,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.431,
+        "ctx_signals": {
+            "grid_intersection": 0.19837636334148445,
+            "footing_relationship": 0.13999999999999999,
+            "mark_match": 0.017869656622284485,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": false,
+        "classifier_confidence": 0.7,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan + real F/P/C mark nearby; on grid 8-7; confidence 0.43"
+    },
+    {
+        "cx": 2044.4655151367188,
+        "cy": 1422.802230834961,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.431,
+        "ctx_signals": {
+            "grid_intersection": 0.1983763610494136,
+            "footing_relationship": 0.13999999999999999,
+            "mark_match": 0.017869656622284485,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": false,
+        "classifier_confidence": 0.7,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan + real F/P/C mark nearby; on grid 7-7; confidence 0.43"
+    },
+    {
+        "cx": 1486.4035034179688,
+        "cy": 1422.802230834961,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.444,
+        "ctx_signals": {
+            "grid_intersection": 0.19837636334148445,
+            "footing_relationship": 0.13999999999999999,
+            "mark_match": 0.03083391730903995,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": false,
+        "classifier_confidence": 0.7,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan + real F/P/C mark nearby; on grid 5-7; confidence 0.44"
+    },
+    {
+        "cx": 1207.3724975585938,
+        "cy": 1422.802230834961,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.444,
+        "ctx_signals": {
+            "grid_intersection": 0.19837636334148445,
+            "footing_relationship": 0.13999999999999999,
+            "mark_match": 0.03083391730903995,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": false,
+        "classifier_confidence": 0.7,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan + real F/P/C mark nearby; on grid 4-7; confidence 0.44"
+    },
+    {
+        "cx": 1759.2704467773438,
+        "cy": 1325.8644104003906,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.257,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.13999999999999999,
+            "mark_match": 0.041871058163980374,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.7,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan + real F/P/C mark nearby; off grid; confidence 0.26"
+    },
+    {
+        "cx": 1690.5225830078125,
+        "cy": 1365.898681640625,
+        "category": "footing_isolated",
+        "outcome": "accepted",
+        "stage": "validation_engine",
+        "ctx_score": 0.342,
+        "ctx_signals": {
+            "grid_intersection": 0.0,
+            "footing_relationship": 0.09000000000000001,
+            "mark_match": 0.17747021723896284,
+            "beam_connectivity": 0.075,
+            "schedule_match": 0.0
+        },
+        "has_label_match": false,
+        "beam_end_count": 0,
+        "off_grid": true,
+        "classifier_confidence": 0.45,
+        "reason": "Accepted: category=footing_isolated; square-ish outline on a foundation plan, no readable mark nearby -- guessed; off grid; confidence 0.34"
+    }
+]

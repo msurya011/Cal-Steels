@@ -241,21 +241,7 @@ export function ColumnSymbol({
           beam-connectivity/3D math. Points AWAY from the marker now, since
           the marker itself moved to the real position (Stage 6 Part 2) --
           previously this pointed the other direction, which collapsed to a
-          zero-length line once cx/cy became the raw point. */}
-      {layers.aids.columnProjections !== false && hasRaw && (Math.abs(geo.raw_x - geo.x) > 0.0001 || Math.abs(geo.raw_y - geo.y) > 0.0001) && (
-        <g style={{ pointerEvents: 'none' }}>
-          <line
-            x1={`${cx}%`}
-            y1={`${cy}%`}
-            x2={`${geo.x * 100}%`}
-            y2={`${geo.y * 100}%`}
-            stroke="#EF4444"
-            strokeWidth={1}
-            strokeDasharray="3,3"
-            opacity={0.7}
-          />
-        </g>
-      )}
+      {/* Snap vector line disabled -- no over-extending red dashed lines */}
 
       {/* Cross-section symbol — thin stroke only, precise rotation */}
       <g style={{ transformOrigin: 'center', transformBox: 'fill-box', transform: `rotate(${m.rotation || 0}deg)` }}>

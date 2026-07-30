@@ -75,6 +75,7 @@ def score_column_candidate(
     #    are placed AT grid intersections; annotation bubbles, detail
     #    markers, and dimension ticks are scattered wherever there's room
     #    on the sheet, with no relationship to the grid at all.
+    #
     if has_grid_intersection and grid_snap_dist_pt is not None and bay_size_pt:
         closeness = max(0.0, 1.0 - min(1.0, grid_snap_dist_pt / max(bay_size_pt, 1.0)))
         signals["grid_intersection"] = 0.20 * closeness

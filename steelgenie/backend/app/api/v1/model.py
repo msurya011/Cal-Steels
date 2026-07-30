@@ -879,13 +879,19 @@ async def get_merged_model(
     # sync_global_columns() for how those are derived) -- exactly one 3D
     # instance per physical column, regardless of how many pages/floors
     # legitimately reference it.
+    try:
+        from app.engineering.registration import sync_global_columns
+        sync_global_columns(str(project_id))
+    except Exception as _se:
+        logger.exception("Error syncing global columns in get_merged_model: %s", _se)
+
     columns = db.table("columns").select("*").eq("project_id", str(project_id)).execute().data or []
     for c in columns:
         gx, gy = c.get("gx_ft"), c.get("gy_ft")
         if gx is None or gy is None:
             continue
         base_elev = c.get("base_elev_ft") or 0.0
-        top_elev = c.get("top_elev_ft") or base_elev
+        top_elev = c.get("top_elev_ft") or (base_elev + 15.0)  # default 15ft column height if single level
         members_out.append({
             "id": f"col_{c['id']}",
             "member_id": c.get("source_member_id"),
@@ -898,7 +904,23 @@ async def get_merged_model(
             "end": [gx, top_elev, gy],
             "rotation": c.get("rotation", 0),
             "symbol": c.get("symbol"),
-            "unlabeled": False,
         })
 
-    return {"scope": scope, "scope_id": None, "members": attach_bom_attributes(str(project_id), deduplicate_members(members_out)), "grids": grids_out, "floor_count": floor_count}
+    # Fallback: if no global columns exist yet, emit column members directly from members table
+    if not columns:
+        for floor in floors:
+            candidate_pages = pages_for_floor(floor["id"])
+            floor_elev = floor.get("elevation_ft") or next((p.get("tos_ft") for p in candidate_pages if p.get("tos_ft") is not None), None)
+            if floor_elev is None:
+                continue
+            for page in candidate_pages:
+                page_mems = db.table("members").select("*").eq("page_id", str(page["id"])).neq("status", "excluded").execute().data or []
+                for m in page_mems:
+                    if m.get("kind") == "column" or m.get("type") == "column":
+                        out = _member_out(m, page, floor_elev, 0.0, db)
+                        if out:
+                            out["floor_id"] = floor["id"]
+                            out["floor_name"] = floor["name"]
+                            members_out.append(out)
+
+    return {"scope": scope, "scope_id": str(scope_id) if scope_id else None, "members": attach_bom_attributes(str(project_id), deduplicate_members(members_out)), "grids": grids_out, "floor_count": floor_count}

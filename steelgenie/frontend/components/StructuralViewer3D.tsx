@@ -466,9 +466,21 @@ export default function StructuralViewer3D({
         // Full rebuild — scope changed or first load
         buildingScene.rebuildFull(members, grids)
       } else {
-        // Incremental — group by page and append only new (or edited) ones
+        // Incremental — group by page and append only new (or edited) ones.
+        // Columns are excluded from this per-page bucketing and handled by
+        // replaceColumns() instead: every column always carries the SAME
+        // (foundation-plan-anchored) page_id regardless of which floor
+        // extraction most recently grew its height, so routing them through
+        // the per-page "already loaded" gate below silently dropped every
+        // re-sync after the first floor. See replaceColumns() for the full
+        // root-cause writeup.
+        const nonColumnMembers = members.filter(m => m.type !== 'column')
+        const columnMembers    = members.filter(m => m.type === 'column')
+
+        buildingScene.replaceColumns(columnMembers)
+
         const byPage = new Map<string, RawMember[]>()
-        for (const m of members) {
+        for (const m of nonColumnMembers) {
           if (!byPage.has(m.page_id)) byPage.set(m.page_id, [])
           byPage.get(m.page_id)!.push(m)
         }
