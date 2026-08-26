@@ -60,12 +60,17 @@ export default function TakeoffWorkspacePage() {
     }
   }, [pages, currentPageId, setCurrentPage, setScale])
 
-  // Load key plan floors on mount/project change
+  // Sync selectedScale when active page changes
+  const prevPageId = React.useRef<string | null>(null)
   useEffect(() => {
-    if (projectId) {
-      refetchKeyPlanFloors(currentPageId)
+    if (currentPageId && currentPageId !== prevPageId.current) {
+      prevPageId.current = currentPageId
+      const p = pages.find((pg: any) => pg.id === currentPageId)
+      if (p && (p.scale_label || p.scale_num)) {
+        setScale(p.scale_label, p.scale_num)
+      }
     }
-  }, [projectId, currentPageId])
+  }, [currentPageId, pages, setScale])
 
   // Query/Mutations: members
   const {
@@ -79,6 +84,21 @@ export default function TakeoffWorkspacePage() {
     analysePage,
     validateColumns,
   } = useMembers(currentPageId)
+
+  // Sync active page when a member is selected (e.g. from 3D viewer, BOM, or keyboard shortcut)
+  useEffect(() => {
+    if (selection.size === 1) {
+      const selectedId = Array.from(selection)[0]
+      const member = members.find((m: any) => m.id === selectedId)
+      if (member && member.page_id !== currentPageId) {
+        const page = pages.find((p: any) => p.id === member.page_id)
+        if (page) {
+          setCurrentPage(page.id, page.idx)
+          setScale(page.scale_label, page.scale_num)
+        }
+      }
+    }
+  }, [selection, members, pages, currentPageId, setCurrentPage, setScale])
 
   // BOM items carry the fields SteelGenie's "Color By" tool actually colors
   // by once a build has run (Sequence / Weight / Labor Code / Paint) -- these
@@ -111,6 +131,8 @@ export default function TakeoffWorkspacePage() {
 
 
   const activePage = pages.find((p: any) => p.id === currentPageId) || null
+  const activeDrawing = activePage ? drawings.find((d: any) => d.id === activePage.drawing_id) : null
+  const activeSheetName = activePage && activeDrawing ? `${activeDrawing.filename} — Page ${activePage.idx + 1}` : ''
   const [analysingState, setAnalysingState] = useState(false)
   const [extractingPageId, setExtractingPageId] = useState<string | null>(null)
   const [extractProgress, setExtractProgress] = useState<{ pct: number; msg: string } | null>(null)
@@ -183,10 +205,12 @@ export default function TakeoffWorkspacePage() {
   // Card-level page updates (scale / T.O.S. / status) — keeps store in sync
   const handleCardUpdatePage = async (pageId: string, data: any) => {
     try {
-      await updatePage({ pageId, data })
+      // Optimistically update the store if this is the active page
       if (pageId === currentPageId && (data.scale_label || data.scale_num)) {
         setScale(data.scale_label ?? selectedScale, data.scale_num ?? selectedRatio)
       }
+      
+      await updatePage({ pageId, data })
       toast.success('Page settings saved')
     } catch (err: any) {
       toast.error(err.message || 'Failed to save page settings')
@@ -229,14 +253,27 @@ export default function TakeoffWorkspacePage() {
   // Poll job status every 2s until done/failed (fallback when WS events are lost).
   const pollJob = (jobId: string, extractedPageId?: string) => {
     const started = Date.now()
+    let lastProgressPct = -1
+    let lastProgressMsg = ''
+    let lastActivityTime = Date.now()
+
     const timer = setInterval(async () => {
       try {
         const job = await jobsApi.get(jobId)
         if (!job) return
         if (job.status === 'running' || job.status === 'queued') {
+          if (job.progress !== lastProgressPct || job.message !== lastProgressMsg) {
+            lastProgressPct = job.progress ?? 0
+            lastProgressMsg = job.message || ''
+            lastActivityTime = Date.now()
+          }
           setExtractProgress({ pct: job.progress ?? 0, msg: job.message || 'Working…' })
-          // Safety: if a dev-reload killed the worker, the job stays 'running' forever.
-          if (Date.now() - started > 180_000) {
+
+          // Safety: only time out if the worker has stalled with no progress updates for > 120s,
+          // or if total job duration exceeds 10 minutes (600s) on very large scans.
+          const stalledTime = Date.now() - lastActivityTime
+          const totalElapsed = Date.now() - started
+          if (stalledTime > 300_000 || totalElapsed > 600_000) {
             clearInterval(timer)
             setAnalysingState(false)
             setExtractingPageId(null)
@@ -572,7 +609,7 @@ export default function TakeoffWorkspacePage() {
         ocr_dpi: 300,
         floor_elevation_ft: elevation,
       })
-      if (res?.job_id) pollJob(res.job_id)
+      if (res?.job_id) pollJob(res.job_id, currentPageId || undefined)
     } catch (err: any) {
       toast.error(err.message || 'Failed to start analysis job')
       setAnalysingState(false)
@@ -1025,7 +1062,7 @@ export default function TakeoffWorkspacePage() {
             pageTos={activePage?.tos_ft || 12.0}
           />
         ) : (
-          <SheetSummary members={members} />
+          <SheetSummary members={members} bomItems={bomItems} activeSheetName={activeSheetName} />
         )
       )}
     </div>

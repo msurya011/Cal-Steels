@@ -15,6 +15,8 @@ for _s in (_sys.stdout, _sys.stderr):
     except Exception:
         pass
 
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import logging
 import os
 import sys
@@ -41,6 +43,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup: clean up stale running/queued jobs left by previous server sessions
+    try:
+        from app.services.database import get_db, bulk_update_by_id
+        db = get_db()
+        stale_jobs = db.table("jobs").select("id, status").in_("status", ["running", "queued"]).execute().data or []
+        if stale_jobs:
+            logger.info("Cleaning up %d stale running/queued job(s) from prior session", len(stale_jobs))
+            updates = {
+                j["id"]: {
+                    "status": "failed",
+                    "error": "Server was restarted while this job was in progress",
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                }
+                for j in stale_jobs
+            }
+            bulk_update_by_id("jobs", updates)
+    except Exception as exc:
+        logger.warning("Could not clean up stale jobs on startup: %s", exc)
+
+    yield
+
+
 def create_app() -> FastAPI:
     cfg = get_settings()
 
@@ -51,6 +77,7 @@ def create_app() -> FastAPI:
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",
+        lifespan=lifespan,
     )
 
     # ── CORS ──────────────────────────────────────────────────────────────────

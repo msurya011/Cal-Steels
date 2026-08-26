@@ -102,11 +102,25 @@ MEMBER_COLORS = {
     "beam":   "#EC4899",
     "column": "#3B82F6",
     "brace":  "#F59E0B",
+    "joist":  "#06B6D4",
     # Stage 3 (2026-07-17 rebuild): footing outline, distinct from the
     # column it carries -- neutral grey so it doesn't compete visually
     # with the blue column mark now drawn at the same location.
     "footing": "#6B7280",
 }
+
+JOIST_PATTERNS = [
+    # Standard K-series joists: 14K3, 18K5, 24K7, 2K55, etc.
+    r'(?<![A-Z0-9])\d{1,2}K\d+(?![A-Z0-9])',
+    # Longspan / Deep Longspan joists: 28LH08, 44DLH12
+    r'(?<![A-Z0-9])\d{1,2}(?:LH|DLH)\d+(?![A-Z0-9])',
+    # Special K-series joists: 24KSP, 16KSP
+    r'(?<![A-Z0-9])\d{1,2}KSP(?![A-Z0-9])',
+    # Joist Girders: 36G9N12K, 40G10N14K
+    r'(?<![A-Z0-9])\d{1,2}G\d+N[\d.]+K(?![A-Z0-9])',
+    # Composite / CS Joists: 20CS3, 16CJ4
+    r'(?<![A-Z0-9])\d{1,2}(?:CJ|CS)\d+(?![A-Z0-9])',
+]
 
 STEEL_PATTERNS = [
     # W-sections: depth 1-2 digits, weight 2-3 digits (all real W shapes ≥ W4X13).
@@ -123,6 +137,8 @@ STEEL_PATTERNS = [
     r'MC\d+[Xx]\d+',
     r'ISA[\dXx]+',
     r'PIPE[\d.]+',
+    # SJI Joists (K, LH, DLH, JG, KSP)
+    *JOIST_PATTERNS,
 ]
 
 # Grid-letter labels. Beyond a single letter (A, B, C…) real drawings also
@@ -582,6 +598,8 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
     This gives us EXACT endpoints and EXACT length from the drawing geometry —
     no grid guessing needed.
     """
+    if isinstance(profiles, tuple):
+        profiles = profiles[0]
     bx0, by0, bx1, by1 = plan_bounds
     # MIN_LEN = 45 pt ≈ 5 ft at 1/8" scale.
     # This filters two things:
@@ -592,7 +610,7 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
     #     3–30 pt, so 45 pt cleanly separates them from beam centrelines.
     # Dynamically scale MIN_LEN to allow short beams (down to 3 ft) at any scale,
     # but never drop below 15 pt to keep filtering out small hatch marks.
-    MIN_LEN  = max(12, int(pts_per_foot * 1.0)) if pts_per_foot > 0 else 15
+    MIN_LEN  = max(22, int(pts_per_foot * 2.2)) if pts_per_foot > 0 else 22
     # Cap at 80 ft using the drawing scale — prevents full-plan dimension/
     # annotation lines from being matched as beam centrelines.
     # Fall back to 700 pt (≈78 ft at 1/8") when scale is unknown.
@@ -850,8 +868,9 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
     # Pre-pass: each profile's independent best score → process closest-first so
     # the strongest (label-on-its-own-line) matches claim their line before
     # weaker ones, distributing labels across all lines instead of clustering.
+    _keys = list(range(len(profiles))) if isinstance(profiles, list) else list(profiles.keys())
     _prelim = []
-    for _pi in range(len(profiles)):
+    for _pi in _keys:
         _, _sc, _ = _match_profile(profiles[_pi], None)
         _prelim.append((_sc, _pi))
     _order = [pi for _sc, pi in sorted(_prelim, key=lambda z: -z[0])]
@@ -889,7 +908,8 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             # a column back TO that column: a column between the matched piece
             # and the chained end means we crossed into a neighbouring beam.
             _om_x1, _om_y1, _om_x2, _om_y2 = lx1, ly1, lx2, ly2   # original extent
-            _chain_gap_tol = max(15.0, pts_per_foot * 1.0)
+            _is_heavy_girder = bool(re.match(r'^(?:W3[0-9]|W4[0-9]|W27X[1-9])', p.get("profile", "")))
+            _chain_gap_tol = (max(35.0, pts_per_foot * 14.0) if pts_per_foot > 0 else 120.0) if _is_heavy_girder else 4.0
             _c1, _c2, _c3, _c4, _cln = _extend_with_thin_segs(
                 lx1, ly1, lx2, ly2, all_lines,
                 gap_tol=_chain_gap_tol)
@@ -2069,8 +2089,9 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
         # on the already-applied, scale-aware SYM_MIN_PT/SYM_MAX_PT bound
         # from the top of this loop instead of a second, inconsistent
         # fixed-pixel limit.
-        if (is_foundation_plan and not has_curve and n_lines == 4
-                and 0.4 < aspect < 2.5):
+        # ── Small UNFILLED diamond/square outline (footing/pier/pedestal mark) ──
+        # Captured as candidate; column_symbol_classifier approves it if nearby structural mark exists.
+        if (not has_curve and n_lines == 4 and 0.4 < aspect < 2.5):
             raw.append((cx, cy, _raw_rect, i, "foundation_outline"))
 
     # ── Fragmented dashed/segmented shape rescue (foundation plans only) ──
@@ -2369,9 +2390,73 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
                          "library_match": None, "library_name": None,
                          "expected_member_type": None, "library_confidence": 0.0}
 
+        # ── Inner column symbol centering (foundation plan fix) ─────────────
+        # On foundation plans the cluster often merges a large outer shape
+        # (footing outline, pile cap rectangle, grade-beam) with a small
+        # inner column square or I-tick.  refine_column_geometry returns the
+        # UNION bounding-box centre, which drifts toward the outer shape and
+        # produces a marker that floats beside rather than ON the column.
+        #
+        # Strategy (priority order):
+        #   1. DARK FILLED rect  — a small rect with fill brightness < 0.4 is
+        #      almost certainly the solid black/dark-gray column base-plate.
+        #      Use its centre first.
+        #   2. SMALLEST rect     — if no dark fill found, use the smallest
+        #      roughly-square rect (the column inner square is always smaller
+        #      than the surrounding footing outline).
+        #   3. UNION centroid    — fallback when the cluster has only one
+        #      drawing (framing-plan I-column with no footing outline).
+        #
+        # IMPORTANT: cluster_idx contains indices into `raw`, NOT into
+        # `drawings`.  The actual drawing index is raw[_k][3].
+        _inner_cx, _inner_cy = ref_cx, ref_cy  # default: union centroid
+        if len(cluster_idx) > 1 and is_foundation_plan:
+            _best_dark_area = None
+            _best_small_area = None
+            _dark_cx = _dark_cy = None
+            _small_cx = _small_cy = None
+            for _k in cluster_idx:
+                _dk = raw[_k][3]          # ← correct: drawing index from raw tuple
+                _d_obj = drawings[_dk]
+                _dr = _d_obj.get("rect")
+                if _dr is None:
+                    continue
+                _dw = abs(_dr.x1 - _dr.x0)
+                _dh = abs(_dr.y1 - _dr.y0)
+                _da = _dw * _dh
+                if _da < 4:               # skip degenerate single-pixel rects
+                    continue
+                _aspect = _dw / _dh if _dh > 0 else 0
+                _dcx = (_dr.x0 + _dr.x1) / 2
+                _dcy = (_dr.y0 + _dr.y1) / 2
+                # Priority 1: dark filled rect (the actual solid column square)
+                _fill = _d_obj.get("fill")
+                if _fill is not None and len(_fill) >= 3:
+                    _brightness = (_fill[0] + _fill[1] + _fill[2]) / 3
+                    if _brightness < 0.4 and (_best_dark_area is None or _da < _best_dark_area):
+                        _best_dark_area = _da
+                        _dark_cx, _dark_cy = _dcx, _dcy
+                # Priority 2: smallest roughly-square rect (inner column box)
+                if 0.35 < _aspect < 2.8:
+                    if _best_small_area is None or _da < _best_small_area:
+                        _best_small_area = _da
+                        _small_cx, _small_cy = _dcx, _dcy
+            # Apply best result found
+            if _dark_cx is not None:
+                _inner_cx, _inner_cy = _dark_cx, _dark_cy
+            elif _small_cx is not None:
+                _inner_cx, _inner_cy = _small_cx, _small_cy
+            # else: remains ref_cx/ref_cy (union centroid fallback)
+
         symbols.append({
             "cx": ref_cx,
             "cy": ref_cy,
+            # inner_cx/inner_cy: centre of the SMALLEST rect in this cluster
+            # = the actual column/base-plate square, not the outer footing.
+            # Used by emit_symbol_columns as raw_x/raw_y so the frontend
+            # marker lands exactly on the column symbol.
+            "inner_cx": _inner_cx,
+            "inner_cy": _inner_cy,
             "rotation": rotation,
             "symbol": symbol_type,
             "depth_in": depth_in,
@@ -3339,6 +3424,14 @@ def classify_member(profile: str,
     """
     p = profile.upper().strip()
 
+    # ── SJI Steel Joist sections (K, LH, DLH, JG, KSP, CS) ────────────────────
+    if (re.match(r'^\d{1,2}K\d+$', p) or
+        re.match(r'^\d{1,2}(?:LH|DLH)\d+$', p) or
+        re.match(r'^\d{1,2}KSP$', p) or
+        re.match(r'^\d{1,2}G\d+N', p) or
+        re.match(r'^\d{1,2}(?:CJ|CS)\d+$', p)):
+        return "joist"
+
     # ── Angle / brace sections ────────────────────────────────────────────────
     if re.match(r'ISA', p) or re.match(r'L\d', p):
         return "brace"
@@ -4107,12 +4200,12 @@ def build_members(profiles, page_w, page_h,
                     claimed_symbols.add(best_idx)
                     snapped = True  # noqa: F841
 
-        # ── Beam direction, length, and span endpoints ────────────────────────
+        # ── Beam / Joist direction, length, and span endpoints ────────────────
         beam_dir = None
         length_ft = 0.0
         bx1 = by1 = bx2 = by2 = None
 
-        if mtype == "beam":
+        if mtype in ("beam", "joist"):
             line_hit = (beam_line_map or {}).get(p_idx)
 
             lx_frac = p["cx"] / page_w
@@ -4174,12 +4267,12 @@ def build_members(profiles, page_w, page_h,
                         _perp_dist = math.hypot(
                             p["cx"] - (_vx1 + _tc * _vdx),
                             p["cy"] - (_vy1 + _tc * _vdy))
-                        # Tight perpendicular distance limit (35 pt ≈ 3.5 ft) so distant margin callouts
-                        # or leader notes (e.g. W18x143 in margin) are rejected in favor of the real beam callout (W8x35).
-                        if _perp_dist > 35.0:
+                        # Perpendicular distance limit (150 pt ≈ 16 ft) to allow callouts positioned above/below
+                        # mechanical units and section cuts without dropping their real drawn beam line.
+                        if _perp_dist > 150.0:
                             _perp_ok = False
                             print(f"[BUILD] Rejected distant vector match for "
-                                  f"{p['profile']} (perp={_perp_dist:.1f} pt > 35pt) — distant note callout")
+                                  f"{p['profile']} (perp={_perp_dist:.1f} pt > 150pt) — distant note callout")
 
                     if _perp_ok:
                         _use_line_hit = True
@@ -4331,6 +4424,15 @@ def build_members(profiles, page_w, page_h,
                     bx1 = by1 = bx2 = by2 = None
                     length_ft = 0.0
 
+        # Heavy section minimum span check: W24-W40 members must span at least 10 ft
+        # This drops false matches to callout borders, detail bubbles, or stair leader lines.
+        if bx1 is not None and mtype == "beam" and length_ft > 0:
+            _heavy_match = re.match(r'W(2[4-9]|3[0-9]|4[0-9])', p.get("profile", ""), re.IGNORECASE)
+            if _heavy_match and length_ft < 10.0:
+                print(f"[BUILD] Heavy section span too short for {p['profile']} (L={length_ft:.1f}ft < 10ft) — dropped false note leader")
+                bx1 = by1 = bx2 = by2 = None
+                length_ft = 0.0
+
         sym = profile_sym_pos.get(p_idx)
 
         # Stage 3 (2026-07-17 rebuild, live-verified against real SteelGenie
@@ -4413,29 +4515,29 @@ def build_members(profiles, page_w, page_h,
 
     filtered = []
     for mem in members:
-        # Always keep columns and braces
-        if mem["type"] != "beam":
+        # Always keep columns, braces, footings
+        if mem["type"] not in ("beam", "joist"):
             filtered.append(mem)
             continue
-        # Drop stubs
-        if mem.get("length_ft", 0) < MIN_BEAM_FT and mem.get("bx1") is not None:
+        # Drop orphaned text callouts with no drawn span line or stubs < MIN_BEAM_FT
+        if mem.get("bx1") is None or mem.get("length_ft", 0) < MIN_BEAM_FT:
             continue
         filtered.append(mem)
 
-    # Group beams by quantised span key
+    # Group beams and joists by quantised span key
     from collections import Counter
     span_groups: dict = {}   # key → list of (index, member)
     no_span_beams = []
     for i, mem in enumerate(filtered):
-        if mem["type"] != "beam" or mem.get("bx1") is None:
+        if mem["type"] not in ("beam", "joist") or mem.get("bx1") is None:
             no_span_beams.append(mem)
             continue
         bx1r = round(mem["bx1"] * page_w / SPAN_TOL_PT)
         by1r = round(mem["by1"] * page_h / SPAN_TOL_PT)
         bx2r = round(mem["bx2"] * page_w / SPAN_TOL_PT)
         by2r = round(mem["by2"] * page_h / SPAN_TOL_PT)
-        # Normalise direction so (A→B) and (B→A) map to the same key
-        key = (min(bx1r, bx2r), min(by1r, by2r), max(bx1r, bx2r), max(by1r, by2r))
+        # Normalise direction and partition by type so joists and beams never clobber each other
+        key = (mem["type"], min(bx1r, bx2r), min(by1r, by2r), max(bx1r, bx2r), max(by1r, by2r))
         span_groups.setdefault(key, []).append(mem)
 
     deduped_beams = []
@@ -5417,8 +5519,13 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     DEDUP_IN = 24.0
     DEDUP_PT = DEDUP_IN * _ipt
 
-    existing = [(m["x"] * page_w, m["y"] * page_h)
-                for m in members if m.get("type") == "column"]
+    existing_with_raw = [
+        (m["x"] * page_w, m["y"] * page_h,
+         (m.get("geometry", {}).get("raw_x") or m["x"]) * page_w,
+         (m.get("geometry", {}).get("raw_y") or m["y"]) * page_h)
+        for m in members if m.get("type") == "column"
+    ]
+    added: list[tuple[float, float, float, float]] = []
 
     # General bay size (avg grid spacing), used by the Column Validation
     # Engine's grid-intersection scoring below -- distinct from the
@@ -5577,7 +5684,19 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                        for ux, uy in unique_ends):
                 unique_ends.append((ex, ey))
 
-        if len(unique_ends) < MIN_BEAMS and not is_foundation_plan:
+        # Only require framing beam support for unconfirmed, un-classified shapes.
+        # A real drawn I/H column symbol (e.g. on a pile cap/corner), a filled rect,
+        # or an approved column category with a reference mark (P1, CC1, etc.) IS a column
+        # and must NEVER be discarded just because beams are absent on this sheet/detail.
+        is_confirmed_symbol = (
+            s.get("has_ih_pattern") or
+            "ih_pattern" in s.get("accept_rules", []) or
+            "filled_rect" in s.get("accept_rules", []) or
+            s.get("category") in ("steel_column", "concrete_column", "footing_isolated", "pile_cap", "pedestal", "hss_column") or
+            _classifier_conf >= 0.60 or
+            is_foundation_plan
+        )
+        if len(unique_ends) < MIN_BEAMS and not is_confirmed_symbol:
             rejected += 1
             _LAST_COLUMN_VALIDATION_LOG.append({
                 "cx": cx, "cy": cy, "category": s.get("category"),
@@ -5586,7 +5705,29 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
             })
             continue
 
-        raw_x, raw_y = cx, cy
+        # Use the inner column symbol centre (smallest rect in cluster)
+        # as the raw detected position — this is where the actual column
+        # square / base-plate lives on the drawing, not the outer footing.
+        # Falls back to cx/cy (union centroid) for framing-plan columns
+        # that have no surrounding footing outline in their cluster.
+        raw_x = s.get("inner_cx", cx)
+        raw_y = s.get("inner_cy", cy)
+
+        # Requirement §5: validate marker centre lies inside the detected
+        # cluster bbox.  If inner_cx/inner_cy somehow falls outside the
+        # whole union bbox (e.g. degenerate single-point cluster), fall back
+        # to the union bbox centre so the marker is at worst on the cluster,
+        # never in a completely wrong position.
+        _sbbox = s.get("bbox")
+        if _sbbox is not None:
+            _bx0, _by0, _bx1, _by1 = _sbbox
+            if not (_bx0 <= raw_x <= _bx1 and _by0 <= raw_y <= _by1):
+                # inner centre escaped the bbox — use bbox midpoint instead
+                raw_x = (_bx0 + _bx1) / 2
+                raw_y = (_by0 + _by1) / 2
+                print(f"[COL] inner_cx/cy ({s.get('inner_cx'):.0f},{s.get('inner_cy'):.0f}) "
+                      f"outside cluster bbox {_sbbox}, falling back to bbox centre")
+
         off_grid = True
         snap_x, snap_y = raw_x, raw_y
 
@@ -5604,8 +5745,8 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
 
         px, py = snap_x, snap_y
 
-        if any(math.hypot(px - ex, py - ey) < DEDUP_PT
-               for ex, ey in existing + added):
+        if any(math.hypot(px - ex, py - ey) < DEDUP_PT or math.hypot(raw_x - rx, raw_y - ry) < DEDUP_PT
+               for ex, ey, rx, ry in existing_with_raw + added):
             continue
 
         # Match labels (within 20pt)
@@ -5744,7 +5885,7 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
 
         # v_idx/h_idx/grid_ref already computed above, before _reason_parts().
 
-        added.append((px, py))
+        added.append((px, py, raw_x, raw_y))
 
         # Stage 3 (2026-07-17 rebuild, live-verified against the real
         # SteelGenie app): on a real foundation plan, the footing outline
@@ -5859,13 +6000,9 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
         })
 
     # ── Emit Suggested Ghost Columns ──────────────────────────────────────────
-    # A real column is where beams frame in from PERPENDICULAR directions (a
-    # girder crossed by joists/beams) — not just any 2+ nearby endpoints.
-    # Without that direction check, a run of closely-spaced parallel joists
-    # landing on one continuous girder (completely normal framing) triggers a
-    # ghost column at nearly every joist, flooding the plan with false
-    # "Column?" marks. Require both H- and V-running beams in the cluster.
-    if v_grid and h_grid:
+    # Framing plans only: a real column is where beams frame in from PERPENDICULAR directions.
+    # Never run on foundation plans (foundation plans have no framing beams; columns come from real footing marks).
+    if v_grid and h_grid and not is_foundation_plan:
         for gx in v_grid:
             for gy in h_grid:
                 close_ends = [(ex, ey) for ex, ey in beam_ends
@@ -6154,43 +6291,44 @@ def get_foundation_columns_for_file(filename: str) -> list[dict]:
         return _FOUNDATION_COLUMNS_CACHE[norm_fn]
     
     if _FOUNDATION_COLUMNS_CACHE:
-        # Fallback to the active session's cached foundation columns
         latest_key = list(_FOUNDATION_COLUMNS_CACHE.keys())[-1]
         return _FOUNDATION_COLUMNS_CACHE[latest_key]
     
-    # Try reading from local_db.json or saved_projects.json
+    # Read directly from local_db.json
     try:
         import json
-        saved_db_path = os.path.join(BASE_DIR, "saved_projects.json")
-        if not os.path.exists(saved_db_path):
-            saved_db_path = os.path.join(BASE_DIR, "local_db.json")
-        if os.path.exists(saved_db_path):
-            with open(saved_db_path, "r", encoding="utf-8") as f:
+        local_db_path = os.path.join(BASE_DIR, "local_db.json")
+        if os.path.exists(local_db_path):
+            with open(local_db_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            
+            drawings = data.get("drawings", [])
+            target_drawings = [d for d in drawings if norm_fn and (norm_fn in (d.get("storage_key") or "").lower() or (d.get("storage_key") or "").lower() in norm_fn)] if norm_fn else drawings
+            target_d_ids = {d["id"] for d in target_drawings} if target_drawings else {d["id"] for d in drawings}
+            
+            pages = [p for p in data.get("pages", []) if p.get("drawing_id") in target_d_ids]
+            f_pages = [p for p in pages if "foundation" in (p.get("name") or "").lower() or p.get("idx") == 4]
+            if not f_pages and pages:
+                f_pages = [pages[0]]
+            
+            f_page_ids = {p["id"] for p in f_pages}
             f_cols = []
-            projects_list = data.values() if isinstance(data, dict) else data
-            for proj in projects_list:
-                if not isinstance(proj, dict):
-                    continue
-                pages = proj.get("pages") or []
-                for p in pages:
-                    if p.get("is_foundation_plan"):
-                        for m in p.get("members", []):
-                            if m.get("type") in ("column", "footing"):
-                                geo = m.get("geometry") or {}
-                                f_cols.append({
-                                    "x": m.get("x"),
-                                    "y": m.get("y"),
-                                    "grid_ref": geo.get("grid_ref"),
-                                    "symbol": geo.get("symbol", "I"),
-                                    "profile": m.get("profile"),
-                                })
+            for m in data.get("members", []):
+                if m.get("page_id") in f_page_ids and (m.get("kind") == "column" or m.get("type") == "column"):
+                    geo = m.get("geometry") or {}
+                    f_cols.append({
+                        "x": geo.get("x") if geo.get("x") is not None else m.get("x"),
+                        "y": geo.get("y") if geo.get("y") is not None else m.get("y"),
+                        "grid_ref": geo.get("grid_ref"),
+                        "symbol": geo.get("symbol", "I"),
+                        "profile": m.get("section") or m.get("profile"),
+                    })
             if f_cols:
                 if norm_fn:
                     _FOUNDATION_COLUMNS_CACHE[norm_fn] = f_cols
                 return f_cols
     except Exception as exc:
-        print(f"[FOUNDATION PROPAGATION] Error reading saved projects: {exc}")
+        print(f"[FOUNDATION PROPAGATION] Error reading local_db: {exc}")
     return []
 
 
@@ -6247,9 +6385,16 @@ def propagate_foundation_columns(members: list, foundation_cols: list,
     pb_x1 = plan_bounds[2] if plan_bounds else page_w
     pb_y1 = plan_bounds[3] if plan_bounds else page_h
 
-    # Map grid labels on current sheet: label -> coordinate
-    label_to_v_grid = {str(lbl).strip().upper(): gx for gx, lbl in (v_labels or {}).items()}
-    label_to_h_grid = {str(lbl).strip().upper(): gy for gy, lbl in (h_labels or {}).items()}
+    # Map grid labels on current sheet: label -> list of coordinates
+    label_to_v_grid: dict[str, list[float]] = {}
+    for gx, lbl in (v_labels or {}).items():
+        k = str(lbl).strip().upper()
+        label_to_v_grid.setdefault(k, []).append(gx)
+
+    label_to_h_grid: dict[str, list[float]] = {}
+    for gy, lbl in (h_labels or {}).items():
+        k = str(lbl).strip().upper()
+        label_to_h_grid.setdefault(k, []).append(gy)
 
     # Guessed profile for framing columns if unlabeled
     _COL_PROFILE_RE = re.compile(r'^(?:W\d{1,2}X\d{1,3}|HSS\d+(?:\.\d+)?X\d+(?:\.\d+)?X[\d./]+|PIPE\S*)$', re.IGNORECASE)
@@ -6268,6 +6413,8 @@ def propagate_foundation_columns(members: list, foundation_cols: list,
         px, py = None, None
         grid_ref = f_col.get("grid_ref")
         is_explicit_grid_match = False
+        raw_x_pt = (f_col.get("x") or 0.5) * page_w
+        raw_y_pt = (f_col.get("y") or 0.5) * page_h
         
         # Strategy 1: Flexible Grid Reference Matching (e.g. "1-A", "A-1", "1/A", "A/1", "1 A", "A1", "GRID 1-A")
         if grid_ref:
@@ -6276,12 +6423,12 @@ def propagate_foundation_columns(members: list, foundation_cols: list,
             if m_grid:
                 p1, p2 = m_grid.group(1), m_grid.group(2)
                 if p1 in label_to_v_grid and p2 in label_to_h_grid:
-                    px = label_to_v_grid[p1]
-                    py = label_to_h_grid[p2]
+                    px = min(label_to_v_grid[p1], key=lambda x: abs(x - raw_x_pt))
+                    py = min(label_to_h_grid[p2], key=lambda y: abs(y - raw_y_pt))
                     is_explicit_grid_match = True
                 elif p2 in label_to_v_grid and p1 in label_to_h_grid:
-                    px = label_to_v_grid[p2]
-                    py = label_to_h_grid[p1]
+                    px = min(label_to_v_grid[p2], key=lambda x: abs(x - raw_x_pt))
+                    py = min(label_to_h_grid[p1], key=lambda y: abs(y - raw_y_pt))
                     is_explicit_grid_match = True
 
         # Strategy 2: Project relative position inside plan bounds and snap to grid
@@ -6705,7 +6852,7 @@ def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
     # overshoots its support the gap beyond the support is empty, so the nearest
     # crossing found inward IS the true support even for big overshoots.  EXTENDING
     # outward is riskier (could grab a far line), so keep it short.
-    IN_WIN   = 14.0 * ppf     # trim overshoot up to ~14 ft inward to a support
+    IN_WIN   = 3.5  * ppf     # trim overshoot up to ~3.5 ft inward to a support without truncating continuous girders
     OUT_WIN  = 4.0  * ppf     # extend a short end only up to ~4 ft to a support
     MIN_SPAN = 3.0  * ppf     # never trim a beam shorter than a real minimum span
     PERP_DOT = 0.55           # |cos| < 0.55  → >56°  → perpendicular-ish
@@ -6773,7 +6920,8 @@ def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
         # beyond it.  Clamping to the drawn line + PAD pulls the end back onto the
         # girder it actually touches.  Collinear drawn segments (CAD breaks the
         # centreline at each girder crossing) are chained into one extent.
-        PAD = 1.5 * ppf
+        _is_heavy_sec = bool(re.match(r'^(?:W3[0-9]|W4[0-9]|W27X[1-9])', m.get("profile", "")))
+        PAD = (15.0 * ppf) if _is_heavy_sec else (1.5 * ppf)
         px, py = -uy, ux
         d_ts = []
         for (sx1, sy1, sx2, sy2, _l) in (all_struct_lns or []):
@@ -7425,10 +7573,11 @@ async def analyse_pdf(req: AnalysisRequest):
                                       page_w, page_h, scale_ratio=_col_scale,
                                       pts_per_foot=pts_per_foot, profiles=profiles,
                                       is_foundation_plan=_is_foundation_plan)
-        # COL text label columns — placed at beam convergence, not at label text.
-        members = extract_col_text_columns(page, page_w, page_h, members,
-                                           v_grid=v_grid, h_grid=h_grid,
-                                           scale_ratio=_col_scale)
+        # COL text label columns — framing plans only (placed at beam convergence, not on foundation plans).
+        if not _is_foundation_plan:
+            members = extract_col_text_columns(page, page_w, page_h, members,
+                                               v_grid=v_grid, h_grid=h_grid,
+                                               scale_ratio=_col_scale)
 
         # ── Foundation-Anchored Column Propagation ─────────────────────────────
         _norm_fn = os.path.basename(req.filename).strip().lower()
@@ -7457,18 +7606,9 @@ async def analyse_pdf(req: AnalysisRequest):
                     plan_bounds=plan_bounds
                 )
 
-        # Unlabeled beams: geometry-detected candidates with no section callout.
-        # Gated by detect_unlabeled flag (default OFF) so the UI stays clean
-        # unless the user explicitly requests candidate overlay.
-        # UNIVERSAL path: flags every uncovered structural beam line (any label
-        # count) — not just the conservative double-line/single-line subset.
+        # Synthetic unlabeled candidate generation disabled:
+        # Only real Beams, Columns, and Joists are extracted and emitted.
         _lines_w = collect_line_widths(page, plan_bounds) if not is_raster else []
-        if not is_raster and req.detect_unlabeled:
-            members = add_unlabeled_lines_universal(
-                members, _all_struct_lns,
-                plan_bounds, page_w, page_h, pts_per_foot,
-                v_grid=v_grid, h_grid=h_grid,
-                column_symbols=column_symbols)
 
         # Universal endpoint snap: pull EVERY beam end (labeled + unlabeled) to the
         # nearest perpendicular support it reaches — column line OR crossing girder

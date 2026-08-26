@@ -14,6 +14,7 @@ same output (no randomness, no external calls) — see ENGINE_VERSION.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Tuple
 
 from app.engineering import ENGINE_VERSION, shapes
@@ -38,6 +39,18 @@ def _main_bom_row(project_id: str, member: Dict[str, Any], piecemark: str, page:
     kind = member.get("kind", "beam")
     section = member.get("section")
     length_ft = member.get("length_ft") or 0
+    geo = member.get("geometry") or {}
+    resolution_status = geo.get("resolution_status")
+    source_page_num = geo.get("source_page_num")
+
+    comment = None
+    if resolution_status == "resolved" and source_page_num:
+        comment = f"Resolved from Page {source_page_num}"
+    elif resolution_status == "unresolved":
+        comment = "Unresolved reference"
+        if not section or section == "Column":
+            section = "Unresolved"
+
     wt_per_ft = shapes.get_weight_per_ft(section)
     weight_lbs = round(wt_per_ft * length_ft, 2) if wt_per_ft and length_ft else None
 
@@ -59,16 +72,8 @@ def _main_bom_row(project_id: str, member: Dict[str, Any], piecemark: str, page:
         "status": "not_started",
         "member_id": member.get("id"),
         "drawing_id": page.get("drawing_id"),
-        # Best-effort source-sheet reference — we don't have a true architectural
-        # sheet number stored on the page yet, so this identifies the drawing
-        # (filename) plus its page position. A project can have multiple
-        # uploaded drawings, and every drawing's page idx restarts at 0, so
-        # "Page N" alone would be ambiguous across drawings without the name.
         "sheet": f"{page.get('drawing_filename') or 'Drawing'} — Page {page.get('idx', 0) + 1}",
-        "comment": None,
-        # Demand-capacity ratios require a real structural analysis pass we
-        # don't run yet — left blank rather than fabricated, same as SteelGenie
-        # shows for ungenerated designs.
+        "comment": comment,
         "dcr_left": None,
         "dcr_right": None,
     }
@@ -129,18 +134,37 @@ def run_build(
                 continue
             kind = m.get("kind", "beam")
             section = m.get("section")
+            sec_str = (section or "").strip().upper()
             geo = m.get("geometry") or {}
-            if geo.get("suggested") or m.get("source") == "suggested":
-                # Unconfirmed ghost members (e.g. a "Column?" guess placed at
-                # a beam convergence point, never verified against the real
-                # drawing) should never silently enter the BOM as a real
-                # piece — count them separately so the gap is visible instead
-                # of just "missing weight".
-                skipped_suggested += 1
-                continue
+
+            # Unified deterministic member classifier:
+            is_explicit_beam = (kind == "beam") and bool(re.match(r"^(?:W\d|HSS|C\d|MC\d|L\d|PIPE|ISA)", sec_str))
+            is_explicit_joist = (kind == "joist") or bool(re.search(r"\d{1,2}(?:K|LH|DLH|KSP|G|CJ|CS)", sec_str)) or ("JOIST" in sec_str)
+
+            if kind == "column":
+                resolved_sec = geo.get("resolved_profile") or geo.get("profile")
+                if resolved_sec:
+                    section = resolved_sec
+                    m["section"] = resolved_sec
+                elif not section:
+                    section = m.get("piecemark") or "Column"
+                    m["section"] = section
+                if not m.get("length_ft"):
+                    m["length_ft"] = 14.0
+            elif is_explicit_joist or (not is_explicit_beam and kind != "footing"):
+                kind = "joist"
+                m["kind"] = "joist"
+            elif is_explicit_beam or kind == "beam":
+                kind = "beam"
+                m["kind"] = "beam"
+
             if not section:
-                skipped_by_kind[kind] = skipped_by_kind.get(kind, 0) + 1
-                continue
+                if geo.get("suggested") or m.get("source") == "suggested":
+                    skipped_suggested += 1
+                    continue
+                else:
+                    skipped_by_kind[kind] = skipped_by_kind.get(kind, 0) + 1
+                    continue
 
             prefix = _MARK_PREFIX_BY_KIND.get(kind, "X")
             piecemark_counters[prefix] = piecemark_counters.get(prefix, 0) + 1

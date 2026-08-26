@@ -17,11 +17,29 @@ interface BracedFrame {
 }
 
 async function pollJob(jobId: string, onProgress: (pct: number, msg: string) => void): Promise<any> {
+  const started = Date.now()
+  let lastProgressPct = -1
+  let lastProgressMsg = ''
+  let lastActivityTime = Date.now()
+
   for (;;) {
     const job = await jobsApi.get(jobId)
-    onProgress(job.progress ?? 0, job.message ?? '')
-    if (job.status === 'done') return job
-    if (job.status === 'failed') throw new Error(job.error || 'Build failed')
+    if (job) {
+      if (job.progress !== lastProgressPct || job.message !== lastProgressMsg) {
+        lastProgressPct = job.progress ?? 0
+        lastProgressMsg = job.message || ''
+        lastActivityTime = Date.now()
+      }
+      onProgress(job.progress ?? 0, job.message ?? '')
+      if (job.status === 'done') return job
+      if (job.status === 'failed') throw new Error(job.error || 'Build failed')
+    }
+
+    const stalledTime = Date.now() - lastActivityTime
+    const totalElapsed = Date.now() - started
+    if (stalledTime > 120_000 || totalElapsed > 600_000) {
+      throw new Error('Operation timed out — server may have restarted or worker stalled.')
+    }
     await new Promise((r) => setTimeout(r, 1500))
   }
 }

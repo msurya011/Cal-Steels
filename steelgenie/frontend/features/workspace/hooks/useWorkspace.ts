@@ -19,6 +19,8 @@ export function useWorkspace(projectId: string) {
     queryKey: ['drawings', projectId],
     queryFn: () => drawingsApi.list(projectId),
     enabled: !!projectId,
+    staleTime: 1000 * 60 * 10,
+    gcTime: 1000 * 60 * 30,
   })
 
   const drawingIds = drawings.map((d: any) => d.id).sort().join(',')
@@ -35,19 +37,24 @@ export function useWorkspace(projectId: string) {
       return perDrawing.flat()
     },
     enabled: drawings.length > 0,
+    staleTime: 1000 * 60 * 10,
+    gcTime: 1000 * 60 * 30,
   })
 
   // Kept for any callers that still want "the first drawing" (e.g. as a
   // default upload target) -- no longer used to scope which pages are shown.
   const activeDrawingId = drawings[0]?.id || null
 
-  // Mutation: Update page
+  // Mutation: Update page (optimistic cache update for instant UI response)
   const updatePageMutation = useMutation({
     mutationFn: ({ pageId, data }: { pageId: string; data: any }) =>
       drawingsApi.updatePage(pageId, data),
-    onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ['pages', projectId, drawingIds] })
-      queryClient.invalidateQueries({ queryKey: ['page', variables.pageId] })
+    onMutate: async ({ pageId, data }) => {
+      // Optimistically update the cached pages list immediately
+      queryClient.setQueryData(['pages', projectId, drawingIds], (old: any[] | undefined) => {
+        if (!old) return old
+        return old.map((p) => (p.id === pageId ? { ...p, ...data } : p))
+      })
     },
   })
 

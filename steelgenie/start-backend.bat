@@ -1,5 +1,5 @@
 @echo off
 title CalSteel Backend (port 8000)
 cd /d "%~dp0backend"
-".venv\Scripts\python.exe" run.py
+py -3.14 run.py || python run.py
 pause

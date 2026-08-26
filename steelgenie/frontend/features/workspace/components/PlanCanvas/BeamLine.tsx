@@ -422,29 +422,39 @@ export const BeamLine = React.memo(function BeamLine({
         </>
       )}
 
-      {/* Progressive Label */}
+      {/* Beam Profile & Length Label */}
       {showText && labelText && !isUnlabeled && (
-        <g>
+        <g
+          style={{
+            transform: `translate(${midX}%, ${midY}%) rotate(${angle}deg)`,
+            transformOrigin: '0 0',
+            pointerEvents: 'none',
+          }}
+        >
           {isHovered && (
             <rect
-              x={`${midX}%`} y={`${midY - 2.5}%`}
-              width="8%" height="3%"
-              fill="#0F172A" rx="1" ry="1"
-              style={{
-                transformBox: 'fill-box', transformOrigin: 'center', transform: `translate(-4%, 0) rotate(${angle}deg)`, opacity: 0.85, pointerEvents: 'none'
-              }}
+              x="-50" y="-11"
+              width="100" height="22"
+              fill="#0F172A" rx="4" ry="4"
+              style={{ opacity: 0.94, stroke: '#38BDF8', strokeWidth: 1 }}
             />
           )}
           <text
-            x={`${midX}%`}
-            y={`${midY - 1.1}%`}
-            fill={isHovered ? '#FFFFFF' : markerColor}
-            fontSize={isHovered ? '8px' : '7px'}
+            x="0"
+            y={isHovered ? "0" : "-6"}
+            fill={isHovered ? '#FFFFFF' : '#F8FAFC'}
+            fontSize={isHovered ? '9.5px' : '8px'}
             fontWeight="700"
             textAnchor="middle"
+            dominantBaseline="central"
             style={{
-              userSelect: 'none', paintOrder: 'stroke', stroke: '#0B1220', strokeWidth: 2.2, pointerEvents: 'none',
-              transformBox: 'fill-box', transformOrigin: 'center', transform: `rotate(${angle}deg)`,
+              userSelect: 'none',
+              paintOrder: 'stroke fill',
+              stroke: '#090D1A',
+              strokeWidth: 3.5,
+              strokeLinejoin: 'round',
+              fontFamily: 'Inter, system-ui, sans-serif',
+              letterSpacing: '0.02em',
             }}
           >
             {labelText}

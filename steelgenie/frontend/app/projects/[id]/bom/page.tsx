@@ -137,6 +137,13 @@ function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: (v: b
   )
 }
 
+const cleanSheetName = (sheetStr: string | null | undefined): string => {
+  if (!sheetStr) return '-'
+  const match = sheetStr.match(/Page\s+\d+/i)
+  if (match) return match[0]
+  return sheetStr.replace(/^[^-—]+[-—]\s*/, '')
+}
+
 const formatStatus = (status: string | null) => {
   if (!status) return 'Not Started'
   return status
@@ -160,11 +167,43 @@ export default function BomPage() {
     return `${activeDrawing?.filename || 'Drawing'} — Page ${activePage.idx + 1}`
   }, [activePage, activeDrawing])
 
+  const pageDisplayMap = useMemo(() => {
+    const map: Record<string, string> = {}
+    pages.forEach((p: any, index: number) => {
+      const displayNum = `Page ${index + 1}`
+      map[p.id] = displayNum
+      map[`Page ${p.idx + 1}`] = displayNum
+      map[`Page ${p.idx + 1}`.toLowerCase()] = displayNum
+      const drawing = drawings.find((d: any) => d.id === p.drawing_id)
+      const fullName = `${drawing?.filename || 'Drawing'} — Page ${p.idx + 1}`
+      map[fullName] = displayNum
+      map[p.drawing_id + '_' + p.idx] = displayNum
+    })
+    return map
+  }, [pages, drawings])
+
+  const getSidebarPageName = useCallback((sheetStr: string | null | undefined): string => {
+    if (!sheetStr) return '-'
+    if (pageDisplayMap[sheetStr]) return pageDisplayMap[sheetStr]
+    const m = sheetStr.match(/Page\s+(\d+)/i)
+    if (m) {
+      const rawIdx = parseInt(m[1], 10)
+      const pageEntry = pages.find((p: any) => p.idx + 1 === rawIdx)
+      if (pageEntry) {
+        const pIdx = pages.indexOf(pageEntry)
+        if (pIdx >= 0) return `Page ${pIdx + 1}`
+      }
+      return m[0]
+    }
+    return sheetStr.replace(/^[^-—]+[-—]\s*/, '')
+  }, [pageDisplayMap, pages])
+
   const [items, setItems] = useState<BomItem[]>([])
   const [summary, setSummary] = useState<BomSummary | null>(null)
   const [facets, setFacets] = useState<BomFacets>(EMPTY_FACETS)
   const [loading, setLoading] = useState(true)
   const [generating, setGenerating] = useState(false)
+  const [buildProgress, setBuildProgress] = useState(0)
   const [buildMsg, setBuildMsg] = useState('')
   const [buildWarnings, setBuildWarnings] = useState<string[]>([])
   const [showWarnings, setShowWarnings] = useState(true)
@@ -196,7 +235,8 @@ export default function BomPage() {
     camber: true,
     cope: true,
     holes: true,
-    weld_studs: true,
+    bolts: false,
+    weld_studs: false,
     status: true,
     sequence: true,
     comment: true,
@@ -205,12 +245,7 @@ export default function BomPage() {
     dcr_right: true,
   })
 
-  useEffect(() => {
-    if (activeSheetName && currentPageId !== lastPageId) {
-      setFilters((f) => ({ ...f, sheet: activeSheetName }))
-      setLastPageId(currentPageId)
-    }
-  }, [activeSheetName, currentPageId, lastPageId])
+
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -248,7 +283,7 @@ export default function BomPage() {
   const loadBom = useCallback(async () => {
     setLoading(true)
     try {
-      const query: Record<string, any> = {}
+      const query: Record<string, any> = { limit: 10000 }
       if (filters.category) query.category = filters.category
       if (filters.section_type) query.section_type = filters.section_type
       if (filters.section) query.section = filters.section
@@ -308,19 +343,23 @@ export default function BomPage() {
 
   const handleGenerate = async () => {
     setGenerating(true)
-    setBuildMsg('Requesting build…')
+    setBuildProgress(10)
+    setBuildMsg('Starting project build…')
     setBuildWarnings([])
     try {
       const { job_id } = await buildApi.trigger(projectId)
       for (;;) {
         const job = await jobsApi.get(job_id)
-        setBuildMsg(`${job.message || 'Building…'} (${job.progress ?? 0}%)`)
+        const pct = job.progress ?? (job.status === 'done' ? 100 : 25)
+        setBuildProgress(pct)
+        setBuildMsg(job.message || 'Building…')
         if (job.status === 'done') {
+          setBuildProgress(100)
           const warnings: string[] = job.result?.warnings || []
           setBuildWarnings(warnings)
           setShowWarnings(true)
           if (warnings.length > 0) {
-            toast.warning(`${job.message || 'Build complete'} — ${warnings.length} warning(s), see details below.`)
+            toast.warning(`${job.message || 'Build complete'} — ${warnings.length} warning(s).`)
           } else {
             toast.success(job.message || 'Build complete')
           }
@@ -329,15 +368,16 @@ export default function BomPage() {
         if (job.status === 'failed') {
           throw new Error(job.error || 'Build failed')
         }
-        await new Promise((r) => setTimeout(r, 1500))
+        await new Promise((r) => setTimeout(r, 400))
       }
-      loadBom()
-      checkStale()
+      await loadBom()
+      await checkStale()
     } catch (err: any) {
       toast.error(err.message || 'Build failed')
     } finally {
       setGenerating(false)
       setBuildMsg('')
+      setBuildProgress(0)
     }
   }
 
@@ -398,6 +438,23 @@ export default function BomPage() {
     })
   }
 
+  const accessoryMap = useMemo(() => {
+    const map: Record<string, { bolts: number; weld_studs: number }> = {}
+    items.forEach(item => {
+      if (!item.piecemark) return
+      if (!map[item.piecemark]) {
+        map[item.piecemark] = { bolts: 0, weld_studs: 0 }
+      }
+      if (item.category === 'Bolts') {
+        map[item.piecemark].bolts += item.qty || 0
+      }
+      if (item.category === 'Weld Studs') {
+        map[item.piecemark].weld_studs += item.weld_studs || item.qty || 0
+      }
+    })
+    return map
+  }, [items])
+
   const columns = useMemo(() => [
     { id: 'is_main', label: 'MAIN', dropdownLabel: 'Main', render: (item: BomItem) => item.is_main ? '1' : '0' },
     { id: 'category', label: 'CATEGORY', dropdownLabel: 'Category', render: (item: BomItem) => item.category || '-' },
@@ -413,18 +470,70 @@ export default function BomPage() {
     { id: 'camber', label: 'CAMBER', dropdownLabel: 'Camber', render: (item: BomItem) => item.camber || 0 },
     { id: 'cope', label: 'COPE', dropdownLabel: 'Cope', render: (item: BomItem) => item.cope || 0 },
     { id: 'holes', label: 'HOLE', dropdownLabel: 'Hole', render: (item: BomItem) => item.holes || 0 },
-    { id: 'weld_studs', label: 'WELD STUD', dropdownLabel: 'Weld Stud', render: (item: BomItem) => item.weld_studs || 0 },
+    { id: 'bolts', label: 'BOLTS', dropdownLabel: 'Bolts', render: (item: BomItem) => {
+      if (item.piecemark && accessoryMap[item.piecemark]) {
+        return accessoryMap[item.piecemark].bolts
+      }
+      return 0
+    } },
+    { id: 'weld_studs', label: 'WELD STUD', dropdownLabel: 'Weld Stud', render: (item: BomItem) => {
+      if (item.piecemark && accessoryMap[item.piecemark]) {
+        return accessoryMap[item.piecemark].weld_studs || item.weld_studs || 0
+      }
+      return item.weld_studs || 0
+    } },
     { id: 'status', label: 'STATUS', dropdownLabel: 'Status', render: (item: BomItem) => formatStatus(item.status) },
     { id: 'sequence', label: 'SEQUENCE', dropdownLabel: 'Sequence', render: (item: BomItem) => item.sequence ?? '-' },
     { id: 'comment', label: 'COMMENT', dropdownLabel: 'Comment', render: (item: BomItem) => item.comment || '-' },
-    { id: 'sheet', label: 'SHEET', dropdownLabel: 'Sheet', render: (item: BomItem) => item.sheet || '-' },
+    { id: 'sheet', label: 'SHEET', dropdownLabel: 'Sheet', render: (item: BomItem) => getSidebarPageName(item.sheet) },
     { id: 'dcr_left', label: 'DCR LEFT', dropdownLabel: 'DCR Left', render: (item: BomItem) => item.dcr_left ?? '-' },
     { id: 'dcr_right', label: 'DCR RIGHT', dropdownLabel: 'DCR Right', render: (item: BomItem) => item.dcr_right ?? '-' },
-  ], [getFormatLength])
+  ], [getFormatLength, accessoryMap, getSidebarPageName])
 
   const activeColumns = useMemo(() => {
     return columns.filter((col) => visibleFields[col.id])
   }, [columns, visibleFields])
+
+  const filteredItems = useMemo(() => {
+    return items.filter(item => {
+      if (filters.category) {
+        return (item.category || '').toLowerCase() === filters.category.toLowerCase()
+      }
+      return true
+    })
+  }, [items, filters.category])
+
+  const groupedItems = useMemo(() => {
+    const groups: Record<string, { items: BomItem[]; totalWeight: number }> = {}
+    let grandTotalWeight = 0
+
+    filteredItems.forEach(item => {
+      const sheetName = getSidebarPageName(item.sheet)
+      if (!groups[sheetName]) {
+        groups[sheetName] = { items: [], totalWeight: 0 }
+      }
+      groups[sheetName].items.push(item)
+      const weight = item.weight_lbs || 0
+      groups[sheetName].totalWeight += weight
+      grandTotalWeight += weight
+    })
+
+    // Sort sheets by numeric page order (Page 1, Page 2, Page 3, ...)
+    const sortedSheets = Object.keys(groups).sort((a, b) => {
+      const numA = parseInt(a.replace(/\D/g, ''), 10) || 0
+      const numB = parseInt(b.replace(/\D/g, ''), 10) || 0
+      return numA - numB
+    })
+
+    return {
+      groups: sortedSheets.map(sheet => ({
+        sheet,
+        items: groups[sheet].items,
+        totalWeight: groups[sheet].totalWeight
+      })),
+      grandTotalWeight
+    }
+  }, [filteredItems, getSidebarPageName])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', padding: '24px', boxSizing: 'border-box', overflow: 'hidden', backgroundColor: '#F8FAFC' }}>
@@ -465,7 +574,7 @@ export default function BomPage() {
                 padding: '0 6px',
               }}
             >
-              {items.length}
+              {filteredItems.length}
             </span>
           </div>
           <p style={{ margin: '4px 0 0', fontSize: '13px', color: '#64748B' }}>
@@ -631,16 +740,16 @@ export default function BomPage() {
                     handleDownloadEpm()
                     setShowExportDropdown(false)
                   }}
-                  disabled={items.length === 0}
+                  disabled={filteredItems.length === 0}
                   style={{
                     display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 14px',
                     backgroundColor: 'transparent', border: 'none', outline: 'none',
-                    color: items.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
-                    cursor: items.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
+                    color: filteredItems.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
+                    cursor: filteredItems.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
                     transition: 'background-color 0.2s',
                   }}
                   onMouseEnter={(e) => {
-                    if (items.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
+                    if (filteredItems.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.backgroundColor = 'transparent'
@@ -654,16 +763,16 @@ export default function BomPage() {
                     handleDownloadCsv()
                     setShowExportDropdown(false)
                   }}
-                  disabled={items.length === 0}
+                  disabled={filteredItems.length === 0}
                   style={{
                     display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 14px',
                     backgroundColor: 'transparent', border: 'none', outline: 'none',
-                    color: items.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
-                    cursor: items.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
+                    color: filteredItems.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
+                    cursor: filteredItems.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
                     transition: 'background-color 0.2s',
                   }}
                   onMouseEnter={(e) => {
-                    if (items.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
+                    if (filteredItems.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.backgroundColor = 'transparent'
@@ -677,16 +786,16 @@ export default function BomPage() {
                     handleDownloadKiss()
                     setShowExportDropdown(false)
                   }}
-                  disabled={items.length === 0}
+                  disabled={filteredItems.length === 0}
                   style={{
                     display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 14px',
                     backgroundColor: 'transparent', border: 'none', outline: 'none',
-                    color: items.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
-                    cursor: items.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
+                    color: filteredItems.length === 0 ? '#94A3B8' : '#334155', fontSize: '13px', fontWeight: 500,
+                    cursor: filteredItems.length === 0 ? 'not-allowed' : 'pointer', textAlign: 'left',
                     transition: 'background-color 0.2s',
                   }}
                   onMouseEnter={(e) => {
-                    if (items.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
+                    if (filteredItems.length > 0) e.currentTarget.style.backgroundColor = '#F1F5F9'
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.backgroundColor = 'transparent'
@@ -736,19 +845,56 @@ export default function BomPage() {
         </div>
       )}
 
+      {/* Live Build Progress Bar Card */}
+      {generating && (
+        <div style={{
+          marginBottom: '20px',
+          padding: '16px 20px',
+          backgroundColor: '#0F172A',
+          border: '1px solid #3B82F6',
+          borderRadius: '8px',
+          boxShadow: '0 4px 20px rgba(59, 130, 246, 0.2)',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <RefreshCw size={16} className="animate-spin" color="#38BDF8" />
+              <span style={{ fontSize: '14px', fontWeight: 600, color: '#F8FAFC' }}>
+                {buildMsg || 'Building Project Takeoff & Calculating Tonnage...'}
+              </span>
+            </div>
+            <span style={{ fontSize: '15px', fontWeight: 700, color: '#38BDF8' }}>
+              {buildProgress}%
+            </span>
+          </div>
+          <div style={{
+            width: '100%',
+            height: '8px',
+            backgroundColor: '#1E293B',
+            borderRadius: '4px',
+            overflow: 'hidden',
+          }}>
+            <div style={{
+              width: `${Math.max(5, buildProgress)}%`,
+              height: '100%',
+              backgroundColor: '#3B82F6',
+              borderRadius: '4px',
+              transition: 'width 0.3s ease',
+              backgroundImage: 'linear-gradient(90deg, #3B82F6, #60A5FA)',
+            }} />
+          </div>
+        </div>
+      )}
+
       {/* Summary dashboard */}
       {summary && (
         <div style={{ display: 'flex', gap: '16px', marginBottom: '16px', flexWrap: 'wrap' }}>
           {[
-            { label: 'Total Weight (tons)', value: summary.total_weight_tons.toFixed(2) },
-            { label: 'BOM Items', value: summary.total_items },
-            { label: 'Beams', value: summary.by_category?.['Beams'] || 0 },
-            { label: 'Columns', value: summary.by_category?.['Columns'] || 0 },
-            { label: 'Braces', value: (summary.by_category?.['Vertical Braces'] || 0) + (summary.by_category?.['Horizontal Braces'] || 0) },
-            { label: 'Bolts', value: summary.by_category?.['Bolts'] || 0 },
-            { label: 'Weld Studs', value: summary.by_category?.['Weld Studs'] || 0 },
+            { label: 'Total Weight (tons)', value: (groupedItems.grandTotalWeight / 2000).toFixed(2) },
+            { label: 'BOM Items', value: filteredItems.length },
+            { label: 'Beams', value: filteredItems.filter(item => item.category?.toLowerCase() === 'beams').length },
+            { label: 'Columns', value: filteredItems.filter(item => item.category?.toLowerCase() === 'columns').length },
           ].map((stat, i) => (
-            <div key={i} style={{ flex: '1 1 140px', backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '12px 16px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+            <div key={i} style={{ flex: '1 1 160px', backgroundColor: '#FFFFFF', border: '1px solid #E2E8F0', borderRadius: '8px', padding: '12px 16px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
               <div style={{ fontSize: '18px', fontWeight: 700, color: '#0F172A' }}>{stat.value}</div>
               <div style={{ fontSize: '10px', color: '#64748B', marginTop: '2px', textTransform: 'uppercase', letterSpacing: '0.4px' }}>{stat.label}</div>
             </div>
@@ -802,7 +948,7 @@ export default function BomPage() {
             >
               <SlidersHorizontal size={13} /> {showFilters ? 'Hide filters' : 'Show filters'}
             </button>
-            <span style={{ fontSize: '12px', color: '#94A3B8' }}>Showing {items.length} item{items.length === 1 ? '' : 's'}</span>
+            <span style={{ fontSize: '12px', color: '#94A3B8' }}>Showing {filteredItems.length} item{filteredItems.length === 1 ? '' : 's'}</span>
           </div>
 
           <div style={{ flex: 1, overflow: 'auto' }}>
@@ -810,7 +956,7 @@ export default function BomPage() {
               <div style={{ display: 'flex', height: '200px', alignItems: 'center', justifyContent: 'center' }}>
                 <Spinner size="md" />
               </div>
-            ) : items.length === 0 ? (
+            ) : filteredItems.length === 0 ? (
               <div style={{ display: 'flex', height: '200px', alignItems: 'center', justifyContent: 'center', color: '#64748B', fontSize: '13px', flexDirection: 'column', gap: '8px' }}>
                 <span>No BOM rows match the current filters.</span>
                 <span style={{ fontSize: '12px' }}>
@@ -824,46 +970,77 @@ export default function BomPage() {
                 </span>
               </div>
             ) : (
-              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '12px' }}>
-                <thead>
-                  <tr style={{ borderBottom: '1px solid #E2E8F0', color: '#64748B', fontWeight: 600, position: 'sticky', top: 0, backgroundColor: '#F8FAFC' }}>
-                    {activeColumns.map((col) => (
-                      <th key={col.id} style={{ padding: '12px 16px', fontSize: '11px', letterSpacing: '0.5px' }}>
-                        {col.label}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((item) => (
-                    <tr
-                      key={item.id}
-                      style={{ borderBottom: '1px solid #E2E8F0', color: '#334155' }}
-                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#F8FAFC')}
-                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                    >
-                      {activeColumns.map((col) => {
-                        const cellValue = col.render(item)
-                        
-                        let cellStyle: React.CSSProperties = { padding: '12px 16px' }
-                        if (col.isPiecemark) {
-                          cellStyle = { ...cellStyle, fontWeight: 700, color: '#3B82F6' }
-                        } else if (col.isSection) {
-                          cellStyle = { ...cellStyle, fontWeight: 600, color: '#0F172A' }
-                        } else if (col.id === 'status') {
-                          cellStyle = { ...cellStyle, color: '#64748B' }
-                        }
-                        
-                        return (
-                          <td key={col.id} style={cellStyle}>
-                            {cellValue}
-                          </td>
-                        )
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div style={{ display: 'flex', flexDirection: 'column', padding: '16px', gap: '28px' }}>
+                {groupedItems.groups.map(group => (
+                  <div key={group.sheet} style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#F8FAFC', padding: '10px 16px', borderRadius: '8px', border: '1px solid #E2E8F0' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontSize: '14px', fontWeight: 700, color: '#0F172A' }}>
+                          📄 {group.sheet}
+                        </span>
+                        <span style={{ fontSize: '12px', color: '#64748B', backgroundColor: '#E2E8F0', padding: '2px 8px', borderRadius: '10px', fontWeight: 600 }}>
+                          {group.items.length} items
+                        </span>
+                      </div>
+                      <span style={{ fontSize: '13px', fontWeight: 700, color: '#1E293B' }}>
+                        Subtotal: {group.totalWeight.toLocaleString(undefined, { maximumFractionDigits: 1 })} lbs ({(group.totalWeight / 2000).toFixed(2)} tons)
+                      </span>
+                    </div>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '12px' }}>
+                      <thead>
+                        <tr style={{ borderBottom: '1px solid #E2E8F0', color: '#64748B', fontWeight: 600 }}>
+                          {activeColumns.map((col) => (
+                            <th key={col.id} style={{ padding: '10px 12px', fontSize: '11px', letterSpacing: '0.5px' }}>
+                              {col.label}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {group.items.map((item) => (
+                          <tr
+                            key={item.id}
+                            style={{ borderBottom: '1px solid #E2E8F0', color: '#334155' }}
+                            onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#F8FAFC')}
+                            onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                          >
+                            {activeColumns.map((col) => {
+                              const cellValue = col.render(item)
+                              let cellStyle: React.CSSProperties = { padding: '10px 12px' }
+                              if (col.isPiecemark) {
+                                cellStyle = { ...cellStyle, fontWeight: 700, color: '#3B82F6' }
+                              } else if (col.isSection) {
+                                cellStyle = { ...cellStyle, fontWeight: 600, color: '#0F172A' }
+                              } else if (col.id === 'status') {
+                                cellStyle = { ...cellStyle, color: '#64748B' }
+                              }
+                              return (
+                                <td key={col.id} style={cellStyle}>
+                                  {cellValue}
+                                </td>
+                              )
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ))}
+                
+                <div style={{ 
+                  marginTop: '16px', 
+                  padding: '16px', 
+                  backgroundColor: '#0F172A', 
+                  borderRadius: '8px', 
+                  display: 'flex', 
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)'
+                }}>
+                  <span style={{ fontSize: '16px', fontWeight: 600, color: '#F8FAFC', textTransform: 'uppercase', letterSpacing: '1px' }}>Grand Total</span>
+                  <span style={{ fontSize: '20px', fontWeight: 700, color: '#38BDF8' }}>{(groupedItems.grandTotalWeight / 2000).toFixed(2)} Tons ({(groupedItems.grandTotalWeight).toLocaleString()} lbs)</span>
+                </div>
+              </div>
             )}
           </div>
         </div>

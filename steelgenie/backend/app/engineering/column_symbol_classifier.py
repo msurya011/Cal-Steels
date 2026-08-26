@@ -90,7 +90,8 @@ _DETAIL_REF_RE = re.compile(r'^[A-Z0-9]{1,3}\s*/\s*[A-Z]?-?\d{2,4}[A-Z.]*$', re.
 # pattern is much more likely a grid label.
 _GRID_LABEL_RE = re.compile(r'^(?:[A-Z]{1,2}(?:\.\d+)?|\d{1,2}(?:\.\d+)?)$', re.IGNORECASE)
 
-_MARK_RE = re.compile(r'^(?:[FPC]\d{1,3}[A-Z]?)$')
+# Column/Footing mark pattern: C1, CC1, CC2, F1, P1, PC1, CP1, PU1, POST1, BP1
+_MARK_RE = re.compile(r'^(?:[A-Z]{1,3}\d{1,4}[A-Z]?)$', re.IGNORECASE)
 
 # Dimension strings: "12'-6"", "3'-9 1/2"", "24'-0"".
 _DIMENSION_RE = re.compile(r"^\d+'-\d+(?:\s?\d+/\d+)?\"?$")
@@ -387,33 +388,10 @@ def _classify_one(
     # FOOTING_ISOLATED). Both tags mean the same real-world thing -- a
     # footing outline -- just detected via two different geometry paths.
     _outline_rules = accept_rules & {"foundation_outline", "fragmented_outline"}
-    if (is_foundation_plan and _outline_rules
-            and 0.4 < aspect < 2.5 and has_mark_tight):
-        return FOOTING_ISOLATED, 0.7, "square-ish outline on a foundation plan + real F/P/C mark nearby"
+    if (_outline_rules and 0.4 < aspect < 2.5 and has_mark_tight):
+        return PEDESTAL if not is_foundation_plan else FOOTING_ISOLATED, 0.75, "square-ish pedestal/footing outline + real structural mark nearby"
 
-    # 6b-lo. Same shape signal, no readable mark nearby (2026-07-17, Stage 6
-    #     fix). Root-caused live: closing the _has_IH_pattern false-positive
-    #     bug (real fix, box/diamond shapes no longer fake a column icon)
-    #     had a side effect here -- an unmarked footing outline used to get
-    #     rescued into STEEL_COLUMN by rule 7 below regardless of a mark
-    #     (rule 7 accepts with OR without has_mark, just at lower
-    #     confidence), because the fake ih_pattern injection made
-    #     has_ih_pattern true for every such shape. With that injection
-    #     removed, an unmarked footing outline no longer satisfies rule 7
-    #     OR the has_mark-gated 6b above, and fell all the way through to
-    #     the conservative MISC default -- silently dropped instead of kept
-    #     as a lower-confidence candidate. That's inconsistent with how
-    #     this same classifier already treats an unmarked steel-column icon
-    #     (rule 7, lower confidence) and an unmarked-but-high-confidence
-    #     library match (rule 6c below) -- neither of those silently drops
-    #     a real shape-signal candidate just because OCR/mark-matching
-    #     found no text. Also matches SteelGenie's own verified live
-    #     behavior: an unlabeled symbol still gets a guessed profile and a
-    #     "Need Review" flag, never gets silently omitted. Lower confidence
-    #     than the marked case, still well above the classifier's own
-    #     validation floor, still real column/footing candidacy.
-    if (is_foundation_plan and _outline_rules
-            and 0.4 < aspect < 2.5):
+    if (is_foundation_plan and _outline_rules and 0.4 < aspect < 2.5):
         return FOOTING_ISOLATED, 0.45, "square-ish outline on a foundation plan, no readable mark nearby -- guessed"
 
     # 6c. Universal Symbol Library match (Phase 2/4). By this point every

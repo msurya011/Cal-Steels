@@ -9,13 +9,12 @@ import logging
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 
 from app.core.tenancy import AuthUser
 from app.schemas.bom import BomItemOut, BomSummary, ExportRequest
 from app.services.database import get_db
-from app.workers.queue import create_job
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["bom"])
@@ -44,7 +43,7 @@ def _section_weight_per_ft(section: Optional[str]) -> Optional[float]:
 
 
 @router.get("/projects/{project_id}/bom", response_model=List[BomItemOut])
-async def get_bom(
+def get_bom(
     project_id: UUID,
     user: AuthUser,
     category: Optional[str] = Query(None),
@@ -58,7 +57,7 @@ async def get_bom(
     is_main: Optional[bool] = Query(None),
     sheet: Optional[str] = Query(None, description="Filter to a single drawing/sheet — a project can span multiple uploaded drawings"),
     search: Optional[str] = Query(None, description="Matches piecemark, section, or category"),
-    limit: int = Query(200, le=5000),
+    limit: int = Query(10000, le=50000),
     offset: int = Query(0, ge=0),
 ):
     db = get_db()
@@ -91,7 +90,7 @@ async def get_bom(
 
 
 @router.get("/projects/{project_id}/bom/facets")
-async def get_bom_facets(project_id: UUID, user: AuthUser):
+def get_bom_facets(project_id: UUID, user: AuthUser):
     """Distinct values per filterable column, for populating the BOM filter sidebar."""
     db = get_db()
     resp = db.table("bom_items").select("*").eq("project_id", str(project_id)).execute()
@@ -114,8 +113,8 @@ async def get_bom_facets(project_id: UUID, user: AuthUser):
 
 
 @router.get("/projects/{project_id}/bom/summary", response_model=BomSummary)
-async def get_bom_summary(
-    project_id: UUID, 
+def get_bom_summary(
+    project_id: UUID,
     user: AuthUser,
     sheet: Optional[str] = Query(None, description="Filter to a single drawing/sheet")
 ):
@@ -126,7 +125,9 @@ async def get_bom_summary(
     resp = q.execute()
     items = resp.data or []
 
-    total_lbs = sum((r.get("weight_lbs") or 0) * (r.get("qty") or 1) for r in items)
+    # Exclude joists from structural steel tonnage total (SJI separate trade scope)
+    structural_items = [r for r in items if (r.get("category") or "").lower() != "joists"]
+    total_lbs = sum((r.get("weight_lbs") or 0) * (r.get("qty") or 1) for r in structural_items)
     by_cat: Dict[str, int] = {}
     for r in items:
         cat = r.get("category") or "other"
@@ -141,7 +142,7 @@ async def get_bom_summary(
 
 
 @router.get("/projects/{project_id}/bom/model-summary")
-async def get_model_summary(
+def get_model_summary(
     project_id: UUID,
     user: AuthUser,
     page_id: Optional[UUID] = Query(None, description="If set, returns a Sheet Summary scoped to this page instead of the whole project"),
@@ -186,7 +187,9 @@ async def get_model_summary(
     def _cat_count(cat: str) -> int:
         return sum((r.get("qty") or 1) for r in items if r.get("category") == cat)
 
-    total_lbs = sum((r.get("weight_lbs") or 0) * (r.get("qty") or 1) for r in items)
+    # Exclude joists from structural steel tonnage total
+    structural_items = [r for r in items if (r.get("category") or "").lower() != "joists"]
+    total_lbs = sum((r.get("weight_lbs") or 0) * (r.get("qty") or 1) for r in structural_items)
     camber_total = sum((r.get("camber") or 0) * (r.get("qty") or 1) for r in items)
     weld_studs_total = sum((r.get("weld_studs") or 0) for r in items)
 
@@ -217,7 +220,7 @@ async def get_model_summary(
         "horizontal_brace": _cat_count("Horizontal Braces"),
         "joists": _cat_count("Joists"),
         "moment_connection": moment_connections,
-        "bolt": 0,
+        "bolt": _cat_count("Bolts"),
         "embed_plate": 0,
         "camber": round(camber_total, 2),
         "anchor": anchors_total,
@@ -228,10 +231,11 @@ async def get_model_summary(
 
 
 @router.post("/projects/{project_id}/bom/generate")
-async def generate_bom_from_members(project_id: UUID, user: AuthUser):
+def generate_bom_from_members(project_id: UUID, user: AuthUser):
     """
     Generate BOM rows from current members on all pages.
     This is the M2-level BOM: main members only, weight = lb/ft × length.
+    Joists are excluded from structural steel weight (weight_lbs = 0).
     """
     db = get_db()
 
@@ -274,9 +278,9 @@ async def generate_bom_from_members(project_id: UUID, user: AuthUser):
         piecemark_counters[key] = piecemark_counters.get(key, 0) + 1
         piecemark = f"{mark_prefix}_{piecemark_counters[key]}"
 
-        # Weight
-        wt_per_ft = _section_weight_per_ft(section)
-        weight_lbs = round(wt_per_ft * length_ft, 2) if wt_per_ft and length_ft else None
+        # Weight: Joists carry 0 lbs structural steel weight
+        wt_per_ft = _section_weight_per_ft(section) if kind != "joist" else 0.0
+        weight_lbs = round(wt_per_ft * length_ft, 2) if (wt_per_ft and length_ft) else (0.0 if kind == "joist" else None)
 
         # Section type
         import re
@@ -296,7 +300,7 @@ async def generate_bom_from_members(project_id: UUID, user: AuthUser):
             "length_in": length_in,
             "grade": grade,
             "weight_lbs": weight_lbs,
-            "is_main": True,
+            "is_main": kind != "joist",
         })
 
     if bom_rows:
@@ -307,7 +311,7 @@ async def generate_bom_from_members(project_id: UUID, user: AuthUser):
 
 
 @router.get("/projects/{project_id}/bom/export/csv")
-async def export_bom_csv(project_id: UUID, user: AuthUser):
+def export_bom_csv(project_id: UUID, user: AuthUser):
     """Export BOM as CSV."""
     db = get_db()
     resp = db.table("bom_items").select("*").eq("project_id", str(project_id)).order("category,section").execute()

@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useMemo } from 'react'
 import { useWorkspaceStore, getMemberRenderProps } from '../../../../lib/stores/workspaceStore'
 import { ColumnSymbol } from './ColumnSymbol'
 import { BeamLine } from './BeamLine'
@@ -60,19 +60,30 @@ export function OverlayLayer({
   const getLabelText = (m: Member) => {
     if (layers.aids.labels === false) return null
 
-    const parts: string[] = []
-
-    // 1. Piecemarks
-    if (layers.aids.piecemarks !== false) {
-      parts.push(m.piecemark || m.section || '')
+    // 1. Column Reference Display (Resolved vs Unresolved)
+    if (m.kind === 'column') {
+      const geo: any = m.geometry || {}
+      const sec = m.section || geo.resolved_profile || ''
+      const bp = geo.base_plate_mark ? ` • ${geo.base_plate_mark}` : ''
+      if (sec || m.piecemark) {
+        return `${sec || m.piecemark}${bp}`
+      }
+      return 'Column'
     }
 
-    // 2. Lengths
-    if (layers.aids.lengths === true && m.length_ft) {
+    const parts: string[] = []
+
+    // 2. Piecemarks / Section (e.g. W16X26)
+    if (layers.aids.piecemarks !== false && (m.section || m.piecemark)) {
+      parts.push(m.section || m.piecemark || '')
+    }
+
+    // 3. Lengths (always included by default when length_ft is present)
+    if (layers.aids.lengths !== false && m.length_ft && m.length_ft > 0) {
       parts.push(`${m.length_ft.toFixed(1)}'`)
     }
 
-    // 3. Reactions
+    // 4. Reactions
     if (layers.aids.reactions === true && m.reaction) {
       parts.push(m.reaction)
     }
@@ -81,18 +92,30 @@ export function OverlayLayer({
       return m.section || ''
     }
 
-    return parts.filter(Boolean).join(' - ')
+    return parts.filter(Boolean).join(' • ')
   }
 
-  // Freshly extracted members were silently invisible with zero on-screen
-  // indication of why (only a console.warn nobody ever sees): a
-  // classVisibility/isolation filter left over from a PREVIOUS session gets
-  // restored from localStorage on load and applies to every page, including
-  // ones just extracted. The extraction itself was working fine -- the plan
-  // just looked "broken" because 100% of the new members matched an old
-  // hidden-layer filter. Compute that state for real (not just log it) so a
-  // visible fix can be offered instead of a silent, undiscoverable failure.
-  const visibleMembers = members.filter(m => getMemberRenderProps({ layers, hiddenIds, isolation }, m).visible)
+  // Memoize visible members and sort them so columns render on top.
+  // This prevents expensive O(N log N) sorting and redundant getMemberRenderProps
+  // calls on every render cycle when hovering/selecting.
+  const { visibleMembers, sortedVisibleMembers } = useMemo(() => {
+    const visible: Member[] = []
+    const visibleWithProps: { m: Member, renderProps: ReturnType<typeof getMemberRenderProps> }[] = []
+    
+    for (const m of members) {
+      const renderProps = getMemberRenderProps({ layers, hiddenIds, isolation }, m)
+      if (renderProps.visible) {
+        visible.push(m)
+        visibleWithProps.push({ m, renderProps })
+      }
+    }
+    
+    // Sort so columns paint last (on top)
+    const sorted = visibleWithProps.sort((a, b) => (a.m.kind === 'column' ? 1 : 0) - (b.m.kind === 'column' ? 1 : 0))
+    
+    return { visibleMembers: visible, sortedVisibleMembers: sorted }
+  }, [members, layers, hiddenIds, isolation])
+
   const allHiddenByFilter = members.length > 0 && visibleMembers.length === 0
 
   return (
@@ -145,9 +168,8 @@ export function OverlayLayer({
           the beam lines drawn on top of it, making it invisible even though
           it's rendering correctly. Force columns to always paint last (on
           top) so every column marker is guaranteed visible. */}
-        {[...members].sort((a, b) => (a.kind === 'column' ? 1 : 0) - (b.kind === 'column' ? 1 : 0)).map((m) => {
-        const renderProps = getMemberRenderProps({ layers, hiddenIds, isolation }, m)
-        if (!renderProps.visible) return null
+        {sortedVisibleMembers.map(({ m, renderProps }) => {
+
 
         const { color, opacity } = renderProps
         const geo = m.geometry
@@ -211,76 +233,80 @@ export function OverlayLayer({
           )
         }
 
-        // 2. Beam rendering
-        if (m.kind === 'beam') {
-          // Red = "needs a profile assigned" on every extraction, unconditionally --
-          // not gated by the "Unlabelled" detect-more-candidates checkbox. That
-          // checkbox only controls whether the backend goes looking for EXTRA
-          // beam-shaped lines with no section callout at all (geo.unlabeled).
-          // A beam can also lack a section simply because OCR/registration
-          // didn't confidently match a callout to it -- those must be red too,
-          // by default, with no toggle required.
-          const isUnlabeled = !!(geo as any).unlabeled || !m.section
-          // Verified live against app.steelgenie.com (Page 31, zoomed to plan
-          // density): normal/labeled beams render violet/purple there, with
-          // red reserved specifically for flagged/unlabeled members -- the
-          // opposite of what this file had. Matches the 3D viewer's already
-          // -confirmed lavender/red scheme too.
-          const LABELED_BEAM_COLOR = '#8B5CF6' // Violet/purple for labeled beams, like SteelGenie
-          const UNLABELED_BEAM_COLOR = '#EC4899' // Pink for unlabeled/flagged
+        // 2. Determine member category: Column, Beam, or Joist
+        const sectionStr = (m.section || '').trim().toUpperCase()
+        const piecemarkStr = (m.piecemark || '').trim().toUpperCase()
+        
+        // Joist check: explicit kind, SJI callout (20K4, 28K6, 24K7), or infill framing line without a W-section
+        const isExplicitJoist = m.kind === 'joist' ||
+          /\d{1,2}(?:K|LH|DLH|KSP|G|CJ|CS)/.test(sectionStr) ||
+          /\d{1,2}(?:K|LH|DLH|KSP|G|CJ|CS)/.test(piecemarkStr) ||
+          sectionStr.includes('JOIST') || piecemarkStr.includes('JOIST')
 
+        // Beam check: has a real hot-rolled profile (W, HSS, C, MC, L, PIPE)
+        const isExplicitBeam = m.kind === 'beam' &&
+          /^(W\d|HSS|C\d|MC\d|L\d|PIPE|ISA)/.test(sectionStr)
+
+        const isJoist = isExplicitJoist || (!isExplicitBeam && m.kind !== 'column' && m.kind !== 'footing')
+
+        // 2. Joist rendering — clean GREEN SVG line overlay across joist geometry, NO text label
+        if (isJoist) {
+          const JOIST_COLOR = '#10B981' // Vibrant Green
           const hasSpan = geo.bx1 !== undefined && geo.bx1 !== null && geo.bx2 !== undefined && geo.bx2 !== null
-          const markerColor = isUnlabeled ? UNLABELED_BEAM_COLOR : (isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : LABELED_BEAM_COLOR)
-          
-          // Hover highlight -- verified live against app.steelgenie.com: hovering
-          // a beam there highlights it bright green, not cyan.
-          const strokeColor = isHovered ? '#22C55E' : markerColor
+          if (!hasSpan) return null
+
+          const strokeColor = isHovered ? '#22C55E' : (isSelected ? '#22C55E' : JOIST_COLOR)
+          const strokeWidth = (isHovered ? 3.5 : 2.2) + strokeWidthModifier
+
+          const x1 = geo.bx1! * 100
+          const y1 = geo.by1! * 100
+          const x2 = geo.bx2! * 100
+          const y2 = geo.by2! * 100
+
+          return (
+            <g
+              key={m.id}
+              onClick={(e) => { e.stopPropagation(); onMemberClick(m, e) }}
+              onMouseEnter={() => onMemberHover(m.id)}
+              onMouseLeave={() => onMemberHover(null)}
+              style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
+            >
+              {/* Selection highlight line */}
+              {isSelected && (
+                <line
+                  x1={`${x1}%`} y1={`${y1}%`} x2={`${x2}%`} y2={`${y2}%`}
+                  fill="none" stroke="#22C55E" strokeWidth={strokeWidth + 4}
+                  style={{ opacity: 0.5, pointerEvents: 'none' }}
+                />
+              )}
+              {/* Clean joist line overlay on top of drawing in SOLID GREEN — NO text overlay */}
+              <line
+                x1={`${x1}%`} y1={`${y1}%`} x2={`${x2}%`} y2={`${y2}%`}
+                fill="none"
+                stroke={strokeColor}
+                strokeWidth={strokeWidth}
+                strokeLinecap="round"
+                className={isZoomTarget ? 'pulsing-member' : ''}
+                style={{
+                  transition: 'all 0.12s ease',
+                  filter: filterStyle,
+                  mixBlendMode: 'multiply',
+                }}
+              />
+            </g>
+          )
+        }
+
+        // 3. Beam rendering — real hot-rolled structural beams in VIOLET with label & length
+        if (isExplicitBeam || m.kind === 'beam') {
+          const BEAM_COLOR = '#8B5CF6' // Violet / Purple straight solid line
+          const hasSpan = geo.bx1 !== undefined && geo.bx1 !== null && geo.bx2 !== undefined && geo.bx2 !== null
+          if (!hasSpan) return null
+
+          const strokeColor = isHovered ? '#22C55E' : (isSelected ? '#22C55E' : BEAM_COLOR)
           const strokeWidthBase = isHovered ? 4 : 2
           const strokeWidth = strokeWidthBase + strokeWidthModifier
-          
-          // Progressive disclosure: only show full text if zoomed in significantly, or hovered/selected
-          const showText = (zoomLevel >= 2.5) || isHovered || isSelected || isZoomTarget
-
-          if (!hasSpan) {
-            const px = geo.x * 100
-            const py = geo.y * 100
-            const labelText = getLabelText(m)
-            return (
-              <g
-                key={m.id}
-                onClick={(e) => { e.stopPropagation(); onMemberClick(m, e) }}
-                onMouseEnter={() => onMemberHover(m.id)}
-                onMouseLeave={() => onMemberHover(null)}
-                style={{ pointerEvents: 'all', cursor: 'pointer', opacity }}
-              >
-                <circle
-                  cx={`${px}%`}
-                  cy={`${py}%`}
-                  r={isHovered ? 5 : 3.5}
-                  fill={isHovered ? '#22C55E' : 'none'}
-                  stroke={strokeColor}
-                  strokeWidth={1.4}
-                  strokeDasharray="none"
-                  style={{ transition: 'all 0.15s ease', filter: filterStyle }}
-                />
-                {showText && labelText && !isUnlabeled && (
-                  <text
-                    x={`${px}%`}
-                    y={`${py - 1.6}%`}
-                    fill={strokeColor}
-                    fontSize="6.5px"
-                    fontWeight="600"
-                    textAnchor="middle"
-                    style={{
-                      userSelect: 'none', paintOrder: 'stroke', stroke: '#0B1220', strokeWidth: 2, pointerEvents: 'none'
-                    }}
-                  >
-                    {labelText}
-                  </text>
-                )}
-              </g>
-            )
-          }
+          const showText = layers.aids.labels !== false
 
           const x1 = geo.bx1! * 100
           const y1 = geo.by1! * 100
@@ -293,12 +319,12 @@ export function OverlayLayer({
               member={m}
               x1={x1} y1={y1} x2={x2} y2={y2}
               strokeColor={strokeColor}
-              markerColor={markerColor}
+              markerColor={BEAM_COLOR}
               strokeWidth={strokeWidth}
               isSelected={isSelected}
               isHovered={isHovered}
               isZoomTarget={isZoomTarget}
-              isUnlabeled={isUnlabeled}
+              isUnlabeled={false}
               showHalo={showHalo}
               showText={showText}
               labelText={getLabelText(m)}
@@ -314,7 +340,7 @@ export function OverlayLayer({
           )
         }
 
-        // 3. Brace rendering
+        // 4. Brace rendering
         const bx = geo.x * 100
         const by = geo.y * 100
         const bgx1 = geo.bx1 !== undefined && geo.bx1 !== null ? geo.bx1 * 100 : null

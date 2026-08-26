@@ -172,13 +172,12 @@ export function ColumnSymbol({
   const sH = hasRealSize ? geo.sym_h * 100 : 0.5
   const ft = sW * 0.22   // flange thickness ≈ 22% of depth — matches real wide-flange proportions
 
-  let stroke = color
+  let stroke = color || '#38BDF8'
   let dash: string | undefined
   if (layers.colorMode === 'kind') {
-    if (isSuggested) { stroke = '#94A3B8'; dash = '3,3' }
-    else if (hasError) { stroke = '#EF4444'; dash = '4,3' }
-    else if (isVerified) { stroke = '#10B981' }
-    else if (isLowConf || m.status === 'need_review') { stroke = '#F59E0B'; dash = '4,3' }
+    if (isVerified) { stroke = '#10B981' }
+    else if (hasError && !geo.projected_from_foundation) { stroke = '#EF4444'; dash = '4,3' }
+    else { stroke = color || '#38BDF8' }
   }
   const sw = (isHovered ? 2.2 : 1.4) + (isSelected ? 1.0 : 0)
 
@@ -202,7 +201,8 @@ export function ColumnSymbol({
     />
   )
 
-  const labelText = isSuggested ? 'Column?' : getLabelText(m)
+  const rawLabel = getLabelText(m)
+  const labelText = rawLabel === 'Column?' || !rawLabel ? (m.section || 'Column') : rawLabel
 
   return (
     <g
@@ -210,18 +210,8 @@ export function ColumnSymbol({
       onPointerDown={handlePointerDown}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
-      style={{ pointerEvents: 'all', cursor: isSuggested ? 'pointer' : 'grab', opacity: isSuggested ? opacity * 0.65 : opacity, touchAction: 'none' }}
+      style={{ pointerEvents: 'all', cursor: 'grab', opacity: opacity, touchAction: 'none' }}
     >
-      {/* Suggested ghost ring — the only "extra" affordance kept, since a
-          suggested/unconfirmed column genuinely has no real symbol yet. */}
-      {isSuggested && (
-        <circle
-          cx={`${cx}%`} cy={`${cy}%`} r={isHovered ? 10 : 8}
-          fill="none" stroke="#94A3B8" strokeWidth={1.2} strokeDasharray="3,3"
-          className="pulsing-halo"
-        />
-      )}
-
       {/* Selection outline — editing aid, not part of the base drawing style */}
       {isSelected && (
         <rect
@@ -277,24 +267,24 @@ export function ColumnSymbol({
         />
       )}
 
-      {/* Profile label — plain text next to the symbol, color-coded by status.
-          No pill background, no category text, no warning glyph -- a flagged
-          column is communicated by the stroke color alone (red), matching
-          the reference's restraint. */}
+      {/* Profile label — large bold text, no background, readable at a glance */}
       {labelText && (
         <text
           x={`${cx}%`}
           y={`${cy - sH / 2 - 1.2}%`}
           fill={stroke}
-          fontSize="6px"
-          fontWeight="600"
+          fontSize="11px"
+          fontWeight="700"
+          fontFamily="'Inter', 'Segoe UI', sans-serif"
           textAnchor="middle"
           style={{
             userSelect: 'none',
             paintOrder: 'stroke',
             stroke: '#0B1220',
-            strokeWidth: 2,
+            strokeWidth: 2.5,
+            strokeLinejoin: 'round',
             pointerEvents: 'none',
+            letterSpacing: '0.02em',
           }}
         >
           {labelText}

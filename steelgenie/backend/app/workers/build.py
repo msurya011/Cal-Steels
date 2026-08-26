@@ -94,21 +94,23 @@ async def run_build_job(
     db.table("column_groups").delete().eq("project_id", project_id).execute()
     db.table("braced_frames").delete().eq("project_id", project_id).execute()
 
+    # Batch insert all records to avoid multiple heavy disk writes
     bom_rows = result["bom_items"]
-    for i in range(0, len(bom_rows), 100):
-        chunk = bom_rows[i:i + 100]
-        if chunk:
-            db.table("bom_items").insert(chunk).execute()
+    if bom_rows:
+        db.table("bom_items").insert(bom_rows).execute()
 
-    for g in result["column_groups"]:
-        db.table("column_groups").insert({**g, "project_id": project_id}).execute()
+    if result["column_groups"]:
+        cgroups_to_insert = [{**g, "project_id": project_id} for g in result["column_groups"]]
+        db.table("column_groups").insert(cgroups_to_insert).execute()
 
-    for f in result["braced_frames"]:
-        db.table("braced_frames").insert({**f, "project_id": project_id}).execute()
+    if result["braced_frames"]:
+        bframes_to_insert = [{**f, "project_id": project_id} for f in result["braced_frames"]]
+        db.table("braced_frames").insert(bframes_to_insert).execute()
 
-    # Mark built pages accordingly.
-    for p in pages:
-        db.table("pages").update({"status": "built"}).eq("id", p["id"]).execute()
+    # Mark built pages
+    if pages:
+        pids = [p["id"] for p in pages]
+        db.table("pages").update({"status": "built"}).in_("id", pids).execute()
 
     await _update_job(
         job_id, "done", 100,

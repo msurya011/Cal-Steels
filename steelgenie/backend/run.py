@@ -1,20 +1,38 @@
+import os
+import sys
 import uvicorn
 
 if __name__ == "__main__":
-    # IMPORTANT: reload must ignore data files the app writes at runtime
-    # (local_db.json, uploads, logs). Otherwise every job progress write
-    # triggers a server restart that KILLS running extraction jobs.
+    # IMPORTANT: reload must only watch the app/ source directory, and ignore data
+    # files (local_db.json*, uploads, logs, cache). Otherwise any file write or
+    # test execution in the backend directory triggers an unexpected uvicorn reload
+    # that abruptly kills active background extraction/build jobs.
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    app_dir = os.path.join(backend_dir, "app")
+
+    no_reload = "--no-reload" in sys.argv or os.environ.get("NO_RELOAD", "").lower() in ("1", "true")
+
     uvicorn.run(
         "app.main:app",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8000,
-        reload=True,
-        reload_includes=["*.py"],
+        reload=not no_reload,
+        reload_dirs=[app_dir] if not no_reload else None,
+        reload_includes=["*.py"] if not no_reload else None,
         reload_excludes=[
-            "local_db.json",
+            "local_db.json*",
+            "*.tmp",
             "saved_projects.json",
             "uploads/*",
             "*.log",
             "*.txt",
-        ],
+            "*.png",
+            "*.json",
+            "*.csv",
+            "brace_*",
+            "debug/*",
+            "scratch/*",
+            "*.bak",
+            "*.corrupt_backup",
+        ] if not no_reload else None,
     )

@@ -275,8 +275,17 @@ async def run_analyse(
             "length_ft": m.get("length_ft"),
         })
 
-    # ── Foundation-Anchored Column Propagation ─────────────────────────────
+    # ── Foundation-Anchored Column Cross-Page Reference Resolution ────────
     is_fp = bool(result.get("is_foundation_plan"))
+    if is_fp and file_path:
+        try:
+            from app.engineering.column_reference_resolver import resolve_foundation_plan_columns
+            logger.info("Resolving Foundation Plan columns & Base Plates on page idx %d...", page_idx)
+            resolve_foundation_plan_columns(file_path, page_idx, member_rows)
+        except Exception as res_err:
+            logger.warning("Foundation column reference resolution error: %s", res_err)
+
+    # ── Foundation-Anchored Column Propagation ─────────────────────────────
     if not is_fp and project_id:
         try:
             drw_rows = db.table("drawings").select("id").eq("project_id", str(project_id)).execute().data or []
@@ -383,7 +392,7 @@ async def run_analyse(
     # Column cross-validation + missing-column suggestions (Layer 3/4 of the
     # column plan): score detected columns against beam-endpoint support and
     # suggest ghost columns where beams converge with no column detected.
-    member_rows = _postprocess_columns(member_rows, page_id)
+    member_rows = _postprocess_columns(member_rows, page_id, is_foundation_plan=is_fp)
 
     # Clear old members for this page before inserting fresh extraction results
     try:
@@ -487,29 +496,17 @@ async def run_analyse(
 def _postprocess_columns(
     member_rows: List[Dict[str, Any]],
     page_id: str,
-    endpoint_tol: float = 0.010,      # fraction of page — beam end "supports" a column
-    cluster_tol: float = 0.006,       # endpoint clustering grid
-    min_converging: int = 3,          # beam ends needed to suggest a missing column
-    max_suggestions: int = 30,
+    endpoint_tol: float = 0.03,
+    cluster_tol: float = 0.02,
+    min_converging: int = 2,
+    max_suggestions: int = 20,
+    is_foundation_plan: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Column validation & suggestion pass (pure post-processing; never mutates
-    beams). For each detected column, count beam endpoints terminating nearby
-    and blend that into confidence/status + error flags. Then, at clusters of
-    converging beam endpoints with NO detected column, emit ghost 'suggested'
-    columns for the review queue.
-
-    A real column is the geometric signature of beams framing in from
-    PERPENDICULAR directions (a girder + joists/beams crossing it). Densely
-    spaced parallel joists all terminating near the same point along a
-    continuous girder is NOT a column — it's just tight joist spacing — but
-    without direction-diversity that pattern easily clears a raw endpoint-count
-    threshold, which is what was flooding plans with false "Column?" ghosts at
-    nearly every joist landing point. Requiring both H- and V-running beams in
-    the convergence cluster filters that out.
+    Score detected columns and ensure strict spatial deduplication.
+    Framing plans only: suggest missing columns where beams converge.
+    Foundation plans: skip beam-support checks and ghost suggestions.
     """
-    # Gather beam endpoints, tagged with the beam's running direction so we
-    # can require perpendicular (orthogonal) convergence, not just proximity.
     endpoints: List[tuple] = []
     for r in member_rows:
         if r["kind"] != "beam":
@@ -532,12 +529,13 @@ def _postprocess_columns(
         )
         flags: List[str] = []
         conf = col.get("confidence") or 0.5
-        if support >= 2:
-            conf = min(1.0, conf + 0.15)
-        elif support == 0:
-            flags.append("orphan")           # no beam frames into this column
-            conf = max(0.1, conf - 0.20)
-        if not col.get("section"):
+        if not is_foundation_plan:
+            if support >= 2:
+                conf = min(1.0, conf + 0.15)
+            elif support == 0:
+                flags.append("orphan")
+                conf = max(0.1, conf - 0.20)
+        if not col.get("section") and not is_foundation_plan:
             flags.append("no_label")
             conf = max(0.1, conf - 0.10)
 
@@ -545,15 +543,11 @@ def _postprocess_columns(
         g["error_flags"] = flags
         g["symbol"] = g.get("symbol") or "I"
         col["confidence"] = round(conf, 2)
-        if conf < 0.75 or flags:
+        if (conf < 0.75 or flags) and not is_foundation_plan:
             col["status"] = "need_review"
 
-    # 2) Suggest missing columns at beam-end convergence points.
-    # Require the cluster to contain endpoints from BOTH H- and V-running
-    # beams — the actual geometric signature of a column (a girder crossed by
-    # perpendicular framing) — so a tight run of parallel joists landing near
-    # each other on one continuous girder never gets mistaken for one.
-    if endpoints:
+    # 2) Suggest missing columns at beam-end convergence points (Framing plans only)
+    if endpoints and not is_foundation_plan:
         clusters: Dict[tuple, List[tuple]] = {}
         for (px, py, bdir) in endpoints:
             key = (round(px / cluster_tol), round(py / cluster_tol))
@@ -565,8 +559,6 @@ def _postprocess_columns(
             if suggested >= max_suggestions or len(pts) < min_converging:
                 continue
             dirs = {d for (_x, _y, d) in pts if d}
-            # Skip if we have direction data and it's not actually orthogonal
-            # convergence — this is the fix for the false "Column?" flood.
             if dirs and not ({"H", "V"} <= dirs):
                 continue
             mx = sum(p[0] for p in pts) / len(pts)
@@ -596,7 +588,34 @@ def _postprocess_columns(
         if suggested:
             logger.info("Column suggestions: %d ghost columns added for page %s", suggested, page_id)
 
-    return member_rows
+    # 3) Strict Universal Spatial Deduplication
+    # Merge any columns that are within 2.5% of page width of each other into exactly one column
+    final_rows: List[Dict[str, Any]] = []
+    seen_col_positions: List[Tuple[float, float, int]] = []
+    for r in member_rows:
+        if r.get("kind") != "column":
+            final_rows.append(r)
+            continue
+        g = r.get("geometry") or {}
+        cx = float(g.get("raw_x") if g.get("raw_x") is not None else g.get("x", 0))
+        cy = float(g.get("raw_y") if g.get("raw_y") is not None else g.get("y", 0))
+
+        import math
+        dup_idx = -1
+        for (ex, ey, f_idx) in seen_col_positions:
+            if math.hypot(cx - ex, cy - ey) < 0.025:
+                dup_idx = f_idx
+                break
+
+        if dup_idx >= 0:
+            existing = final_rows[dup_idx]
+            if not existing.get("section") and r.get("section"):
+                final_rows[dup_idx] = r
+        else:
+            seen_col_positions.append((cx, cy, len(final_rows)))
+            final_rows.append(r)
+
+    return final_rows
 
 
 def _confidence_to_float(conf) -> Optional[float]:

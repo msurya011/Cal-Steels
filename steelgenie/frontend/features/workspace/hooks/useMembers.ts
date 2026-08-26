@@ -5,11 +5,13 @@ import { useWorkspaceStore } from '../../../lib/stores/workspaceStore'
 export function useMembers(pageId: string | null) {
   const queryClient = useQueryClient()
 
-  // Query: Get all members for page
+  // Query: Get all members for page (cached in memory for instant page navigation)
   const { data: members = [], isLoading, error } = useQuery({
     queryKey: ['members', pageId],
     queryFn: () => (pageId ? membersApi.list(pageId) : Promise.resolve([])),
     enabled: !!pageId,
+    staleTime: 1000 * 60 * 5, // 5 minutes fresh
+    gcTime: 1000 * 60 * 30,    // 30 minutes in memory cache
   })
 
   // Every mutation below also calls bumpModelRefresh(pageId) -- previously

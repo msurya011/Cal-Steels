@@ -4,6 +4,7 @@ Includes a fully compliant local offline Mock DB engine when Supabase is unresol
 """
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import json
@@ -42,6 +43,20 @@ _DB_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "local_db.json"
 )
+
+# Clean up orphaned .tmp files left by past crashed writes.
+# Each crash creates a <pid>.<tid>.tmp file that never gets removed, and they
+# accumulate on disk. This runs once at import time (server startup) and is
+# a no-op when there are no stale files to remove.
+def _cleanup_tmp_files() -> None:
+    for _tmp in glob.glob(f"{_DB_FILE}.*.tmp"):
+        try:
+            os.remove(_tmp)
+            logger.debug("Removed orphaned tmp file: %s", _tmp)
+        except OSError:
+            pass
+
+_cleanup_tmp_files()
 
 # In-process cache of the parsed DB, keyed off the file's mtime. Every single
 # .execute() call in MockQueryBuilder used to call _load_db(), which did a
@@ -230,9 +245,26 @@ def _save_db(data: dict) -> None:
         tmp_path = f"{_DB_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, _DB_FILE)
+            # os.fsync() removed: it forced a synchronous physical-disk flush
+            # on every write of the full (40+ MB) file, adding 1-3 s per save.
+        import time
+        replaced = False
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, _DB_FILE)
+                replaced = True
+                break
+            except (PermissionError, OSError):
+                time.sleep(0.05 * (attempt + 1))
+        if not replaced:
+            # Fallback if replace is still locked
+            with open(_DB_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
         # Keep the cache in lockstep with what we just wrote, so the very
         # next _load_db() call (e.g. the next chained .execute() in the same
         # request) reuses this in-memory copy instead of re-reading the file
@@ -505,6 +537,34 @@ def bulk_update_by_id(table_name: str, updates_by_id: dict[str, dict]) -> int:
             count += 1
         _save_db(db)
     return count
+
+
+def bulk_delete_by_id(table_name: str, ids: list[str]) -> int:
+    """Delete many rows from one table in a single file write.
+
+    Mirrors bulk_update_by_id: calling .delete().eq("id", x).execute() N
+    times writes the full local_db.json N times.  On a 32-page project with
+    ~10 grids/page, the old extract_grids_for_page pattern was flushing the
+    65 MB file ~320 times (~4 minutes) while the job sat at 90% — causing
+    the frontend stall-timeout to fire.  This replaces all those writes with
+    a single atomic flush.
+    """
+    if not ids:
+        return 0
+    id_set = set(ids)
+    db_client = get_db()
+    if not isinstance(db_client, MockClient):
+        for row_id in ids:
+            db_client.table(table_name).delete().eq("id", row_id).execute()
+        return len(ids)
+
+    with _db_lock:
+        db = _load_db()
+        items = db.get(table_name, [])
+        before = len(items)
+        db[table_name] = [r for r in items if r.get("id") not in id_set]
+        _save_db(db)
+    return before - len(db[table_name])
 
 
 def get_db() -> Any:

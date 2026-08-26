@@ -59,7 +59,7 @@ async def run_ingest(
             "status": "ingesting",
         }).eq("id", drawing_id).execute()
 
-        pages_created = []
+        pages_to_insert: list[dict] = []
 
         for idx in range(page_count):
             pct = 10 + int((idx / page_count) * 80)
@@ -81,16 +81,19 @@ async def run_ingest(
             image_key = generate_storage_key(f"drawings/{drawing_id}/pages", ".jpg")
             await storage.put(image_key, prev_bytes, "image/jpeg")
 
-            # Create page record
-            page_row = {
+            # Collect page record — all pages are batch-inserted after the loop
+            # so local_db.json is written once instead of once per page.
+            pages_to_insert.append({
                 "drawing_id": drawing_id,
                 "idx": idx,
                 "thumb_key": thumb_key,
                 "image_key": image_key,
                 "status": "not_started",
-            }
-            resp = db.table("pages").insert(page_row).execute()
-            pages_created.append(resp.data[0]["id"])
+            })
+
+        # Single batch insert → one DB write for all pages (was N writes)
+        batch_resp = db.table("pages").insert(pages_to_insert).execute()
+        pages_created = [p["id"] for p in batch_resp.data]
 
         doc.close()
 

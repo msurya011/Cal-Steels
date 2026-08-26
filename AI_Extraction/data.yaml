@@ -1,8 +1,0 @@
-path: D:/Steel-ghost 2/AI_Extraction/datasets/drawings
-train: images/train
-val: images/val
-
-nc: 2
-names:
-  0: Cube-Column
-  1: I-Column

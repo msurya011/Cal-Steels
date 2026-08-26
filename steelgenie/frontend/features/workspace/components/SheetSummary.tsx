@@ -15,6 +15,8 @@ interface Member {
 
 interface SheetSummaryProps {
   members: Member[]
+  bomItems?: any[]
+  activeSheetName?: string
 }
 
 /**
@@ -25,12 +27,15 @@ interface SheetSummaryProps {
 function unitWeightLbFt(section: string | null): number | null {
   if (!section) return null
   const s = section.toUpperCase().trim()
-  if (s.startsWith('HSS') || s.startsWith('L') || s.startsWith('PIPE')) return null
   const m = s.match(/^(?:W|WT|S|ST|C|MC|M|MT|HP)\s*\d+(?:\.\d+)?X(\d+(?:\.\d+)?)/)
-  return m ? parseFloat(m[1]) : null
+  if (m) return parseFloat(m[1])
+  if (s.startsWith('HSS')) return 10.0
+  if (s.startsWith('PIPE')) return 8.0
+  if (s.startsWith('L')) return 3.5
+  return null
 }
 
-export function SheetSummary({ members }: SheetSummaryProps) {
+export function SheetSummary({ members, bomItems, activeSheetName }: SheetSummaryProps) {
   const store = useWorkspaceStore()
   const {
     layers,
@@ -47,12 +52,41 @@ export function SheetSummary({ members }: SheetSummaryProps) {
     const counts = { column: 0, beam: 0, vbrace: 0, hbrace: 0, joist: 0 }
     let weightLbs = 0
     for (const m of members) {
-      if (m.kind in counts) (counts as any)[m.kind] += 1
+      const sectionStr = (m.section || '').trim().toUpperCase()
+      const isExplicitBeam = m.kind === 'beam' && /^(W\d|HSS|C\d|MC\d|L\d|PIPE|ISA)/.test(sectionStr)
+      const isExplicitJoist = m.kind === 'joist' ||
+        /\d{1,2}(?:K|LH|DLH|KSP|G|CJ|CS)/.test(sectionStr) ||
+        sectionStr.includes('JOIST')
+
+      let k = m.kind
+      if (isExplicitJoist || (!isExplicitBeam && m.kind !== 'column' && m.kind !== 'footing')) {
+        k = 'joist'
+      } else if (isExplicitBeam) {
+        k = 'beam'
+      }
+
+      if (k in counts) (counts as any)[k] += 1
       const uw = unitWeightLbFt(m.section)
-      if (uw && m.length_ft) weightLbs += uw * m.length_ft
+      if (uw && m.length_ft && k !== 'joist') weightLbs += uw * m.length_ft
     }
-    return { counts, tons: weightLbs / 2000 }
-  }, [members])
+
+    let weldStuds = 0
+    let bolts = 0
+
+    if (bomItems && bomItems.length > 0 && activeSheetName) {
+      const sheetBom = bomItems.filter(item => item.sheet === activeSheetName)
+      sheetBom.forEach(item => {
+        if (item.category === 'Weld Studs') {
+          weldStuds += item.weld_studs || item.qty || 0
+        }
+        if (item.category === 'Bolts') {
+          bolts += item.qty || 0
+        }
+      })
+    }
+
+    return { counts, tons: weightLbs / 2000, weldStuds, bolts }
+  }, [members, bomItems, activeSheetName])
 
   const reviewStats = useMemo(() => {
     const total = members.length
@@ -189,7 +223,6 @@ export function SheetSummary({ members }: SheetSummaryProps) {
     >
       {/* 1. PROJECT TOTALS */}
       <div style={{ padding: '10px 0 0' }}>
-        {totalsRow('Weld Studs', 0)}
         {totalsRow('Total Weight (tons)', stats.tons.toFixed(2))}
         {totalsRow('Hrs/Ton', <span style={{ color: '#64748B', fontSize: '10px', fontWeight: 700 }}>WIP</span>)}
       </div>

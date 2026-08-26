@@ -576,27 +576,34 @@ def extract_grids_for_page(page_id: str) -> dict:
     v_grid = _cluster(xs)
     h_grid = _cluster(ys)
 
-    existing = db.table("grids").select("*").eq("page_id", str(page_id)).execute().data or []
-    for g in existing:
-        if g.get("source") == "ai":
-            db.table("grids").delete().eq("id", g["id"]).execute()
+    # Delete existing ai-source grids in one bulk operation (one file write)
+    # instead of one delete per row (N file writes). The old pattern caused
+    # one full local_db.json flush per grid line, which on a 32-page project
+    # with ~10 grids/page = 320 writes x ~0.75s = ~4 min stalled at 90%.
+    stale_ids = [g["id"] for g in existing_real if g.get("source") == "ai"]
+    if stale_ids:
+        from app.services.database import bulk_delete_by_id
+        bulk_delete_by_id("grids", stale_ids)
 
-    written = 0
+    # Build all grid rows and insert as a single batch (one file write total)
+    grid_rows = []
     for i, x in enumerate(v_grid):
-        db.table("grids").insert({
+        grid_rows.append({
             "page_id": str(page_id), "axis": "x", "label": str(i + 1),
             "position": x, "confidence": 0.5, "source": "ai",
-        }).execute()
-        written += 1
+        })
 
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     for i, y in enumerate(h_grid):
         label = letters[i] if i < len(letters) else str(i + 1)
-        db.table("grids").insert({
+        grid_rows.append({
             "page_id": str(page_id), "axis": "y", "label": label,
             "position": y, "confidence": 0.5, "source": "ai",
-        }).execute()
-        written += 1
+        })
+
+    written = len(grid_rows)
+    if grid_rows:
+        db.table("grids").insert(grid_rows).execute()
 
     return {"v_grid": v_grid, "h_grid": h_grid, "written": written}
 
@@ -915,8 +922,13 @@ def _register_floor_impl(floor_id: str) -> dict:
     floor_status = "registered" if avg_conf >= 0.6 and all(r["method"] != "tile" for r in results) else "need_review"
     db.table("floors").update({"status": floor_status}).eq("id", str(floor_id)).execute()
 
-    for pid in ordered:
-        write_global_geometry(pid)
+    # Write global geometry for ALL pages of this floor in a SINGLE file write.
+    # Previously this was a per-page loop: write_global_geometry(pid) for each
+    # ordered page.  Each call does a full bulk_update_by_id → json.dump of the
+    # entire 65 MB local_db.json (~2.8s). With N pages on one floor that's
+    # N × 2.8s of pure I/O while the job sits at 90%, which is what causes
+    # the "Extraction timed out" toast on multi-page projects.
+    write_global_geometry_multi(ordered)
 
     dedup_result = _dedup_floor_members(str(floor_id), db)
 
@@ -1030,6 +1042,52 @@ def write_global_geometry(page_id: str) -> dict:
 
     written = bulk_update_by_id("members", pending)
     return {"written": written}
+
+
+def write_global_geometry_multi(page_ids: list[str]) -> dict:
+    """Apply registration transforms for MULTIPLE pages in ONE file write.
+
+    register_floor() used to call write_global_geometry() in a per-page loop,
+    causing one full local_db.json write per page (~2.8s each on this project).
+    A 10-page floor cost ~28s; a 32-page floor over a minute — exactly enough
+    to trip the frontend 120s stall-timeout at 90%. This merges all pages'
+    member geometry updates into a single bulk_update_by_id call so the whole
+    floor always takes one write regardless of page count.
+    """
+    db = get_db()
+    all_pending: dict[str, dict] = {}
+    total_pages = 0
+    for page_id in page_ids:
+        reg = db.table("page_registrations").select("*").eq("page_id", str(page_id)).maybe_single().execute().data
+        if not reg:
+            continue
+        tx, ty = reg["tx_ft"], reg["ty_ft"]
+        ft_x, ft_y = reg["ft_per_pct_x"], reg["ft_per_pct_y"]
+        floor_id = reg["floor_id"]
+        members = db.table("members").select("*").eq("page_id", str(page_id)).execute().data or []
+        total_pages += 1
+        for m in members:
+            geo = dict(m.get("geometry") or {})
+            x, y = geo.get("x"), geo.get("y")
+            if x is None or y is None:
+                continue
+            global_geo: dict[str, Any] = {
+                "floor_id": floor_id,
+                "gx_ft": round(tx + x * ft_x, 3),
+                "gy_ft": round(ty + y * ft_y, 3),
+            }
+            if geo.get("bx1") is not None and geo.get("by1") is not None:
+                global_geo["gx1_ft"] = round(tx + geo["bx1"] * ft_x, 3)
+                global_geo["gy1_ft"] = round(ty + geo["by1"] * ft_y, 3)
+            if geo.get("bx2") is not None and geo.get("by2") is not None:
+                global_geo["gx2_ft"] = round(tx + geo["bx2"] * ft_x, 3)
+                global_geo["gy2_ft"] = round(ty + geo["by2"] * ft_y, 3)
+            geo["global"] = global_geo
+            all_pending[m["id"]] = {"geometry": geo}
+
+    from app.services.database import bulk_update_by_id
+    written = bulk_update_by_id("members", all_pending)
+    return {"written": written, "pages": total_pages}
 
 
 # ---------------------------------------------------------------------------
@@ -1448,6 +1506,7 @@ def sync_global_columns(project_id: str) -> dict:
     rejected_low_confidence = 0
     columns_to_insert = []
     segments_to_insert = []
+    pending_ghost_updates: dict[str, dict] = {}
     for c in clusters:
         members = c["members"]
         # Base = the lowest floor this column's own extraction appears on
@@ -1494,32 +1553,20 @@ def sync_global_columns(project_id: str) -> dict:
         # surfaced as review_flag=True in column_segments below, exactly
         # like SteelGenie's warning icon -- visibly uncertain, never hidden.
         if top_elev <= base_elev:
-            higher_floors = [e for e in all_floor_elevs_sorted if e > base_elev]
-            if higher_floors:
-                top_elev = min(higher_floors)
+            # Stage 6 Part 4 / Floating Column Fix: A column detected only on 
+            # a framing plan physically rises FROM the floor below TO that 
+            # sheet's elevation. We must anchor the base at the nearest LOWER
+            # registered floor first, so it supports the floor it was found on.
+            lower_floors = [e for e in all_floor_elevs_sorted if e < base_elev]
+            if lower_floors:
+                base_elev = max(lower_floors)
+                confirmed_top_elev = base_elev
             else:
-                # Stage 6 Part 4 (2026-07-20, live-verified against "sasa"/
-                # Bayhealth: 20 of 34 columns in the merged 3D model came out
-                # as literal zero-length segments -- invisible -- because
-                # every one of them had ALL its member evidence on the
-                # topmost registered floor (a framing-plan-only detection
-                # with no matching foundation-plan column yet). The Fix 2
-                # fallback above only reaches UPWARD to a higher floor, so a
-                # column whose base already IS the highest registered floor
-                # had nowhere to extend to and stayed pinned at [E, E]. A
-                # column detected only on one sheet still physically rises
-                # FROM the floor below TO that sheet's elevation -- mirror
-                # Fix 2 downward: anchor the base at the nearest LOWER
-                # registered floor instead of leaving a degenerate point.
-                # confirmed_top_elev is pulled down to the new base too,
-                # since nothing about this span is beam-confirmed -- it's
-                # exactly as inferred as the upward case, and must be
-                # flagged "floor_registration"/review, not silently marked
-                # confirmed, by _build_column_segments below.
-                lower_floors = [e for e in all_floor_elevs_sorted if e < base_elev]
-                if lower_floors:
-                    base_elev = max(lower_floors)
-                    confirmed_top_elev = base_elev
+                # If there are no lower floors (e.g. it's on the foundation plan),
+                # it must extend UPWARD to the next floor.
+                higher_floors = [e for e in all_floor_elevs_sorted if e > base_elev]
+                if higher_floors:
+                    top_elev = min(higher_floors)
 
         # Merge in Column Schedule data. B1 (column-engine-gap-analysis.md):
         # rather than first-match-wins on mark then profile text equality,
@@ -1685,12 +1732,8 @@ def sync_global_columns(project_id: str) -> dict:
                     # sourced canonical member for this same physical column.
                     if not gm.get("section") and plan_profile:
                         member_update["section"] = plan_profile
-                    if not gm.get("piecemark") and plan_mark:
-                        member_update["piecemark"] = plan_mark
-                    try:
-                        db.table("members").update(member_update).eq("id", gm.get("id")).execute()
-                    except Exception as exc:
-                        logger.warning("Could not reconcile ghost column member %s: %s", gm.get("id"), exc)
+                    if gm.get("id"):
+                        pending_ghost_updates[gm["id"]] = member_update
             except Exception:
                 # Defensive: this reconciliation pass must never be able to
                 # abort the surrounding cluster loop -- the bulk columns
@@ -1779,6 +1822,9 @@ def sync_global_columns(project_id: str) -> dict:
     if segments_to_insert:
         for i in range(0, len(segments_to_insert), 100):
             db.table("column_segments").insert(segments_to_insert[i:i+100]).execute()
+    if pending_ghost_updates:
+        from app.services.database import bulk_update_by_id
+        bulk_update_by_id("members", pending_ghost_updates)
 
     schedule_marks_found = len(schedule_by_mark) or len({
         (r.column_type or r.profile) for r in schedule_records

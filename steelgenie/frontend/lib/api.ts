@@ -28,8 +28,9 @@ async function getAuthToken() {
 export async function apiFetch(path: string, init: RequestInit = {}) {
   const token = await getAuthToken()
 
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(path.startsWith('http') ? path : `${BASE}${path}`, {
     ...init,
+    cache: 'no-store',
     headers: {
       'Content-Type': 'application/json',
       ...init.headers,

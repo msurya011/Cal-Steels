@@ -31,10 +31,13 @@ interface PlanCanvasProps {
   onAddAnnotationMarker: (pt: Point) => void
   onRulerCalibrate: (line: { x1: number; y1: number; x2: number; y2: number }) => void
   onDrawMember: (
-    kind: 'column' | 'beam' | 'brace',
+    kind: 'column' | 'beam' | 'brace' | 'joist' | 'hbrace',
     geom: { x1: number; y1: number; x2: number; y2: number }
   ) => void
-  onMemberDragEnd?: (id: string, x: number, y: number) => void
+  onMemberDragEnd?: (id: string, dx: number, dy: number) => void
+  onEndpointDragEnd?: (id: string, endpoint: 'start' | 'end', x: number, y: number) => void
+  floorPages?: any
+  currentPageId?: string | null
 }
 
 export function PlanCanvas({
@@ -45,6 +48,9 @@ export function PlanCanvas({
   onRulerCalibrate,
   onDrawMember,
   onMemberDragEnd,
+  onEndpointDragEnd,
+  floorPages,
+  currentPageId,
 }: PlanCanvasProps) {
   const {
     activeTool,
@@ -272,6 +278,8 @@ export function PlanCanvas({
           <img
             src={imageUrl}
             alt="Drawing Plan"
+            loading="eager"
+            decoding="async"
             onLoad={(e) => {
               const img = e.currentTarget
               setImageNaturalWidth(img.naturalWidth)
@@ -294,6 +302,7 @@ export function PlanCanvas({
             hoveredMemberId={hoveredMemberId}
             onMemberHover={setHoveredMemberId}
             onMemberDragEnd={onMemberDragEnd}
+            onEndpointDragEnd={onEndpointDragEnd}
           />
 
           {/* Ruler calibration preview overlay lines */}

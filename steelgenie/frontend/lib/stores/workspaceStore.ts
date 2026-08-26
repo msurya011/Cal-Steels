@@ -107,7 +107,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'All',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#8B5CF6', vbrace: '#D97706', hbrace: '#0E7490', joist: '#10B981', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -128,7 +128,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'Steel only',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#8B5CF6', vbrace: '#D97706', hbrace: '#0E7490', joist: '#10B981', unlabelled: '#64748B' },
     aids: {
       markers: false,
       rulers: false,
@@ -149,7 +149,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'QA pass',
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#8B5CF6', vbrace: '#D97706', hbrace: '#0E7490', joist: '#10B981', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -170,7 +170,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
     name: 'Braces check',
     classVisibility: { beam: false, column: false, vbrace: true, hbrace: true, joist: false, unlabelled: false },
     classOpacity: { beam: 1, column: 1, vbrace: 1, hbrace: 1, joist: 1, unlabelled: 1 },
-    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#8B5CF6', vbrace: '#D97706', hbrace: '#0E7490', joist: '#10B981', unlabelled: '#64748B' },
     aids: {
       markers: true,
       rulers: true,
@@ -195,14 +195,16 @@ const getInitialLayers = (): LayersState => {
       try {
         const parsed = JSON.parse(saved)
         parsed.hiddenLegendKeys = new Set(parsed.hiddenLegendKeys || [])
-        // Fill back-compatibility keys if missing
-        if (parsed.planVisible === undefined) parsed.planVisible = true
         if (!parsed.aids) parsed.aids = {}
         if (parsed.aids.piecemarks === undefined) parsed.aids.piecemarks = true
         if (parsed.aids.lengths === undefined) parsed.aids.lengths = false
         if (parsed.aids.reactions === undefined) parsed.aids.reactions = false
         if (parsed.aids.columnProjections === undefined) parsed.aids.columnProjections = true
         if (parsed.aids.lengthFilter === undefined) parsed.aids.lengthFilter = false
+        if (parsed.classColors) {
+          if (parsed.classColors.beam === '#BE185D') parsed.classColors.beam = '#8B5CF6'
+          if (parsed.classColors.joist === '#7C3AED' || parsed.classColors.joist === '#06B6D4') parsed.classColors.joist = '#10B981'
+        }
         return parsed
       } catch {
         // ignore
@@ -212,7 +214,7 @@ const getInitialLayers = (): LayersState => {
   return {
     classVisibility: { beam: true, column: true, vbrace: true, hbrace: true, joist: true, unlabelled: true },
     classOpacity: { beam: 1.0, column: 1.0, vbrace: 1.0, hbrace: 1.0, joist: 1.0, unlabelled: 1.0 },
-    classColors: { column: '#38BDF8', beam: '#BE185D', vbrace: '#D97706', hbrace: '#0E7490', joist: '#7C3AED', unlabelled: '#64748B' },
+    classColors: { column: '#38BDF8', beam: '#8B5CF6', vbrace: '#D97706', hbrace: '#0E7490', joist: '#10B981', unlabelled: '#64748B' },
     planVisible: true,
     aids: {
       markers: true,
@@ -752,7 +754,18 @@ export const getMemberRenderProps = (
   }
 ) => {
   const { layers, hiddenIds, isolation } = state
-  const mKind = member.kind
+  const sectionStr = (member.section || '').trim().toUpperCase()
+  const isExplicitBeam = member.kind === 'beam' && /^(W\d|HSS|C\d|MC\d|L\d|PIPE|ISA)/.test(sectionStr)
+  const isExplicitJoist = member.kind === 'joist' ||
+    /\d{1,2}(?:K|LH|DLH|KSP|G|CJ|CS)/.test(sectionStr) ||
+    sectionStr.includes('JOIST')
+
+  let mKind = (member.kind || 'beam').toLowerCase()
+  if (isExplicitJoist || (!isExplicitBeam && member.kind !== 'column' && member.kind !== 'footing')) {
+    mKind = 'joist'
+  } else if (isExplicitBeam) {
+    mKind = 'beam'
+  }
 
   const weightTier = (w: number | null | undefined): string => {
     if (w === null || w === undefined) return 'Unbuilt'
