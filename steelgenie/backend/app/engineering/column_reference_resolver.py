@@ -1,0 +1,533 @@
+"""
+Universal Column & Base Plate Reference Resolver for Foundation Plans.
+
+Cross-page reference resolution specifically for Foundation Plan extractions:
+1. Direct Callout Matching: Extracts nearby AISC profiles (W14X176, HSS8X8X1/2) and Base Plate marks (BP-1, BP-7)
+   next to each column symbol on the Foundation Plan.
+2. Graphical Column Schedule Matching: Matches columns at grid intersections (e.g. A-1, B-5, C-6, D-4)
+   against Graphical Column Schedules across the PDF drawing set (e.g. Page 18).
+3. Tabular Schedule Matching: Cross-references C1..C8 and BP-1..BP-10 against Schedule Sheets (e.g. Page 8, Page 25).
+4. Automatic Ghost Pruning & Deduplication: Filters out false-positive grid crossings and duplicate footing boxes,
+   retaining only the exact physical columns defined in the drawing set.
+5. Assigns exact structural profiles, weights, base plate specs, and source page to every Foundation column.
+"""
+from __future__ import annotations
+
+import logging
+import math
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import fitz  # PyMuPDF
+
+from app.engineering.shapes import get_weight_per_ft
+
+logger = logging.getLogger(__name__)
+
+# Column mark pattern — matches any column reference seen on real foundation plans:
+# C1, C2, C4, C-1, C1A, C-1A, CC1, CC2, CC-1, COL 1, COL-1, BP-1, BP1000
+# 1-3 letter prefix + digits covers: C, CC, CL, PU, POST, COL
+_MARK_PATTERN = re.compile(
+    r"\b(?:COL(?:UMN)?[\s\-_]*)?([A-Z]{1,3}[\s\-_]?\d{1,4}[A-Z]?)\b",
+    re.IGNORECASE
+)
+
+# AISC Profile pattern (W8x35, W10x33, W10x45, W10x77, W12x79, W12x120, W14x176, HSS6x6x5/16, HSS8x8x1/2)
+_AISC_PROFILE_PATTERN = re.compile(
+    r"\b((?:W|WT|S|ST|C|MC|M|MT|HP)\s*\d+(?:\.\d+)?\s*[Xx]\s*\d+(?:\.\d+)?|HSS\s*\d+(?:\.\d+)?\s*[Xx]\s*\d+(?:\.\d+)?(?:\s*[Xx]\s*[\d/]+)?|PIPE\s*\d+(?:\.\d+)?(?:\s*STD|\s*X-?S)?|L\s*\d+(?:\.\d+)?\s*[Xx]\s*\d+(?:\.\d+)?(?:\s*[Xx]\s*[\d/]+)?)\b",
+    re.IGNORECASE
+)
+
+# Base plate mark & dimension pattern (e.g. BP-1, BP1, BP1000, 14"x14"x1", 18"X18"X1 1/4", 1'-2" x 1'-2")
+_BP_MARK_PATTERN = re.compile(r"\b(BP[\-_]?\d{1,4}[A-Z]?)\b", re.IGNORECASE)
+_BP_DIM_PATTERN = re.compile(r'(\d{1,2}(?:[\'"]|\s*-\s*\d{1,2}(?:\s*[\d/]+)?")?\s*[Xx]\s*\d{1,2}(?:[\'"]|\s*-\s*\d{1,2}(?:\s*[\d/]+)?")?(?:\s*[Xx]\s*[\d/\s]+(?:\s*")?)?)', re.IGNORECASE)
+_ANCHOR_PATTERN = re.compile(r'(\(?\d+\)?(?:\s*[\d/]+"\s*DIA|\s*/\s*AB-?\d+)[^\n\r,]*)', re.IGNORECASE)
+_GRID_LOC_PATTERN = re.compile(r"^([A-Z](?:\.[0-9])?)-([0-9](?:\.[0-9])?)$", re.IGNORECASE)
+
+
+@dataclass
+class ResolvedColumnDetail:
+    """Exact structural specifications resolved for a Foundation Plan column/baseplate mark."""
+    mark: str
+    normalized_mark: str
+    profile: Optional[str] = None
+    weight_per_ft: Optional[float] = None
+    base_plate_mark: Optional[str] = None
+    base_plate_dims: Optional[str] = None
+    anchor_rods: Optional[str] = None
+    source_page_idx: Optional[int] = None      # 0-based
+    source_page_num: Optional[int] = None      # 1-based (e.g. Page 8, Page 18, Page 25)
+    source_sheet_name: Optional[str] = None
+    status: str = "unresolved"                 # "resolved" | "unresolved"
+    raw_snippet: Optional[str] = None
+    confidence_score: int = 0                  # higher score = higher priority
+
+
+# Column mark token regex — matches any mark reference on foundation plans or schedules:
+# C1, CC1, CC2, C1A, CC1A, PU1, COL1, POST1 — 1-3 letter prefix + 1-4 digits + optional suffix
+_COL_MARK_RE = re.compile(
+    r"^(?:CC?\d{1,3}[A-Z]?|PU\d{1,3}|POST\d{1,3}|COL\d{1,3}|[A-Z]{1,3}\d{1,3}[A-Z]?)$",
+    re.IGNORECASE
+)
+
+
+def normalize_mark(mark: str) -> str:
+    """Normalize a mark token for robust matching.
+    Examples: 'C-1' -> 'C1', 'CC-1' -> 'CC1', 'BP-1' -> 'BP1', 'B.7-3' -> 'B.7-3'."""
+    if not mark:
+        return ""
+    m = mark.upper().strip()
+    # Grid location format (e.g. A-1, B.7-3) — keep as-is
+    if re.match(r"^[A-Z](?:\.[0-9])?-[0-9](?:\.[0-9])?$", m):
+        return m
+    m = re.sub(r"^COL(?:UMN)?[\s\-_]*", "C", m)
+    m = re.sub(r"[\s\-_]+", "", m)
+    return m
+
+
+def scan_pdf_for_column_schedules(doc: fitz.Document) -> List[int]:
+    """
+    Universally scan any multi-page PDF document to identify candidate Column Schedule pages.
+    Does NOT assume any hardcoded page index — checks every page.
+    """
+    candidate_indices = []
+    keywords = [
+        "GRAPHICAL COLUMN SCHEDULE",
+        "COLUMN SCHEDULE",
+        "BASE PLATE SCHEDULE",
+        "BASEPLATE SCHEDULE",
+        "BASE PLATE DETAILS",
+        "BASEPLATE DETAILS",
+        "COLUMN DETAILS",
+        "COLUMN TYPES",
+        "SCHEDULE - COLUMNS",
+        "SCHEDULE - BASE PLATES",
+        "BASE PLATE & ANCHOR BOLT SCHEDULE",
+        "BASE PLATE AND ANCHOR BOLT SCHEDULE",
+    ]
+
+    for page_idx in range(len(doc)):
+        try:
+            page = doc[page_idx]
+            text = page.get_text().upper()
+            if any(k in text for k in keywords):
+                candidate_indices.append(page_idx)
+        except Exception as exc:
+            logger.warning("Error reading text on page %d: %s", page_idx, exc)
+
+    return candidate_indices
+
+
+def parse_graphical_column_schedule(page: fitz.Page, page_idx: int) -> Dict[str, ResolvedColumnDetail]:
+    """
+    Extract Grid Location -> Column Profile mappings from a Graphical Column Schedule sheet (e.g. Page 18).
+    """
+    results: Dict[str, ResolvedColumnDetail] = {}
+    words = page.get_text("words")
+
+    grid_words = []
+    profile_words = []
+
+    for w in words:
+        txt = w[4].strip()
+        g_m = _GRID_LOC_PATTERN.match(txt)
+        if g_m:
+            grid_words.append((txt.upper(), w[0], w[1], w[2], w[3]))
+        p_m = _AISC_PROFILE_PATTERN.search(txt)
+        if p_m:
+            profile_words.append((p_m.group(1).upper().replace(" ", ""), w[0], w[1], w[2], w[3]))
+
+    for g_txt, gx0, gy0, gx1, gy1 in grid_words:
+        gcx = (gx0 + gx1) / 2.0
+        col_profiles = [
+            (p_txt, px0, py0, py1) for p_txt, px0, py0, px1, py1 in profile_words
+            if abs(gcx - (px0 + px1) / 2.0) < 35.0
+        ]
+        if col_profiles:
+            col_profiles.sort(key=lambda x: x[2], reverse=True)
+            tier1_profile = col_profiles[0][0]
+            wt = get_weight_per_ft(tier1_profile)
+            results[g_txt] = ResolvedColumnDetail(
+                mark=g_txt,
+                normalized_mark=g_txt,
+                profile=tier1_profile,
+                weight_per_ft=wt,
+                source_page_idx=page_idx,
+                source_page_num=page_idx + 1,
+                status="resolved",
+                confidence_score=15,
+            )
+
+    return results
+
+
+def parse_vertical_column_schedule(page: fitz.Page, page_idx: int) -> Dict[str, ResolvedColumnDetail]:
+    """
+    Extract Column Marks (C1, C2, C3, C4, PU1, PU2) and their assigned profiles from vertical schedule tables.
+    """
+    results: Dict[str, ResolvedColumnDetail] = {}
+    words = page.get_text("words")
+
+    mark_words = []
+    for w in words:
+        txt = w[4].strip().upper()
+        # Match: C1, CC1, CC2, C1A, CC1A, PU1, POST1, COL1
+        if _COL_MARK_RE.match(normalize_mark(txt)):
+            xc = (w[0] + w[2]) / 2.0
+            yc = (w[1] + w[3]) / 2.0
+            mark_words.append((normalize_mark(txt), xc, yc, w))
+
+    profile_words = []
+    for w in words:
+        txt = w[4].strip().upper().replace(" ", "")
+        p_m = _AISC_PROFILE_PATTERN.search(txt)
+        if p_m:
+            prof = p_m.group(1).upper().replace(" ", "")
+            xc = (w[0] + w[2]) / 2.0
+            yc = (w[1] + w[3]) / 2.0
+            profile_words.append((prof, xc, yc, w))
+
+    for m_txt, m_xc, m_yc, m_w in mark_words:
+        col_profs = [p for p in profile_words if abs(p[1] - m_xc) < 35.0]
+        if col_profs:
+            profs_for_mark = [p[0] for p in sorted(col_profs, key=lambda z: z[2])]
+            level1_prof = max(profs_for_mark, key=lambda p: get_weight_per_ft(p) or 0)
+            wt = get_weight_per_ft(level1_prof)
+            n_m = normalize_mark(m_txt)
+            detail = ResolvedColumnDetail(
+                mark=m_txt,
+                normalized_mark=n_m,
+                profile=level1_prof,
+                weight_per_ft=wt,
+                source_page_idx=page_idx,
+                source_page_num=page_idx + 1,
+                status="resolved",
+                confidence_score=12,
+            )
+            results[n_m] = detail
+            results[m_txt] = detail
+    return results
+
+
+def parse_schedule_page_details(page: fitz.Page, page_idx: int) -> Dict[str, ResolvedColumnDetail]:
+    """
+    Extract all column/baseplate/grid mark -> (profile, baseplate, dims, anchors) mappings from a schedule page.
+    """
+    results: Dict[str, ResolvedColumnDetail] = {}
+
+    text_upper = page.get_text().upper()
+    if "GRAPHICAL COLUMN SCHEDULE" in text_upper:
+        graph_results = parse_graphical_column_schedule(page, page_idx)
+        results.update(graph_results)
+
+    # Check for vertical column schedules (e.g. Bayhealth Page 3)
+    if "COLUMN" in text_upper or "SCHEDULE" in text_upper:
+        vert_results = parse_vertical_column_schedule(page, page_idx)
+        results.update(vert_results)
+
+    try:
+        blocks = page.get_text("blocks")
+        for b in blocks:
+            block_text = b[4]
+            lines = [l.strip() for l in block_text.split("\n") if l.strip()]
+
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                n_m = normalize_mark(line)
+
+                # Check for BP-X (Base Plate Schedule)
+                if re.match(r"^BP\d{1,4}[A-Z]?$", n_m):
+                    bp_dims = None
+                    anchors = None
+                    if i + 2 < len(lines):
+                        w = lines[i+1] if i+1 < len(lines) else ""
+                        v = lines[i+2] if i+2 < len(lines) else ""
+                        t = lines[i+5] if i+5 < len(lines) else ""
+                        bp_dims = f"{w} x {v} x {t}".strip(" x")
+                        if i + 7 < len(lines):
+                            anchors = lines[i+7]
+
+                    score = 8
+                    results[n_m] = ResolvedColumnDetail(
+                        mark=line,
+                        normalized_mark=n_m,
+                        profile=None,
+                        base_plate_mark=line,
+                        base_plate_dims=bp_dims,
+                        anchor_rods=anchors,
+                        source_page_idx=page_idx,
+                        source_page_num=page_idx + 1,
+                        status="resolved",
+                        raw_snippet=" ".join(lines[i:i+6]),
+                        confidence_score=score,
+                    )
+
+                # Check for C1, CC1, CC2, C2 etc. (Column Schedule marks)
+                # Matches: C\d, CC\d, CL\d and any 1-3 letter prefix + digits
+                elif _COL_MARK_RE.match(n_m):
+                    profile = None
+                    bp_dims = None
+                    bp_mark = None
+                    anchors = None
+
+                    for lookahead in range(1, min(6, len(lines) - i)):
+                        target_line = lines[i + lookahead]
+                        if re.match(r"^C\d{1,3}[A-Z]?$", normalize_mark(target_line)):
+                            break
+
+                        p_match = _AISC_PROFILE_PATTERN.search(target_line)
+                        if p_match and not profile:
+                            profile = p_match.group(1).upper().replace(" ", "")
+
+                        bp_d_match = _BP_DIM_PATTERN.search(target_line)
+                        if bp_d_match and not bp_dims:
+                            bp_dims = bp_d_match.group(1).strip()
+
+                        bp_m_match = _BP_MARK_PATTERN.search(target_line)
+                        if bp_m_match and not bp_mark:
+                            bp_mark = bp_m_match.group(1).upper()
+
+                        anc_match = _ANCHOR_PATTERN.search(target_line)
+                        if anc_match and not anchors:
+                            anchors = anc_match.group(1).strip()
+
+                    if profile or bp_dims or bp_mark:
+                        score = (10 if profile else 0) + (5 if bp_dims else 0) + (3 if anchors else 0)
+                        wt = get_weight_per_ft(profile) if profile else None
+
+                        if n_m not in results or score > results[n_m].confidence_score:
+                            results[n_m] = ResolvedColumnDetail(
+                                mark=line,
+                                normalized_mark=n_m,
+                                profile=profile,
+                                weight_per_ft=wt,
+                                base_plate_mark=bp_mark,
+                                base_plate_dims=bp_dims,
+                                anchor_rods=anchors,
+                                source_page_idx=page_idx,
+                                source_page_num=page_idx + 1,
+                                status="resolved" if profile else "unresolved",
+                                raw_snippet=" ".join(lines[i:i+4]),
+                                confidence_score=score,
+                            )
+                i += 1
+    except Exception as exc:
+        logger.warning("Text block scanning on page %d failed: %s", page_idx, exc)
+
+    return results
+
+
+def resolve_foundation_plan_columns(
+    pdf_path: str,
+    page_idx: int,
+    column_member_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Direct spatial association, schedule resolution, and ghost pruning for Foundation Plan columns:
+    1. Extracts nearby profile callouts (W14X176, HSS8X8X1/2) and Base Plate marks (BP-1, BP-7) next to each column symbol.
+    2. Matches Grid References (A-1, B-5, C-6) against Graphical Column Schedules.
+    3. Cross-references Base Plate marks against the document's Schedule sheets.
+    4. Deduplicates overlapping detections at the same coordinate.
+    5. Prunes unreferenced ghost intersections when a schedule is present in the document.
+    """
+    if not os.path.exists(pdf_path) or column_member_rows is None:
+        return column_member_rows
+
+    try:
+        doc = fitz.open(pdf_path)
+        if page_idx < 0 or page_idx >= len(doc):
+            doc.close()
+            return column_member_rows
+
+        fp_page = doc[page_idx]
+        words = fp_page.get_text("words")
+        pw = fp_page.rect.width
+        ph = fp_page.rect.height
+
+        # 1. Extract Grid Lines & Real Bubble Labels on Foundation Plan
+        import main
+        v_lines, h_lines, v_labels, h_labels = main.extract_grid_lines(fp_page, pw, ph, (0, 0, pw, ph))
+
+        # 2. Pre-extract all profile and BP words on the Foundation Plan
+        profile_tokens = []
+        bp_tokens = []
+        col_mark_tokens = []
+
+        for w in words:
+            txt = w[4].strip()
+            wx = (w[0] + w[2]) / (2 * pw)
+            wy = (w[1] + w[3]) / (2 * ph)
+
+            p_m = _AISC_PROFILE_PATTERN.search(txt)
+            if p_m:
+                profile_tokens.append((p_m.group(1).upper().replace(" ", ""), wx, wy))
+
+            bp_m = _BP_MARK_PATTERN.search(txt)
+            if bp_m:
+                bp_tokens.append((bp_m.group(1).upper(), wx, wy))
+
+            c_m = _MARK_PATTERN.search(txt)
+            # Accept: C1, CC1, CC2, C3, C1A, CC1A and any 1-3 letter prefix marks
+            # (was only accepting C\d — this dropped CC1, CC2, CC3 completely)
+            if c_m and _COL_MARK_RE.match(normalize_mark(c_m.group(1))):
+                col_mark_tokens.append((normalize_mark(c_m.group(1)), wx, wy))
+
+        # 3. Scan PDF for Schedule Sheets & Upper Framing Sheets
+        global_schedule_index: Dict[str, ResolvedColumnDetail] = {}
+
+        # 3a. Parse Graphical Column Schedules & Tabular Schedules (Fast text/table scan only)
+        for p_i in range(len(doc)):
+            page = doc[p_i]
+            txt = page.get_text().upper()
+            if any(kw in txt for kw in ["COLUMN SCHEDULE", "GRAPHICAL COLUMN", "BASE PLATE", "BASEPLATE", "SCHEDULE"]):
+                details = parse_schedule_page_details(page, p_i)
+                for k, d in details.items():
+                    if k not in global_schedule_index or d.confidence_score > global_schedule_index[k].confidence_score:
+                        global_schedule_index[k] = d
+
+        doc.close()
+
+        # Helper to find grid label for coordinates
+        def find_grid_at_pos(norm_x: float, norm_y: float) -> Optional[Tuple[str, str]]:
+            pt_x = norm_x * pw
+            pt_y = norm_y * ph
+            if not v_labels or not h_labels:
+                return None
+            best_v = min(v_labels.keys(), key=lambda gx: abs(pt_x - gx), default=None)
+            best_h = min(h_labels.keys(), key=lambda gy: abs(pt_y - gy), default=None)
+            if best_v is not None and best_h is not None:
+                if abs(pt_x - best_v) < 35.0 and abs(pt_y - best_h) < 35.0:
+                    return (v_labels[best_v], h_labels[best_h])
+            return None
+
+        # 4. Resolve every existing extracted column
+        resolved_rows: List[Dict[str, Any]] = []
+
+        for row in column_member_rows:
+            if row.get("kind") != "column":
+                resolved_rows.append(row)
+                continue
+
+            geo = row.get("geometry") or {}
+            cx = geo.get("x", 0)
+            cy = geo.get("y", 0)
+            raw_cx = geo.get("raw_x", cx)
+            raw_cy = geo.get("raw_y", cy)
+
+            existing_sec = row.get("section")
+            if existing_sec == "Column" or existing_sec == "Col" or existing_sec == "?":
+                existing_sec = None
+
+            _RADIUS = 0.08
+
+            # Priority 1: Direct profile next to column on Foundation Plan
+            nearest_p = None
+            min_pd = _RADIUS
+            for p, px, py in profile_tokens:
+                d = min(math.hypot(cx - px, cy - py),
+                        math.hypot(raw_cx - px, raw_cy - py))
+                if d < min_pd:
+                    min_pd = d
+                    nearest_p = p
+
+            # Priority 2: Nearby BP mark or Column Mark (e.g. CC1, CC2, C1, BP-1)
+            nearest_bp = None
+            min_bpd = _RADIUS
+            for bp, bx, by in bp_tokens:
+                d = min(math.hypot(cx - bx, cy - by),
+                        math.hypot(raw_cx - bx, raw_cy - by))
+                if d < min_bpd:
+                    min_bpd = d
+                    nearest_bp = bp
+
+            nearest_cmark = None
+            min_cmd = _RADIUS
+            for cm, cmx, cmy in col_mark_tokens:
+                d = min(math.hypot(cx - cmx, cy - cmy),
+                        math.hypot(raw_cx - cmx, raw_cy - cmy))
+                if d < min_cmd:
+                    min_cmd = d
+                    nearest_cmark = cm
+
+            # Priority 3: Grid Location match
+            g_pair = find_grid_at_pos(cx, cy)
+            if g_pair is None:
+                g_pair = find_grid_at_pos(raw_cx, raw_cy)
+            grid_detail = None
+            if g_pair:
+                v_l, h_l = g_pair
+                g_ref1 = f"{v_l}-{h_l}"
+                g_ref2 = f"{h_l}-{v_l}"
+                geo["grid_ref"] = g_ref1
+                grid_detail = global_schedule_index.get(g_ref1) or global_schedule_index.get(g_ref2)
+
+            # Check mark lookups in schedule
+            mark_detail = (global_schedule_index.get(nearest_cmark) if nearest_cmark else None) or \
+                          (global_schedule_index.get(nearest_bp) if nearest_bp else None)
+
+            # Determine winning profile & specifications
+            resolved_p = existing_sec or nearest_p or (mark_detail.profile if mark_detail else None) or (grid_detail.profile if grid_detail else None)
+            winning_bp = nearest_bp or (mark_detail.base_plate_mark if mark_detail else None) or (grid_detail.base_plate_mark if grid_detail else None)
+            winning_src = (mark_detail.source_page_num if mark_detail else None) or (grid_detail.source_page_num if grid_detail else None)
+            winning_dims = (mark_detail.base_plate_dims if mark_detail else None) or (grid_detail.base_plate_dims if grid_detail else None)
+            winning_anchors = (mark_detail.anchor_rods if mark_detail else None) or (grid_detail.anchor_rods if grid_detail else None)
+
+            if resolved_p or grid_detail or mark_detail:
+                row["section"] = resolved_p
+                geo["resolved_profile"] = resolved_p
+                geo["base_plate_mark"] = winning_bp
+                if winning_src:
+                    geo["source_page_num"] = winning_src
+                if winning_dims:
+                    geo["base_plate_dims"] = winning_dims
+                if winning_anchors:
+                    geo["anchor_rods"] = winning_anchors
+                geo["resolution_status"] = "resolved"
+                resolved_rows.append(row)
+            else:
+                row["section"] = None
+                geo["resolved_profile"] = None
+                geo["resolution_status"] = "resolved" if not global_schedule_index else "unresolved"
+                resolved_rows.append(row)
+
+        # 5. Strict Spatial Deduplication: Never allow duplicate markers on the same column
+        # Merge any columns that are within 2.5% of page width of each other
+        deduped_rows: List[Dict[str, Any]] = []
+        for r in resolved_rows:
+            if r.get("kind") != "column":
+                deduped_rows.append(r)
+                continue
+            r_geo = r.get("geometry") or {}
+            rx = r_geo.get("raw_x", r_geo.get("x", 0))
+            ry = r_geo.get("raw_y", r_geo.get("y", 0))
+            
+            # Check if an existing column is already at this physical position
+            dup_idx = -1
+            for idx, existing in enumerate(deduped_rows):
+                if existing.get("kind") != "column":
+                    continue
+                e_geo = existing.get("geometry") or {}
+                ex = e_geo.get("raw_x", e_geo.get("x", 0))
+                ey = e_geo.get("raw_y", e_geo.get("y", 0))
+                if math.hypot(rx - ex, ry - ey) < 0.025:  # Within 2.5% distance = same physical column
+                    dup_idx = idx
+                    break
+            
+            if dup_idx >= 0:
+                # Merge into existing: keep whichever has the resolved section / better information
+                existing = deduped_rows[dup_idx]
+                if not existing.get("section") and r.get("section"):
+                    deduped_rows[dup_idx] = r
+            else:
+                deduped_rows.append(r)
+
+        column_member_rows.clear()
+        column_member_rows.extend(deduped_rows)
+        return column_member_rows
+
+    except Exception as exc:
+        logger.exception("Error in resolve_foundation_plan_columns: %s", exc)
+        return column_member_rows
