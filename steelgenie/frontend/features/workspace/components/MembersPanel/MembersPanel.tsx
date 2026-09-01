@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { FileSpreadsheet, AlertTriangle } from 'lucide-react'
+import { useWorkspaceStore } from '../../../../lib/stores/workspaceStore'
 
 interface Member {
   id: string
@@ -24,6 +25,7 @@ const needsReview = (m: Member) =>
   m.status === 'need_review' || m.section === null || (m.confidence !== null && m.confidence !== undefined && m.confidence < 0.7)
 
 export function MembersPanel({ members, selectedMemberId, onSelectMember }: MembersPanelProps) {
+  const { selectedRatio, imageNaturalWidth, imageAspect } = useWorkspaceStore()
   const [reviewOnly, setReviewOnly] = useState(false)
 
   const reviewCount = members.filter(needsReview).length
@@ -174,11 +176,14 @@ export function MembersPanel({ members, selectedMemberId, onSelectMember }: Memb
               >
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                   <span style={{ fontSize: '12px', fontWeight: 700, color: '#F1F5F9', display: 'flex', alignItems: 'center', gap: '5px' }}>
-                    {m.section || 'Unlabelled'}
+                    {m.section || ((m.geometry as any)?.grid_ref ? `Col @ ${(m.geometry as any).grid_ref}` : (m.geometry as any)?.grid_tag || 'Unlabelled')}
                     {review && <AlertTriangle size={10} style={{ color: '#F59E0B' }} />}
                   </span>
                   <span style={{ fontSize: '10px', color: '#94A3B8' }}>
                     {getMemberKindLabel(m.kind)}
+                    {(m.geometry as any)?.grid_ref && (
+                      <span style={{ color: '#38BDF8', fontWeight: 600 }}> · Grid {(m.geometry as any).grid_ref}</span>
+                    )}
                     {m.source === 'manual' && <span style={{ color: '#8B5CF6' }}> · manual</span>}
                     {m.confidence !== null && m.confidence !== undefined && (
                       <span style={{ color: m.confidence >= 0.7 ? '#10B981' : '#F59E0B' }}>
@@ -187,11 +192,34 @@ export function MembersPanel({ members, selectedMemberId, onSelectMember }: Memb
                     )}
                   </span>
                 </div>
-                {m.length_ft !== null && (
-                  <span style={{ fontSize: '11px', color: '#60A5FA', fontWeight: 600 }}>
-                    {m.length_ft.toFixed(1)}'
-                  </span>
-                )}
+                {(() => {
+                  const len = m.length_ft && m.length_ft > 0 ? m.length_ft : (() => {
+                    const geo = m.geometry || {}
+                    const bx1 = geo.bx1 ?? (m as any).bx1
+                    const by1 = geo.by1 ?? (m as any).by1
+                    const bx2 = geo.bx2 ?? (m as any).bx2
+                    const by2 = geo.by2 ?? (m as any).by2
+                    if (bx1 !== undefined && bx1 !== null && bx2 !== undefined && bx2 !== null && (bx1 !== bx2 || by1 !== by2)) {
+                      const ratio = selectedRatio || 96
+                      const ppf = 864.0 / ratio
+                      // Preview images are rendered at 150 DPI by the ingest worker.
+                      // PDF points = pixels × (72 / 150). Fall back to ANSI-D-sized
+                      // defaults (2448 × 1584 pts) only when the image hasn't loaded yet.
+                      const PREVIEW_DPI = 150
+                      const pageWPt = imageNaturalWidth ? imageNaturalWidth * (72 / PREVIEW_DPI) : 2448
+                      const pageHPt = imageNaturalWidth ? imageNaturalWidth * imageAspect * (72 / PREVIEW_DPI) : 1584
+                      const lenPt = Math.hypot((bx2 - bx1) * pageWPt, (by2 - by1) * pageHPt)
+                      const cFt = lenPt / ppf
+                      if (cFt >= 2.0 && cFt <= 150.0) return Math.round(cFt * 10) / 10
+                    }
+                    return null
+                  })()
+                  return len !== null ? (
+                    <span style={{ fontSize: '11px', color: '#60A5FA', fontWeight: 600 }}>
+                      {len.toFixed(1)}'
+                    </span>
+                  ) : null
+                })()}
               </div>
             )
           })

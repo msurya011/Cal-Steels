@@ -12,6 +12,7 @@ import time
 import base64
 import os
 import io
+import json
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -342,14 +343,11 @@ def _snap_to_columns_along_axis(x1: float, y1: float,
 
     ux, uy = dx / ln, dy / ln   # unit along beam
     px, py = -uy, ux            # unit perpendicular
-
-    # Snap each end to the NEAREST column beyond it (not the furthest).
-    # Taking the nearest is what makes a larger snap_dist safe: the endpoint
-    # connects to the immediately-adjacent column and never jumps a bay.
-    # Because targets are real column centres, this can never fly into empty
-    # space the way a generic line-extension can.
-    best_left_t  = None   # nearest column just BEFORE x1  (t < 0)
-    best_right_t = None   # nearest column just AFTER  x2  (t > ln)
+    # Snap each end to the NEAREST column (within snap_dist).
+    # Handles both short-drawn beams (extending to column centre) AND
+    # overshooting beams (trimming back from foundation/wall to column centre).
+    best_left_t  = None   # nearest column around x1  (|t| <= snap_dist)
+    best_right_t = None   # nearest column around x2  (|t - ln| <= snap_dist)
 
     for sym in col_syms:
         cx, cy = sym["cx"], sym["cy"]
@@ -360,14 +358,14 @@ def _snap_to_columns_along_axis(x1: float, y1: float,
         if perp > perp_tol:
             continue   # column is not on this beam's axis
 
-        # Left end: column before x1 — keep the one closest to x1 (t nearest 0)
-        if -snap_dist <= t < 0:
-            if best_left_t is None or t > best_left_t:
+        # Left end: column within snap_dist of x1 (before or after x1)
+        if abs(t) <= snap_dist and (ln - t) > 10.0:
+            if best_left_t is None or abs(t) < abs(best_left_t):
                 best_left_t = t
 
-        # Right end: column past x2 — keep the one closest to x2 (t nearest ln)
-        if ln < t <= ln + snap_dist:
-            if best_right_t is None or t < best_right_t:
+        # Right end: column within snap_dist of x2 (before or after x2)
+        if abs(t - ln) <= snap_dist and t > 10.0:
+            if best_right_t is None or abs(t - ln) < abs(best_right_t - ln):
                 best_right_t = t
 
     ox1, oy1 = x1, y1   # keep original origin for right-end computation
@@ -1031,7 +1029,7 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             # drafter slack.  Crucially, when NO column line is within this
             # range the endpoint KEEPS its drawn position instead of flying out
             # to a far grid/perimeter line in empty space (the overshoot bug).
-            _EXT_MAX = max(15, min(45, pts_per_foot * 2.5)) if pts_per_foot > 0 else 25.0
+            _EXT_MAX = max(25, min(65, pts_per_foot * 3.5)) if pts_per_foot > 0 else 35.0
             _adx, _ady = abs(lx2 - lx1), abs(ly2 - ly1)
             _is_H = _adx > _ady * 2
             _is_V = _ady > _adx * 2
@@ -4717,25 +4715,147 @@ def dedup_overlapping_beams(members, page_w, page_h, pts_per_foot):
 # the number after the last 'X' (e.g. W12X19 = 19 lb/ft, C12X20.7 = 20.7 lb/ft),
 # so no table is needed for them.  HSS / L / PIPE designations are DIMENSIONAL,
 # so their weights come from a small AISC lookup (extend as needed).
+# ── AISC 15th & 16th Edition Official Weight Tables (Table 1-11, 1-12, 1-7) ──
 _DIM_SHAPE_WT = {
-    "HSS6X6X3/8": 27.48, "HSS6X6X1/4": 19.02, "HSS6X6X5/16": 23.34,
-    "HSS12X6X3/8": 41.11, "HSS8X8X1/4": 25.82, "HSS8X8X3/8": 37.69,
-    "HSS4X4X1/4": 12.21, "HSS5X5X1/4": 15.62, "HSS10X10X3/8": 47.90,
-    "L4X4": 12.8,        # L4X4X3/8 (common default); thickness-specific if given
+    # ── Square HSS (AISC Table 1-12) ──
+    "HSS16X16X5/8": 127.40, "HSS16X16X1/2": 103.30, "HSS16X16X3/8": 78.60,
+    "HSS14X14X5/8": 110.40, "HSS14X14X1/2": 89.68, "HSS14X14X3/8": 68.37,
+    "HSS12X12X5/8": 93.36, "HSS12X12X1/2": 76.07, "HSS12X12X3/8": 58.10, "HSS12X12X5/16": 49.00, "HSS12X12X1/4": 39.43,
+    "HSS10X10X5/8": 76.34, "HSS10X10X1/2": 62.46, "HSS10X10X3/8": 47.90, "HSS10X10X5/16": 40.35, "HSS10X10X1/4": 32.63,
+    "HSS8X8X5/8": 59.32, "HSS8X8X1/2": 47.35, "HSS8X8X3/8": 37.69, "HSS8X8X5/16": 31.84, "HSS8X8X1/4": 25.82, "HSS8X8X3/16": 19.63,
+    "HSS7X7X1/2": 42.05, "HSS7X7X3/8": 32.58, "HSS7X7X5/16": 27.59, "HSS7X7X1/4": 22.42,
+    "HSS6X6X5/8": 42.30, "HSS6X6X1/2": 35.05, "HSS6X6X3/8": 27.48, "HSS6X6X5/16": 23.34, "HSS6X6X1/4": 19.02, "HSS6X6X3/16": 14.53,
+    "HSS5X5X1/2": 28.25, "HSS5X5X3/8": 22.37, "HSS5X5X5/16": 19.08, "HSS5X5X1/4": 15.62, "HSS5X5X3/16": 11.97,
+    "HSS4X4X1/2": 21.46, "HSS4X4X3/8": 17.27, "HSS4X4X5/16": 14.83, "HSS4X4X1/4": 12.21, "HSS4X4X3/16": 9.42, "HSS4X4X1/8": 6.46,
+    "HSS3.5X3.5X1/4": 10.51, "HSS3.5X3.5X3/16": 8.15,
+    "HSS3X3X3/8": 12.17, "HSS3X3X5/16": 10.58, "HSS3X3X1/4": 8.81, "HSS3X3X3/16": 6.87,
+    "HSS2.5X2.5X1/4": 7.11, "HSS2.5X2.5X3/16": 5.59,
+    "HSS2X2X1/4": 5.41, "HSS2X2X3/16": 4.32, "HSS2X2X1/8": 3.05,
+
+    # ── Rectangular HSS (AISC Table 1-11) ──
+    "HSS16X12X5/8": 110.40, "HSS16X12X1/2": 89.68, "HSS16X12X3/8": 68.37,
+    "HSS16X8X1/2": 76.07, "HSS16X8X3/8": 58.10,
+    "HSS14X10X1/2": 76.07, "HSS14X10X3/8": 58.10,
+    "HSS14X6X1/2": 62.46, "HSS14X6X3/8": 47.90,
+    "HSS12X10X1/2": 69.26, "HSS12X10X3/8": 53.00,
+    "HSS12X8X5/8": 76.34, "HSS12X8X1/2": 62.46, "HSS12X8X3/8": 47.90, "HSS12X8X5/16": 40.35, "HSS12X8X1/4": 32.63,
+    "HSS12X6X1/2": 55.66, "HSS12X6X3/8": 42.79, "HSS12X6X5/16": 36.10, "HSS12X6X1/4": 29.23,
+    "HSS12X4X3/8": 37.69, "HSS12X4X1/4": 25.82,
+    "HSS10X8X1/2": 55.66, "HSS10X8X3/8": 42.79, "HSS10X8X5/16": 36.10, "HSS10X8X1/4": 29.23,
+    "HSS10X6X1/2": 47.35, "HSS10X6X3/8": 37.69, "HSS10X6X5/16": 31.84, "HSS10X6X1/4": 25.82,
+    "HSS10X4X3/8": 32.58, "HSS10X4X5/16": 27.59, "HSS10X4X1/4": 22.42,
+    "HSS8X6X1/2": 42.05, "HSS8X6X3/8": 32.58, "HSS8X6X5/16": 27.59, "HSS8X6X1/4": 22.42,
+    "HSS8X4X1/2": 35.05, "HSS8X4X3/8": 27.48, "HSS8X4X5/16": 23.34, "HSS8X4X1/4": 19.02, "HSS8X4X3/16": 14.53,
+    "HSS6X4X1/2": 28.25, "HSS6X4X3/8": 22.37, "HSS6X4X5/16": 19.08, "HSS6X4X1/4": 15.62, "HSS6X4X3/16": 11.97,
+    "HSS6X3X3/8": 19.82, "HSS6X3X1/4": 13.92,
+    "HSS6X2X1/4": 12.21,
+    "HSS5X3X3/8": 17.27, "HSS5X3X1/4": 12.21,
+    "HSS4X3X3/8": 14.72, "HSS4X3X1/4": 10.51,
+    "HSS4X2X1/4": 8.81, "HSS4X2X3/16": 6.87,
+
+    # ── Angles (AISC Table 1-7) ──
+    "L8X8X1": 51.0, "L8X8X7/8": 45.0, "L8X8X3/4": 38.9, "L8X8X5/8": 32.8, "L8X8X1/2": 26.4,
+    "L6X6X1": 37.4, "L6X6X7/8": 33.1, "L6X6X3/4": 28.7, "L6X6X5/8": 24.2, "L6X6X1/2": 19.6, "L6X6X3/8": 14.9,
+    "L5X5X7/8": 27.2, "L5X5X3/4": 23.6, "L5X5X5/8": 20.0, "L5X5X1/2": 16.2, "L5X5X3/8": 12.3, "L5X5X5/16": 10.3,
+    "L4X4X3/4": 18.5, "L4X4X5/8": 15.7, "L4X4X1/2": 12.8, "L4X4X3/8": 9.8, "L4X4X5/16": 8.2, "L4X4X1/4": 6.6,
+    "L3.5X3.5X1/2": 11.1, "L3.5X3.5X3/8": 8.5, "L3.5X3.5X1/4": 5.8,
+    "L3X3X1/2": 9.4, "L3X3X3/8": 7.2, "L3X3X5/16": 6.1, "L3X3X1/4": 4.9, "L3X3X3/16": 3.71,
+    "L2.5X2.5X3/8": 5.9, "L2.5X2.5X5/16": 5.0, "L2.5X2.5X1/4": 4.1, "L2.5X2.5X3/16": 3.07,
+    "L2X2X3/8": 4.7, "L2X2X5/16": 3.92, "L2X2X1/4": 3.19, "L2X2X3/16": 2.44, "L2X2X1/8": 1.65,
+}
+
+# ── Dynamic Master AISC Database Loader ──
+_AISC_JSON_PATH = os.path.join(os.path.dirname(__file__), "data", "aisc_v16_shapes.json")
+if os.path.exists(_AISC_JSON_PATH):
+    try:
+        with open(_AISC_JSON_PATH, "r", encoding="utf-8") as _f:
+            _ext_db = json.load(_f)
+            for _k, _v in _ext_db.items():
+                if isinstance(_v, dict) and "weight_lb_ft" in _v:
+                    _DIM_SHAPE_WT[_k] = float(_v["weight_lb_ft"])
+            print(f"[AISC] Loaded {len(_ext_db)} shapes from external AISC database")
+    except Exception as _e:
+        print(f"[AISC] Error loading external database: {_e}")
+
+_THICKNESS_DECIMAL_MAP = {
+    0.125: "1/8", 0.1875: "3/16", 0.188: "3/16",
+    0.25: "1/4", 0.250: "1/4",
+    0.3125: "5/16", 0.312: "5/16", 0.313: "5/16",
+    0.375: "3/8",
+    0.5: "1/2", 0.500: "1/2",
+    0.625: "5/8",
+    0.75: "3/4", 0.750: "3/4",
+    0.875: "7/8",
+    1.0: "1", 1.000: "1",
 }
 
 def profile_weight_per_ft(profile):
-    """Nominal weight in lb/ft for a steel section label, or None if unknown."""
-    p = (profile or "").upper().strip()
+    """Nominal weight in lb/ft for an AISC structural steel section label (AISC 15 & 16)."""
+    p = (profile or "").upper().strip().replace(" ", "").replace("×", "X")
     if not p:
         return None
+    
+    # 1. Self-encoding standard profiles: [Shape][Depth]X[Weight_lb_ft]
+    #    e.g. W16X31 -> 31 lb/ft, W24X84 -> 84 lb/ft, C12X20.7 -> 20.7 lb/ft, WT8X15.5 -> 15.5 lb/ft
     m = re.match(r'^(?:W|C|MC|S|HP|WT|MT|ST|M)\d+(?:\.\d+)?X(\d+(?:\.\d+)?)$', p)
-    if m:                                  # weight encoded in the designation
+    if m:
         return float(m.group(1))
+
+    # 2. Normalize decimal thicknesses in HSS / L keys (e.g. HSS8X8X.500 -> HSS8X8X1/2)
+    norm_p = p
+    hss_dec = re.match(r'^(HSS|2?L)(\d+(?:\.\d+)?X\d+(?:\.\d+)?X)(0?\.\d+)$', p)
+    if hss_dec:
+        prefix, dims, dec_str = hss_dec.group(1), hss_dec.group(2), float(hss_dec.group(3))
+        # Find closest standard thickness
+        best_frac = None
+        for dec_val, frac_str in _THICKNESS_DECIMAL_MAP.items():
+            if abs(dec_str - dec_val) < 0.015:
+                best_frac = frac_str
+                break
+        if best_frac:
+            norm_p = f"{prefix}{dims}{best_frac}"
+
+    # 3. Known AISC 15 & 16 Table 1-11 / 1-12 / 1-7 lookup
+    if norm_p in _DIM_SHAPE_WT:
+        return _DIM_SHAPE_WT[norm_p]
     if p in _DIM_SHAPE_WT:
         return _DIM_SHAPE_WT[p]
-    # HSS prefix without an exact table hit → try the base "HSSaXbXt" key as-is
-    return _DIM_SHAPE_WT.get(p)
+
+    # 4. Dynamic HSS weight calculation (AISC formula with corner radius deduction)
+    hss_match = re.match(r'^HSS(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)X([\d/]+|\d+\.\d+)$', p)
+    if hss_match:
+        try:
+            h = float(hss_match.group(1))
+            w = float(hss_match.group(2))
+            t_str = hss_match.group(3)
+            t = (float(t_str.split('/')[0]) / float(t_str.split('/')[1])) if '/' in t_str else float(t_str)
+            # AISC Exact Corner-Radius Adjusted Area Formula
+            # Outside radius Ro = 2.25 * t, Inside radius Ri = 1.25 * t
+            # Area = 2*t*(h + w - 2*t) - (4 - pi)*(2*t^2)
+            area = 2.0 * t * (h + w - 2.0 * t) - 0.8584 * (t ** 2)
+            # Steel density = 3.4 lb/(ft * in^2)
+            return round(area * 3.4, 2)
+        except Exception:
+            pass
+
+    # 5. Dynamic Angle (L) weight calculation
+    l_match = re.match(r'^(2?L)(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)X([\d/]+|\d+\.\d+)$', p)
+    if l_match:
+        try:
+            is_double = l_match.group(1).startswith('2')
+            l1 = float(l_match.group(2))
+            l2 = float(l_match.group(3))
+            t_str = l_match.group(4)
+            t = (float(t_str.split('/')[0]) / float(t_str.split('/')[1])) if '/' in t_str else float(t_str)
+            area = (l1 + l2 - t) * t
+            wt = area * 3.4
+            if is_double:
+                wt *= 2.0
+            return round(wt, 2)
+        except Exception:
+            pass
+
+    return None
 
 
 def build_summary(members):
@@ -5521,9 +5641,9 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
 
     existing_with_raw = [
         (m["x"] * page_w, m["y"] * page_h,
-         (m.get("geometry", {}).get("raw_x") or m["x"]) * page_w,
-         (m.get("geometry", {}).get("raw_y") or m["y"]) * page_h)
-        for m in members if m.get("type") == "column"
+         ((m.get("geometry") or {}).get("raw_x") or m["x"]) * page_w,
+         ((m.get("geometry") or {}).get("raw_y") or m["y"]) * page_h)
+        for m in members if m.get("type") == "column" and m.get("x") is not None and m.get("y") is not None
     ]
     added: list[tuple[float, float, float, float]] = []
 
@@ -5588,13 +5708,8 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
             prof = (m.get("profile") or "").upper().strip()
             if prof and _COL_PROFILE_RE.match(prof):
                 _col_profile_counts[prof] = _col_profile_counts.get(prof, 0) + 1
-    if profiles:
-        for p in profiles:
-            prof = (p.get("profile") or "").upper().strip()
-            if prof and _COL_PROFILE_RE.match(prof):
-                _col_profile_counts[prof] = _col_profile_counts.get(prof, 0) + 1
     _guessed_profile = (max(_col_profile_counts, key=_col_profile_counts.get)
-                         if _col_profile_counts else "W12X40")
+                         if _col_profile_counts else None)
 
     beam_ends = []
     beam_end_dirs: dict[tuple[float, float], str] = {}
@@ -7419,8 +7534,18 @@ async def analyse_pdf(req: AnalysisRequest):
         print(f"{'='*60}\n")
         # ─────────────────────────────────────────────────────────────────────
 
-        # 5. Scale → pts per foot (from user-selected drawing scale)
-        pts_per_foot = scale_to_pts_per_foot(req.scale_ratio) if req.scale_ratio else 0.0
+        # 5. Scale → pts per foot (from user-selected drawing scale or auto-detected from page text)
+        if req.scale_ratio and req.scale_ratio > 0:
+            pts_per_foot = scale_to_pts_per_foot(req.scale_ratio)
+        else:
+            # Auto-detect architectural scale annotation on this page
+            auto_scales = _brace_find_scales(page) if not is_raster else []
+            if auto_scales:
+                pts_per_foot = auto_scales[0][0]
+                print(f"[ANALYSE] Auto-detected drawing scale on page: {pts_per_foot:.2f} pts/ft")
+            else:
+                pts_per_foot = 9.0  # standard 1/8" = 1'-0" fallback (ratio = 96)
+                print(f"[ANALYSE] Default fallback scale: 9.0 pts/ft (1/8\"=1'-0\")")
         print(f"[ANALYSE] scale_ratio={req.scale_ratio}  pts_per_foot={pts_per_foot:.2f}")
 
         # 6. PRIMARY: match beam centerlines to profile labels
@@ -7811,6 +7936,23 @@ async def analyse_pdf(req: AnalysisRequest):
             print(f"[ANALYSE] Applied {page.rotation}° rotation transform "
                   f"to {len(members)} members (unrotated {_puw:.0f}x{_puh:.0f} "
                   f"-> display {_rw:.0f}x{_rh:.0f})")
+
+        # ── Physical length enforcement ───────────────────────────────────────
+        # Ensure EVERY member with endpoints (bx1,by1 -> bx2,by2) has an exact,
+        # mathematically verified length_ft calculated from true drawing scale.
+        _calc_w = page.rect.width if (not is_raster and page.rotation in (90, 270)) else page_w
+        _calc_h = page.rect.height if (not is_raster and page.rotation in (90, 270)) else page_h
+        _eff_ppf = pts_per_foot if (pts_per_foot and pts_per_foot > 0) else 9.0
+
+        for _m in members:
+            _bx1, _by1 = _m.get("bx1"), _m.get("by1")
+            _bx2, _by2 = _m.get("bx2"), _m.get("by2")
+            if _bx1 is not None and _by1 is not None and _bx2 is not None and _by2 is not None:
+                _dx = (_bx2 - _bx1) * _calc_w
+                _dy = (_by2 - _by1) * _calc_h
+                _dist_pt = math.hypot(_dx, _dy)
+                if _dist_pt > 5.0 and _m.get("type") != "column":
+                    _m["length_ft"] = round(_dist_pt / _eff_ppf, 1)
 
         summary = build_summary(members)
 

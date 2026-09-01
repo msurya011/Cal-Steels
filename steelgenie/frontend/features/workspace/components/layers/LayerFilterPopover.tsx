@@ -174,7 +174,7 @@ export function LayerFilterPopover({ members, onClose, projectId }: LayerFilterP
           />
           <CenteredCheckbox
             label="Lengths"
-            checked={layers.aids.lengths === true}
+            checked={layers.aids.lengths !== false}
             onChange={() => toggleAid('lengths')}
           />
           <CenteredCheckbox

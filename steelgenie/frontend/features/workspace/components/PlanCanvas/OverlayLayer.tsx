@@ -56,44 +56,60 @@ export function OverlayLayer({
   // sheets even at full-plan zoom-out, matching the reference framing plans.
   const showChips = true
 
-  // Helper to compose label text dynamically
-  const getLabelText = (m: Member) => {
-    if (layers.aids.labels === false) return null
-
-    // 1. Column Reference Display (Resolved vs Unresolved)
-    if (m.kind === 'column') {
-      const geo: any = m.geometry || {}
-      const sec = m.section || geo.resolved_profile || ''
-      const bp = geo.base_plate_mark ? ` • ${geo.base_plate_mark}` : ''
-      if (sec || m.piecemark) {
-        return `${sec || m.piecemark}${bp}`
+    // Helper to compose label text dynamically
+    const getLabelText = (m: Member) => {
+      // 1. Column Reference Display (Resolved vs Unresolved)
+      if (m.kind === 'column') {
+        const geo: any = m.geometry || {}
+        const sec = m.section || geo.resolved_profile || ''
+        const bp = geo.base_plate_mark ? ` • ${geo.base_plate_mark}` : ''
+        const gridRef = geo.grid_tag || (geo.grid_ref ? `Col @ ${geo.grid_ref}` : null) || geo.grid_location
+        
+        if (sec || m.piecemark) {
+          const gridSuffix = gridRef ? ` [${gridRef.replace(/^Col\s*@\s*/i, '')}]` : ''
+          return `${sec || m.piecemark}${bp}${gridSuffix}`
+        }
+        return gridRef || 'Column'
       }
-      return 'Column'
+
+      const parts: string[] = []
+
+      // 2. Piecemarks / Section (e.g. W16X26)
+      if (m.section || m.piecemark) {
+        parts.push(m.section || m.piecemark || '')
+      }
+
+      // 3. Lengths (always included by default when length_ft is present or computed from span geometry)
+      if (m.kind !== 'column') {
+        let len = m.length_ft && m.length_ft > 0 ? m.length_ft : null
+        if (!len) {
+          const geo: any = m.geometry || {}
+          const bx1 = geo.bx1 ?? (m as any).bx1
+          const by1 = geo.by1 ?? (m as any).by1
+          const bx2 = geo.bx2 ?? (m as any).bx2
+          const by2 = geo.by2 ?? (m as any).by2
+          if (bx1 !== undefined && bx1 !== null && bx2 !== undefined && bx2 !== null && (bx1 !== bx2 || by1 !== by2)) {
+            const ratio = store.selectedRatio || 96
+            const ppf = 864.0 / ratio
+            const wPt = store.imageNaturalWidth || 2592
+            const hPt = store.imageAspect ? wPt / store.imageAspect : 1728
+            const lenPt = Math.hypot((bx2 - bx1) * wPt, (by2 - by1) * hPt)
+            const calcFt = lenPt / ppf
+            if (calcFt >= 1.0 && calcFt <= 250.0) len = Math.round(calcFt * 10) / 10
+          }
+        }
+        if (len && len > 0) {
+          parts.push(`${len.toFixed(1)}'`)
+        }
+      }
+
+      // 4. Reactions
+      if (layers.aids?.reactions === true && m.reaction) {
+        parts.push(m.reaction)
+      }
+
+      return parts.filter(Boolean).join(' • ') || (m.section ?? '')
     }
-
-    const parts: string[] = []
-
-    // 2. Piecemarks / Section (e.g. W16X26)
-    if (layers.aids.piecemarks !== false && (m.section || m.piecemark)) {
-      parts.push(m.section || m.piecemark || '')
-    }
-
-    // 3. Lengths (always included by default when length_ft is present)
-    if (layers.aids.lengths !== false && m.length_ft && m.length_ft > 0) {
-      parts.push(`${m.length_ft.toFixed(1)}'`)
-    }
-
-    // 4. Reactions
-    if (layers.aids.reactions === true && m.reaction) {
-      parts.push(m.reaction)
-    }
-
-    if (parts.length === 0 && layers.aids.labels) {
-      return m.section || ''
-    }
-
-    return parts.filter(Boolean).join(' • ')
-  }
 
   // Memoize visible members and sort them so columns render on top.
   // This prevents expensive O(N log N) sorting and redundant getMemberRenderProps

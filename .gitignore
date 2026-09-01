@@ -1,0 +1,52 @@
+# AI & Machine Learning / Weights / Datasets
+AI_Extraction/
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# Node & Frontend
+node_modules/
+frontend/.next/
+.next/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.env
+.env
+.env.local
+.env.*.local
+
+# Builds, Logs & Dumps
+dist/
+build/
+*.log
+*.sqlite3
+*.db
+database.db
+
+# Backend uploads, scratch test scripts & temporary DB files
+uploads/
+steelgenie/backend/uploads/
+local_db.json*
+_mount_write_test.txt
+scratch_*.py
+steelgenie/backend/scratch_*.py
+
+# OS / Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

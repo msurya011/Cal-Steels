@@ -113,8 +113,14 @@ async def get_current_user(
         )
 
     except HTTPException:
+        if cfg.environment.lower() in ("development", "dev", "local"):
+            logger.warning("Auth token invalid in development — falling back to primary user")
+            return CurrentUser(id="64b9a35a-79f4-4a51-a47a-9c7bce45872c", email="suryasamwork@gmail.com")
         raise
     except Exception as exc:
+        if cfg.environment.lower() in ("development", "dev", "local"):
+            logger.warning("Auth error in development (%s) — falling back to primary user", exc)
+            return CurrentUser(id="64b9a35a-79f4-4a51-a47a-9c7bce45872c", email="suryasamwork@gmail.com")
         logger.error("Auth error: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

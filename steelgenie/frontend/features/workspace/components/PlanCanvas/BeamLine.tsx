@@ -321,9 +321,16 @@ export const BeamLine = React.memo(function BeamLine({
 
   const midX = (x1 + x2) / 2
   const midY = (y1 + y2) / 2
-  let angle = m.geometry.angle_deg ?? (Math.atan2(y2 - y1, x2 - x1) * 180) / Math.PI
+  
+  // Calculate CAD line orientation
+  const dx = x2 - x1
+  const dy = y2 - y1
+  const isVertical = Math.abs(dy) > Math.abs(dx) * 1.5
+
+  let angle = m.geometry?.angle_deg ?? (Math.atan2(dy, dx) * 180) / Math.PI
   if (angle > 90) angle -= 180
   if (angle < -90) angle += 180
+  if (isVertical) angle = -90
 
   const showHandles = (isSelected || isHovered) && (onDragEnd || onEndpointDragEnd)
 
@@ -422,39 +429,29 @@ export const BeamLine = React.memo(function BeamLine({
         </>
       )}
 
-      {/* Beam Profile & Length Label */}
-      {showText && labelText && !isUnlabeled && (
-        <g
-          style={{
-            transform: `translate(${midX}%, ${midY}%) rotate(${angle}deg)`,
-            transformOrigin: '0 0',
-            pointerEvents: 'none',
-          }}
-        >
-          {isHovered && (
-            <rect
-              x="-50" y="-11"
-              width="100" height="22"
-              fill="#0F172A" rx="4" ry="4"
-              style={{ opacity: 0.94, stroke: '#38BDF8', strokeWidth: 1 }}
-            />
-          )}
+      {/* Beam Profile & Length Label aligned along beam orientation */}
+      {showText && labelText && (
+        <g style={{ pointerEvents: 'none' }}>
           <text
-            x="0"
-            y={isHovered ? "0" : "-6"}
-            fill={isHovered ? '#FFFFFF' : '#F8FAFC'}
-            fontSize={isHovered ? '9.5px' : '8px'}
+            x={`${midX}%`}
+            y={`${midY}%`}
+            fill={isHovered ? '#60A5FA' : '#FFFFFF'}
+            fontSize="10px"
             fontWeight="700"
             textAnchor="middle"
             dominantBaseline="central"
             style={{
               userSelect: 'none',
               paintOrder: 'stroke fill',
-              stroke: '#090D1A',
+              stroke: '#0B1220',
               strokeWidth: 3.5,
               strokeLinejoin: 'round',
-              fontFamily: 'Inter, system-ui, sans-serif',
+              fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
               letterSpacing: '0.02em',
+              pointerEvents: 'none',
+              transformBox: 'fill-box',
+              transformOrigin: 'center',
+              transform: `rotate(${angle}deg) translate(0, -6px)`,
             }}
           >
             {labelText}

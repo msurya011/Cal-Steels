@@ -70,12 +70,14 @@ def _main_bom_row(project_id: str, member: Dict[str, Any], piecemark: str, page:
         "weld_studs": 0,
         "is_main": True,
         "status": "not_started",
-        "member_id": member.get("id"),
-        "drawing_id": page.get("drawing_id"),
-        "sheet": f"{page.get('drawing_filename') or 'Drawing'} — Page {page.get('idx', 0) + 1}",
-        "comment": comment,
-        "dcr_left": None,
-        "dcr_right": None,
+        "custom": {
+            "member_id": member.get("id"),
+            "drawing_id": page.get("drawing_id"),
+            "sheet": f"{page.get('drawing_filename') or 'Drawing'} — Page {page.get('idx', 0) + 1}",
+            "comment": comment,
+            "dcr_left": None,
+            "dcr_right": None,
+        },
     }
 
 
@@ -100,11 +102,13 @@ def _accessory_bom_rows(project_id: str, main_piecemark: str, accessories: List[
             "weld_studs": acc["qty"] if acc["category"] == "Weld Studs" else 0,
             "is_main": False,
             "status": "not_started",
-            "drawing_id": page.get("drawing_id"),
-            "sheet": f"{page.get('drawing_filename') or 'Drawing'} — Page {page.get('idx', 0) + 1}",
-            "comment": None,
-            "dcr_left": None,
-            "dcr_right": None,
+            "custom": {
+                "drawing_id": page.get("drawing_id"),
+                "sheet": f"{page.get('drawing_filename') or 'Drawing'} — Page {page.get('idx', 0) + 1}",
+                "comment": None,
+                "dcr_left": None,
+                "dcr_right": None,
+            },
         })
     return rows
 

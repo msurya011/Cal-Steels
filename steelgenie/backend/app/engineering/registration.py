@@ -506,7 +506,6 @@ def cluster_pages_into_floors(project_id: str) -> dict:
             target_floor = db.table("floors").insert({
                 "project_id": str(project_id),
                 "name": floor_name,
-                "level_name": level_name_key,
                 "elevation_ft": tos,
                 "sort_order": sort_order,
                 "status": "draft",
@@ -523,7 +522,6 @@ def cluster_pages_into_floors(project_id: str) -> dict:
         floor_row = db.table("floors").insert({
             "project_id": str(project_id),
             "name": floor_name,
-            "level_name": first.get("level_name"),
             "elevation_ft": first.get("tos_ft"),
             "sort_order": sort_order,
             "status": "draft",
@@ -904,13 +902,22 @@ def _register_floor_impl(floor_id: str) -> dict:
 
         registered[pid] = {"tx": tx, "ty": ty, "ft_x": ft_x, "ft_y": ft_y}
         confidences.append(confidence)
+        db_method = {
+            "grid_label": "grid_match",
+            "grid_correlation": "grid_match",
+            "partial_match": "grid_match",
+            "match_line": "match_line",
+            "manual": "manual",
+            "identity": "identity",
+            "tile": "identity",
+        }.get(method, "identity")
         db.table("page_registrations").upsert({
             "page_id": pid, "floor_id": str(floor_id),
             "tx_ft": tx, "ty_ft": ty, "rotation_deg": 0,
             "ft_per_pct_x": ft_x, "ft_per_pct_y": ft_y,
             "anchor": i == 0,
             "confidence": confidence,
-            "method": method,
+            "method": db_method,
         }).execute()
         results.append({"page_id": pid, "confidence": confidence, "method": method})
 

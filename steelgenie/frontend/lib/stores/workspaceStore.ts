@@ -116,7 +116,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       detectionRegion: true,
       grid: true,
       piecemarks: true,
-      lengths: false,
+      lengths: true,
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
@@ -158,7 +158,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       detectionRegion: false,
       grid: true,
       piecemarks: true,
-      lengths: false,
+      lengths: true,
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
@@ -179,7 +179,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       detectionRegion: false,
       grid: true,
       piecemarks: true,
-      lengths: false,
+      lengths: true,
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
@@ -195,9 +195,8 @@ const getInitialLayers = (): LayersState => {
       try {
         const parsed = JSON.parse(saved)
         parsed.hiddenLegendKeys = new Set(parsed.hiddenLegendKeys || [])
-        if (!parsed.aids) parsed.aids = {}
         if (parsed.aids.piecemarks === undefined) parsed.aids.piecemarks = true
-        if (parsed.aids.lengths === undefined) parsed.aids.lengths = false
+        if (parsed.aids.lengths === undefined) parsed.aids.lengths = true
         if (parsed.aids.reactions === undefined) parsed.aids.reactions = false
         if (parsed.aids.columnProjections === undefined) parsed.aids.columnProjections = true
         if (parsed.aids.lengthFilter === undefined) parsed.aids.lengthFilter = false
@@ -224,7 +223,7 @@ const getInitialLayers = (): LayersState => {
       detectionRegion: false,
       grid: false,
       piecemarks: true,
-      lengths: false,
+      lengths: true,
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
@@ -252,7 +251,7 @@ const getInitialPresets = (): LayerPreset[] => {
             detectionRegion: false,
             grid: false,
             piecemarks: true,
-            lengths: false,
+            lengths: true,
             reactions: false,
             columnProjections: true,
             lengthFilter: false,
@@ -548,7 +547,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
           detectionRegion: false,
           grid: false,
           piecemarks: true,
-          lengths: false,
+          lengths: true,
           reactions: false,
           columnProjections: true,
           lengthFilter: false,

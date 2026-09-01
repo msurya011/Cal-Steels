@@ -92,21 +92,41 @@ def _invalidate_indexes() -> None:
     _index_cache.clear()
 
 
+def _get_table_index(table_name: str, field: str, items: list[dict]) -> dict[str, list[dict]]:
+    idx_key = (table_name, field)
+    index = _index_cache.get(idx_key)
+    if index is None:
+        index = {}
+        for item in items:
+            iv = str(item.get(field)) if item.get(field) is not None else "null"
+            index.setdefault(iv, []).append(item)
+        _index_cache[idx_key] = index
+    return index
+
+
 def _candidates(table_name: str, items: list[dict], filters: list[tuple[str, str, Any]]) -> list[dict]:
-    """Return the rows to check for a query, using the (table, field) index
-    when the query is a single eq() filter (the common case), otherwise the
-    full table so the caller's normal per-item _matches() scan still runs."""
-    if len(filters) == 1 and filters[0][1] == "eq":
-        field, _op, val = filters[0]
-        idx_key = (table_name, field)
-        index = _index_cache.get(idx_key)
-        if index is None:
-            index = {}
-            for item in items:
-                iv = str(item.get(field)) if item.get(field) is not None else "null"
-                index.setdefault(iv, []).append(item)
-            _index_cache[idx_key] = index
-        return index.get(val, [])
+    """Return the candidate rows to check for a query, using the (table, field) index
+    when an eq() or in_() filter is available, otherwise the full table."""
+    if not filters or not items:
+        return items
+
+    # Look for the best indexed filter among the query filters
+    for field, op, val in filters:
+        if op == "eq":
+            index = _get_table_index(table_name, field, items)
+            return index.get(val, [])
+        elif op == "in" and isinstance(val, (list, set, tuple)):
+            index = _get_table_index(table_name, field, items)
+            candidates = []
+            seen_ids = set()
+            for v in val:
+                for row in index.get(str(v), []):
+                    row_id = id(row)
+                    if row_id not in seen_ids:
+                        seen_ids.add(row_id)
+                        candidates.append(row)
+            return candidates
+
     return items
 
 
@@ -243,10 +263,8 @@ def _save_db(data: dict) -> None:
         # already serializes writers within this one process; making the
         # path unique per-writer closes the remaining cross-process gap too.
         tmp_path = f"{_DB_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            # os.fsync() removed: it forced a synchronous physical-disk flush
-            # on every write of the full (40+ MB) file, adding 1-3 s per save.
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
         import time
         replaced = False
         for attempt in range(5):
@@ -259,7 +277,7 @@ def _save_db(data: dict) -> None:
         if not replaced:
             # Fallback if replace is still locked
             with open(_DB_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f, separators=(",", ":"))
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)

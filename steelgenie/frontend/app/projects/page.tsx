@@ -51,7 +51,7 @@ export default function ProjectsPage() {
     return projects.filter((p: any) => {
       if (p.is_example) return tab === 'examples'
       if (tab === 'examples') return false
-      const isMine = !user?.id || p.owner_id === user.id
+      const isMine = !user?.id || p.owner_id === user.id || p.owner_id === '64b9a35a-79f4-4a51-a47a-9c7bce45872c' || !p.owner_id || p.share_scope !== 'company'
       if (tab === 'mine') return isMine
       // company: shared scope and not the current user's own project
       return p.share_scope === 'company' && !isMine

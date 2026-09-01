@@ -80,13 +80,20 @@ def get_bom(
         q = q.eq("sequence", sequence)
     if is_main is not None:
         q = q.eq("is_main", is_main)
-    if sheet:
-        q = q.eq("sheet", sheet)
     if search:
         q = q.ilike("piecemark", f"%{search}%")
     q = q.range(offset, offset + limit - 1)
     resp = q.execute()
-    return resp.data or []
+    items = resp.data or []
+    for it in items:
+        custom_data = it.get("custom")
+        if isinstance(custom_data, dict):
+            for k, v in custom_data.items():
+                if k not in it or it[k] is None:
+                    it[k] = v
+    if sheet:
+        items = [it for it in items if it.get("sheet") == sheet]
+    return items
 
 
 @router.get("/projects/{project_id}/bom/facets")
@@ -95,6 +102,12 @@ def get_bom_facets(project_id: UUID, user: AuthUser):
     db = get_db()
     resp = db.table("bom_items").select("*").eq("project_id", str(project_id)).execute()
     items = resp.data or []
+    for it in items:
+        custom_data = it.get("custom")
+        if isinstance(custom_data, dict):
+            for k, v in custom_data.items():
+                if k not in it or it[k] is None:
+                    it[k] = v
 
     def _distinct(field: str):
         return sorted({str(r[field]) for r in items if r.get(field) not in (None, "")})
@@ -119,11 +132,18 @@ def get_bom_summary(
     sheet: Optional[str] = Query(None, description="Filter to a single drawing/sheet")
 ):
     db = get_db()
-    q = db.table("bom_items").select("category,weight_lbs,qty").eq("project_id", str(project_id))
-    if sheet:
-        q = q.eq("sheet", sheet)
+    q = db.table("bom_items").select("*").eq("project_id", str(project_id))
     resp = q.execute()
     items = resp.data or []
+    for it in items:
+        custom_data = it.get("custom")
+        if isinstance(custom_data, dict):
+            for k, v in custom_data.items():
+                if k not in it or it[k] is None:
+                    it[k] = v
+
+    if sheet:
+        items = [r for r in items if r.get("sheet") == sheet]
 
     # Exclude joists from structural steel tonnage total (SJI separate trade scope)
     structural_items = [r for r in items if (r.get("category") or "").lower() != "joists"]
@@ -150,14 +170,6 @@ def get_model_summary(
     """Project Summary / Sheet Summary breakdown for the 3D viewer's
     Properties panel: Column/Beam/VBrace/HBrace/Joists/Moment Connection/
     Bolt/Embed Plate/Camber/Anchor/Weld Studs/Total Weight/Hrs-per-Ton.
-
-    Camber, Weld Studs and Total Weight come straight from bom_items (real
-    data). Moment Connection is counted from members.geometry.connections
-    (added for the Properties-panel Connections editor). Anchor is counted
-    from column_groups.anchors. Bolt and Embed Plate are not extracted by
-    the CV pipeline yet, so they report 0 rather than a fabricated number --
-    same convention as SteelGenie's own "WIP" hrs/ton when the figure isn't
-    computable yet.
     """
     db = get_db()
 
@@ -180,9 +192,16 @@ def get_model_summary(
             page_ids_for_moment_count.extend(p["id"] for p in pgs)
 
     q = db.table("bom_items").select("*").eq("project_id", str(project_id))
-    if sheet_filter:
-        q = q.eq("sheet", sheet_filter)
-    items = q.execute().data or []
+    raw_items = q.execute().data or []
+    items = []
+    for it in raw_items:
+        custom_data = it.get("custom")
+        if isinstance(custom_data, dict):
+            for k, v in custom_data.items():
+                if k not in it or it[k] is None:
+                    it[k] = v
+        if not sheet_filter or it.get("sheet") == sheet_filter:
+            items.append(it)
 
     def _cat_count(cat: str) -> int:
         return sum((r.get("qty") or 1) for r in items if r.get("category") == cat)

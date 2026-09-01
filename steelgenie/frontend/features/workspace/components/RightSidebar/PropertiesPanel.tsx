@@ -911,6 +911,21 @@ export function PropertiesPanel({
               </div>
             </div>
 
+            {/* Structural Grid Reference badge */}
+            {((member?.geometry as any)?.grid_ref || (member?.geometry as any)?.grid_tag) && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', backgroundColor: 'rgba(59, 130, 246, 0.08)', padding: '10px 12px', borderRadius: '6px', border: '1px solid rgba(59, 130, 246, 0.2)' }}>
+                <label style={{ fontSize: '10px', fontWeight: 700, color: '#60A5FA', textTransform: 'uppercase', letterSpacing: '0.6px' }}>
+                  Grid Reference
+                </label>
+                <div style={{ fontSize: '13px', fontWeight: 700, color: '#F1F5F9', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span>{(member?.geometry as any)?.grid_tag || `Col @ ${(member?.geometry as any)?.grid_ref}`}</span>
+                  <span style={{ fontSize: '10px', color: '#10B981', backgroundColor: 'rgba(16, 185, 129, 0.15)', padding: '2px 8px', borderRadius: '4px', fontWeight: 600 }}>
+                    Auto-Snapped
+                  </span>
+                </div>
+              </div>
+            )}
+
             {/* Member Type select */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
               <label style={{ fontSize: '11px', fontWeight: 600, color: '#94A3B8' }}>Member Type</label>

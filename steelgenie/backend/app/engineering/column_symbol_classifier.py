@@ -93,6 +93,9 @@ _GRID_LABEL_RE = re.compile(r'^(?:[A-Z]{1,2}(?:\.\d+)?|\d{1,2}(?:\.\d+)?)$', re.
 # Column/Footing mark pattern: C1, CC1, CC2, F1, P1, PC1, CP1, PU1, POST1, BP1
 _MARK_RE = re.compile(r'^(?:[A-Z]{1,3}\d{1,4}[A-Z]?)$', re.IGNORECASE)
 
+# Explicit concrete column / concrete pier marks (e.g. CC1, CC2, CP1, PIER1)
+_CONCRETE_MARK_RE = re.compile(r'^(?:CC\d{1,3}[A-Z]?|CP\d{1,3}|PIER\d{1,3}|PED\d{1,3})$', re.IGNORECASE)
+
 # Dimension strings: "12'-6"", "3'-9 1/2"", "24'-0"".
 _DIMENSION_RE = re.compile(r"^\d+'-\d+(?:\s?\d+/\d+)?\"?$")
 
@@ -389,6 +392,8 @@ def _classify_one(
     # footing outline -- just detected via two different geometry paths.
     _outline_rules = accept_rules & {"foundation_outline", "fragmented_outline"}
     if (_outline_rules and 0.4 < aspect < 2.5 and has_mark_tight):
+        if any(_CONCRETE_MARK_RE.match(t) for t in _tight):
+            return CONCRETE_COLUMN, 0.85, "concrete column/pier mark (CC/CP) - concrete scope"
         return PEDESTAL if not is_foundation_plan else FOOTING_ISOLATED, 0.75, "square-ish pedestal/footing outline + real structural mark nearby"
 
     if (is_foundation_plan and _outline_rules and 0.4 < aspect < 2.5):

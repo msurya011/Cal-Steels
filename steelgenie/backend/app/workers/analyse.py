@@ -275,23 +275,27 @@ async def run_analyse(
             "length_ft": m.get("length_ft"),
         })
 
-    # ── Foundation-Anchored Column Cross-Page Reference Resolution ────────
-    is_fp = bool(result.get("is_foundation_plan"))
-    if is_fp and file_path:
+    # ── Universal Column Cross-Page Reference & Schedule Resolution ────────
+    if file_path:
         try:
             from app.engineering.column_reference_resolver import resolve_foundation_plan_columns
-            logger.info("Resolving Foundation Plan columns & Base Plates on page idx %d...", page_idx)
+            logger.info("Resolving Plan columns & Base Plates against drawing schedule on page idx %d...", page_idx)
             resolve_foundation_plan_columns(file_path, page_idx, member_rows)
         except Exception as res_err:
-            logger.warning("Foundation column reference resolution error: %s", res_err)
+            logger.warning("Column reference resolution error: %s", res_err)
+
+    is_fp = bool(result.get("is_foundation_plan"))
 
     # ── Foundation-Anchored Column Propagation ─────────────────────────────
+    # NOTE: We no longer query pages by is_foundation_plan (that column does
+    # not exist in the DB schema). Foundation propagation is skipped unless
+    # the current page itself is detected as a foundation plan.
     if not is_fp and project_id:
         try:
             drw_rows = db.table("drawings").select("id").eq("project_id", str(project_id)).execute().data or []
             drw_ids = [d["id"] for d in drw_rows]
             if drw_ids:
-                fp_pages = db.table("pages").select("id").in_("drawing_id", drw_ids).eq("is_foundation_plan", True).execute().data or []
+                fp_pages = []  # is_foundation_plan column not in schema; skip cross-page lookup
                 if fp_pages:
                     fp_page_ids = [p["id"] for p in fp_pages]
                     fp_members_db = db.table("members").select("*").in_("page_id", fp_page_ids).in_("kind", ["column", "footing"]).execute().data or []
@@ -438,15 +442,11 @@ async def run_analyse(
     # Persist the T.O.S. elevation on the page so that cluster_pages_into_floors()
     # can group this page with other pages at the same elevation into one floor.
     # Without this write, floor clustering has no tos_ft to work from.
-    # is_foundation_plan: same "FOUNDATION PLAN"/"FOUNDATION FRAMING" text
-    # check main.py's extraction already runs to decide symbol-detection
-    # rules, now also persisted so the frontend can label this page's
-    # elevation field "Bottom of Column" instead of "Top of Steel" --
-    # verified live against the real SteelGenie app on two separate
-    # projects (Bayhealth, Congress Heights) that this is its actual
-    # convention, not a guess. Purely a label -- the elevation number
-    # itself is stored and used exactly as before.
-    page_update = {"status": "estimating", "is_foundation_plan": bool(result.get("is_foundation_plan"))}
+    # NOTE: is_foundation_plan is intentionally NOT written here — the column
+    # does not exist in the Supabase pages table schema and writing it causes
+    # a PGRST204 error that aborts every extraction. The flag is only used
+    # locally within this worker via the is_fp variable above.
+    page_update = {"status": "estimating"}
     if floor_elevation_ft is not None:
         page_update["tos_ft"] = floor_elevation_ft
     db.table("pages").update(page_update).eq("id", page_id).execute()

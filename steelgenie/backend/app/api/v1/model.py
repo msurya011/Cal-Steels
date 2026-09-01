@@ -329,19 +329,16 @@ def _ensure_project_registered(project_id: str, db) -> None:
         return
 
     all_pages = db.table("pages").select("id, status").in_("id", page_ids_in_project).execute().data or []
-    status_by_page = {p["id"]: p.get("status") for p in all_pages}
     all_regs = db.table("page_registrations").select("page_id, floor_id").in_("floor_id", floor_ids).execute().data or []
     registered_by_floor: dict[str, set] = {}
     for r in all_regs:
         registered_by_floor.setdefault(r["floor_id"], set()).add(r["page_id"])
-
     for f in floors:
         floor_page_ids = [l["page_id"] for l in links if l["floor_id"] == f["id"]]
-        extracted_page_ids = {pid for pid in floor_page_ids if status_by_page.get(pid) in ("built", "estimating")}
-        if not extracted_page_ids:
+        if not floor_page_ids:
             continue
         registered_page_ids = registered_by_floor.get(f["id"], set())
-        if extracted_page_ids.issubset(registered_page_ids):
+        if set(floor_page_ids).issubset(registered_page_ids):
             continue
         try:
             register_floor(f["id"])
@@ -445,7 +442,22 @@ async def get_column_segments(
     reasons present wherever expected.
     """
     db = get_db()
+    # Emit every column from the Global Column Database as one continuous
+    # member spanning its own real base->top elevation (see
+    # sync_global_columns() for how those are derived) -- exactly one 3D
+    # instance per physical column, regardless of how many pages/floors
+    # legitimately reference it.
     columns = db.table("columns").select("*").eq("project_id", str(project_id)).execute().data or []
+    if not columns:
+        try:
+            from app.engineering.registration import sync_global_columns
+            sync_global_columns(str(project_id))
+            columns = db.table("columns").select("*").eq("project_id", str(project_id)).execute().data or []
+        except Exception as _se:
+            logger.exception("Error syncing global columns in get_merged_model: %s", _se)
+
+    for c in columns:
+        pass
     segments = db.table("column_segments").select("*").eq("project_id", str(project_id)).execute().data or []
     segments_by_column: Dict[str, list] = {}
     for seg in segments:
@@ -694,8 +706,10 @@ async def get_merged_model(
     floors.sort(key=lambda f: (f.get("elevation_ft") if f.get("elevation_ft") is not None else float("inf"), f.get("sort_order", 0)))
     links = db.table("page_floor_links").select("*").execute().data or []
 
-    # Bulk fetch pages instead of N+1 queries
-    all_pages = db.table("pages").select("*").in_("status", ["built", "estimating"]).execute().data or []
+    # Bulk fetch all pages for this project's drawings
+    drw_rows = db.table("drawings").select("id").eq("project_id", str(project_id)).execute().data or []
+    drw_ids = [d["id"] for d in drw_rows]
+    all_pages = db.table("pages").select("*").in_("drawing_id", drw_ids).execute().data or [] if drw_ids else []
     pages_by_id = {p["id"]: p for p in all_pages}
 
     def pages_for_floor(floor_id: str) -> list:
