@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 from typing import Any, Optional
 from uuid import UUID
+
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -157,9 +160,100 @@ async def get_page_grids(page_id: UUID, user: AuthUser):
     return db.table("grids").select("*").eq("page_id", str(page_id)).execute().data or []
 
 
+_GRID_DIMENSIONS_CACHE: dict[tuple[str, float], list] = {}
+
+
+def _compute_grid_dimensions(pdf_path: str, page_idx: int, scale_num: float | None) -> list:
+    from app.engineering.grid_geometry_pass import (
+        run_deterministic_geometry_pass,
+        to_frontend_dimension_lines,
+    )
+    override_ppf = (864.0 / scale_num) if scale_num and scale_num > 0 else None
+    results = run_deterministic_geometry_pass(
+        pdf_path, page_number=page_idx, override_pts_per_foot=override_ppf
+    )
+    return to_frontend_dimension_lines(results)
+
+
+@router.get("/pages/{page_id}/grid-dimensions")
+async def get_page_grid_dimensions(page_id: UUID, user: AuthUser):
+    """Extract and return bay-to-bay grid dimensions with measured scale feet and OCR text."""
+    db = get_db()
+    page = db.table("pages").select("*").eq("id", str(page_id)).maybe_single().execute().data
+    if not page:
+        return []
+
+    # If the page has no scale applied/uploaded, do not compute or return dimensions
+    scale_num = page.get("scale_num")
+    if not scale_num or scale_num <= 0:
+        return []
+
+    cache_key = (str(page_id), float(scale_num))
+    if cache_key in _GRID_DIMENSIONS_CACHE:
+        return _GRID_DIMENSIONS_CACHE[cache_key]
+
+    drawing = db.table("drawings").select("*").eq("id", page["drawing_id"]).maybe_single().execute().data
+    if not drawing:
+        return []
+    storage_key = drawing.get("storage_key") or drawing.get("file_url")
+    if not storage_key:
+        return []
+    
+    from app.services.storage import get_storage
+    storage = get_storage()
+    pdf_path = storage.local_path(storage_key)
+    if not os.path.exists(pdf_path):
+        return []
+    
+    try:
+        loop = asyncio.get_event_loop()
+        dims = await loop.run_in_executor(
+            None, _compute_grid_dimensions, pdf_path, page["idx"], scale_num
+        )
+        _GRID_DIMENSIONS_CACHE[cache_key] = dims
+        return dims
+    except Exception as exc:
+        logger.warning("Error calculating grid dimensions for page %s: %s", page_id, exc)
+        return []
+
+
+@router.post("/pages/{page_id}/gemini-takeoff")
+async def run_page_gemini_estimator_takeoff(page_id: UUID, user: AuthUser):
+    """Run Senior Structural Estimator Gemini AI Takeoff for grid-to-grid bay lengths & stationing."""
+    db = get_db()
+    page = db.table("pages").select("*").eq("id", str(page_id)).maybe_single().execute().data
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+    drawing = db.table("drawings").select("*").eq("id", page["drawing_id"]).maybe_single().execute().data
+    storage_key = drawing.get("storage_key") or drawing.get("file_url")
+    if not storage_key:
+        raise HTTPException(status_code=400, detail="Drawing file not found")
+    
+    from app.services.storage import get_storage
+    storage = get_storage()
+    pdf_path = storage.local_path(storage_key)
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Local PDF file not found on disk")
+        
+    try:
+        from estimator_gemini_takeoff import run_estimator_takeoff
+        out_img = f"estimator_takeoff_{page_id}.png"
+        results = run_estimator_takeoff(pdf_path, page_number=page["idx"], output_image=out_img)
+        return {
+            "status": "SUCCESS",
+            "page_id": str(page_id),
+            "takeoff": results,
+            "preview_image": f"/api/v1/pages/{page_id}/preview"
+        }
+    except Exception as exc:
+        logger.error("Gemini Estimator Takeoff failed for page %s: %s", page_id, exc)
+        raise HTTPException(status_code=500, detail=f"Gemini Estimator Takeoff error: {str(exc)}")
+
+
 @router.post("/pages/{page_id}/grids/extract")
 async def extract_page_grids(page_id: UUID, user: AuthUser):
     return extract_grids_for_page(str(page_id))
+
 
 
 class FloorAssignment(BaseModel):

@@ -1,0 +1,242 @@
+import os
+import sys
+import json
+import base64
+from pathlib import Path
+from dotenv import load_dotenv
+import requests
+import fitz  # PyMuPDF
+from PIL import Image, ImageDraw, ImageFont
+
+# Ensure UTF-8 output on Windows
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+
+# 1. Load API Key
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
+api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    print("[ERROR] GEMINI_API_KEY not found in .env")
+    sys.exit(1)
+
+# 2. System Instruction / Domain Engineering Prompt
+GEMINI_STRUCTURAL_PROMPT = """
+You are a Senior Structural Steel Estimator and Computer Vision Expert.
+
+---
+### GRID COMPLETENESS — CRITICAL (HIGH RECALL & DOUBLE-SCAN):
+The primary objective is GRID RECALL. You must identify ALL grid lines/bubbles visible in the drawing. Missing a real grid is an error.
+
+Before producing the final answer, perform a second complete scan of the drawing specifically for missed grids.
+Scan systematically:
+1. Top margin
+2. Bottom margin
+3. Left margin
+4. Right margin
+5. Interior drawing area
+6. Any grid labels/bubbles that may be partially separated from the main drawing
+
+A grid must be included if there is sufficient visual evidence that it is a structural reference grid.
+Do NOT stop after finding the obvious grids. After detecting the first set of grids, scan again for:
+- additional numbered grids
+- additional lettered grids
+- decimal/sub-grids (e.g. 1.9, 2.5, 6.5, 6.8, B.2, C.6)
+- grids appearing only on one margin (e.g. bottom-only or right-only bubbles)
+- grids with labels/bubbles that are far from the main grid area
+- grids whose line is faint, partially interrupted, or obscured
+- grids that do not intersect columns or beams
+
+IMPORTANT:
+- Grid detection does NOT require a grid to intersect a structural column or beam. A grid may exist even when there is no column/grid intersection visible.
+- If a grid is clearly present, include it even if its line is partially interrupted or its bubble appears only on one margin.
+- NEVER create or mark a grid when there is no visual evidence of that grid.
+- Do not return dimensions, beams, columns, section bubbles, detail bubbles, or dimension lines as grids.
+
+---
+### STRUCTURAL DRAWING RULES:
+1. **Primary Grids vs Sub-Grids**:
+   - Primary Grids (1, 2, 3... and A, B, C...) run continuously all the way from START to END (Top to Bottom, and Left to Right) across the full building. Even if bubbles only appear on the top margin, primary grid lines extend down to the bottom margin to anchor bottom dimensions.
+   - Sub-grids (1.9, 2.5, 4.9, 7.1, B.2, C.6) only exist locally in their specific bay and terminate once their local framing is done.
+   - Check all 4 perimeters (Top, Bottom, Left, Right). Bottom dimensions connect to the extended Primary Grids plus any bottom sub-grids.
+
+2. **Dimension Lines**: Look for dimension strings formatted in feet & inches (e.g., `24'-0"`, `30'-6 1/2"`, `18'-4"`) positioned along dimension strings between adjacent grid bubbles.
+3. **DO NOT EXTRACT**:
+   - Section/Detail bubbles (e.g. `1/S501`, `A/S301`, detail callouts).
+   - Structural member sizes (e.g. `W14x22`, `HSS 8x8`, `L4x4`).
+   - Elevation marks or revision deltas (`Δ1`).
+
+---
+### OUTPUT FORMAT (Strict JSON Only):
+Respond with ONLY a valid JSON object adhering to this schema:
+{
+  "drawing_title": "string",
+  "vertical_grids": [
+    {
+      "label": "A",
+      "axis_type": "vertical",
+      "box_2d": [ymin, xmin, ymax, xmax], // normalized 0 to 1000
+      "side": "top" // "top", "bottom", "left", or "right"
+    }
+  ],
+  "horizontal_grids": [
+    {
+      "label": "1",
+      "axis_type": "horizontal",
+      "box_2d": [ymin, xmin, ymax, xmax], // normalized 0 to 1000
+      "side": "left" // "top", "bottom", "left", or "right"
+    }
+  ],
+  "bay_dimensions": [
+    {
+      "from_grid": "A",
+      "to_grid": "B",
+      "dimension_text": "24'-0\"",
+      "axis": "horizontal", // direction of the span: "horizontal" or "vertical"
+      "track": "consecutive_bay", // "consecutive_bay" or "total_building"
+      "box_2d": [ymin, xmin, ymax, xmax] // normalized 0 to 1000 for the dimension text
+    }
+  ]
+}
+"""
+
+def extract_grids_with_gemini(pdf_path: str, page_number: int = 0, output_image_path: str = "gemini_grid_takeoff.png"):
+    print(f"\n[INFO] 1. Rendering PDF Page {page_number} to high-res image...")
+    doc = fitz.open(pdf_path)
+    page = doc[page_number]
+    
+    # Render at 100 DPI (~2400x1600 px) for crisp text with fast LLM throughput
+    zoom = 100.0 / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
+    
+    temp_img_path = "temp_gemini_input.png"
+    pix.save(temp_img_path)
+    
+    # Ensure image max dimension <= 2048px for optimal LLM vision processing
+    im = Image.open(temp_img_path)
+    if max(im.size) > 2048:
+        im.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+        im.save(temp_img_path)
+    
+    img_w, img_h = im.size
+    print(f"[INFO] Page prepared ({img_w}x{img_h} px).")
+    
+    # Read base64
+    with open(temp_img_path, "rb") as f:
+        img_bytes = f.read()
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    
+    # Models to try in order of priority
+    candidate_models = ["gemini-2.5-flash", "gemini-3.7-flash", "gemini-flash-latest", "gemini-2.5-pro"]
+    
+    res_data = None
+    used_model = None
+    
+    for model_name in candidate_models:
+        print(f"[INFO] 2. Calling Gemini ({model_name}) with Structural Engineering instructions...")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": GEMINI_STRUCTURAL_PROMPT},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": img_b64
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.1
+            }
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=60)
+            if res.status_code == 200:
+                res_data = res.json()
+                used_model = model_name
+                print(f"[SUCCESS] Model {model_name} responded successfully!")
+                break
+            else:
+                print(f"[WARN] Model {model_name} returned {res.status_code}: {res.text[:200]}")
+        except Exception as e:
+            print(f"[WARN] Connection to {model_name} failed: {e}")
+
+    if not res_data:
+        print("[ERROR] All candidate Gemini models failed.")
+        doc.close()
+        return None
+
+    raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+    
+    try:
+        structured_data = json.loads(raw_text)
+    except Exception as e:
+        print(f"[ERROR] Failed to parse JSON response: {e}")
+        print("Raw Response:", raw_text[:500])
+        doc.close()
+        return None
+        
+    print("\n" + "="*60)
+    print(f"[SUCCESS] Gemini Successfully Extracted Structural Grids & Dimensions!")
+    print("="*60)
+    
+    v_grids = structured_data.get("vertical_grids", [])
+    h_grids = structured_data.get("horizontal_grids", [])
+    bays = structured_data.get("bay_dimensions", [])
+    
+    print(f"• Vertical Grids Detected ({len(v_grids)}): {[g.get('label') for g in v_grids]}")
+    print(f"• Horizontal Grids Detected ({len(h_grids)}): {[g.get('label') for g in h_grids]}")
+    print(f"• Bay Dimensions Extracted ({len(bays)}):")
+    for b in bays[:8]:
+        print(f"   - Bay {b.get('from_grid')} -> {b.get('to_grid')}: {b.get('dimension_text')} ({b.get('track', 'bay')})")
+    if len(bays) > 8:
+        print(f"   ... and {len(bays) - 8} more bays.")
+        
+    # 4. Render visual verification overlay
+    print(f"\n[INFO] 3. Generating visual verification markup image: {output_image_path}...")
+    base_img = Image.open(temp_img_path).convert("RGB")
+    draw = ImageDraw.Draw(base_img)
+    
+    # Draw Grid Bubbles (Magenta for Vertical, Cyan for Horizontal)
+    for g in v_grids:
+        box = g.get("box_2d")
+        if box and len(box) == 4:
+            ymin, xmin, ymax, xmax = box
+            y0, x0, y1, x1 = (ymin/1000.0)*img_h, (xmin/1000.0)*img_w, (ymax/1000.0)*img_h, (xmax/1000.0)*img_w
+            draw.rectangle([x0, y0, x1, y1], outline="#d946ef", width=4)
+            draw.text((x0, max(0, y0 - 15)), f"Grid {g.get('label')}", fill="#d946ef")
+
+    for g in h_grids:
+        box = g.get("box_2d")
+        if box and len(box) == 4:
+            ymin, xmin, ymax, xmax = box
+            y0, x0, y1, x1 = (ymin/1000.0)*img_h, (xmin/1000.0)*img_w, (ymax/1000.0)*img_h, (xmax/1000.0)*img_w
+            draw.rectangle([x0, y0, x1, y1], outline="#06b6d4", width=4)
+            draw.text((x0, max(0, y0 - 15)), f"Grid {g.get('label')}", fill="#06b6d4")
+
+    # Draw Dimension Strings (Green)
+    for b in bays:
+        box = b.get("box_2d")
+        if box and len(box) == 4:
+            ymin, xmin, ymax, xmax = box
+            y0, x0, y1, x1 = (ymin/1000.0)*img_h, (xmin/1000.0)*img_w, (ymax/1000.0)*img_h, (xmax/1000.0)*img_w
+            draw.rectangle([x0, y0, x1, y1], outline="#10b981", width=3)
+            draw.text((x0, max(0, y0 - 15)), f"{b.get('dimension_text')}", fill="#10b981")
+            
+    base_img.save(output_image_path)
+    print(f"[OK] Visual verification image saved to: {output_image_path}")
+    
+    doc.close()
+    return structured_data
+
+if __name__ == "__main__":
+    test_pdf = r"d:\Steel-ghost 2\Steel-ghost\AI_Extraction\pdf's\Structural snaps.pdf"
+    extract_grids_with_gemini(test_pdf, page_number=0, output_image_path="gemini_structural_takeoff.png")

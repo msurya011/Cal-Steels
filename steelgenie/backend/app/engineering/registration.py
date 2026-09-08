@@ -114,12 +114,15 @@ def _level_name_from_title(title: Optional[str], sheet_no: Optional[str]) -> tup
 
 
 _PAGE_PT_SIZE_CACHE = {}
+_SCHEDULE_RECORDS_CACHE: dict[str, list] = {}
+
+def clear_registration_caches():
+    """Clear in-memory registration and schedule caches."""
+    _PAGE_PT_SIZE_CACHE.clear()
+    _SCHEDULE_RECORDS_CACHE.clear()
 
 def _page_pt_size(page: dict, db: Any) -> tuple[float, float]:
-    """Return (width_pts, height_pts) for a page by opening its source PDF,
-    the same technique used in app/api/v1/model.py. Falls back to a
-    reasonable ANSI-D-at-scale default if the file can't be opened (mock/
-    offline mode without the original upload present)."""
+    """Return (width_pts, height_pts) for a page by opening its source PDF."""
     page_id_str = str(page["id"])
     if page_id_str in _PAGE_PT_SIZE_CACHE:
         return _PAGE_PT_SIZE_CACHE[page_id_str]
@@ -146,9 +149,6 @@ def _page_pt_size(page: dict, db: Any) -> tuple[float, float]:
     
     _PAGE_PT_SIZE_CACHE[page_id_str] = (3400.0, 2200.0)
     return 3400.0, 2200.0
-
-
-_SCHEDULE_RECORDS_CACHE: dict[str, list] = {}
 
 def _collect_schedule_records(pages: list[dict], db: Any) -> list:
     """

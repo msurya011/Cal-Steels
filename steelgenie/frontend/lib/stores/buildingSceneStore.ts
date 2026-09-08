@@ -652,6 +652,39 @@ class BuildingSceneStore {
     let height = depthFt
     let depth = length
 
+    let setbackStart = 0.25
+    let setbackEnd = 0.25
+
+    if (m.type === 'beam' || m.type === 'joist') {
+      const nearStart = this.spatialGrid.findNear(m.x1, m.z1, 2.5)
+      const colStart = nearStart.find(n => n.type === 'column' && (n.y1 <= m.y1 + 1.5 && n.y2 >= m.y1 - 1.5))
+      if (colStart) {
+        const cDims = profileBoxDims('column', colStart.profile)
+        const colRadius = Math.max(cDims.depthFt, cDims.widthFt) / 2
+        setbackStart = Math.min(length * 0.35, colRadius + 0.04)
+      } else {
+        setbackStart = Math.min(length * 0.25, 0.25)
+      }
+
+      const nearEnd = this.spatialGrid.findNear(m.x2, m.z2, 2.5)
+      const colEnd = nearEnd.find(n => n.type === 'column' && (n.y1 <= m.y2 + 1.5 && n.y2 >= m.y2 - 1.5))
+      if (colEnd) {
+        const cDims = profileBoxDims('column', colEnd.profile)
+        const colRadius = Math.max(cDims.depthFt, cDims.widthFt) / 2
+        setbackEnd = Math.min(length * 0.35, colRadius + 0.04)
+      } else {
+        setbackEnd = Math.min(length * 0.25, 0.25)
+      }
+    } else {
+      setbackStart = 0
+      setbackEnd = 0
+    }
+
+    const trimmedLength = Math.max(0.1, length - (setbackStart + setbackEnd))
+    if (m.type === 'beam' || m.type === 'joist') {
+      depth = trimmedLength
+    }
+
     if (m.type === 'column') {
       // Column's "depth" runs vertically (along the member), so what would
       // be depthFt/widthFt here are the two horizontal cross-section sides.
@@ -674,13 +707,7 @@ class BuildingSceneStore {
       geom = new THREE.BoxGeometry(width, height, depth)
     }
 
-    // Metalness needs an environment to reflect (see initScene's RoomEnvironment
-    // setup) or it just looks like flat dark plastic. 0.65/0.35 (near-chrome)
-    // combined with a dark base color was blowing out to pale/washed-out on
-    // every lit face -- shop-primed structural steel is a painted, semi-matte
-    // metal finish, not a mirror, so pulling metalness/envMapIntensity down
-    // and roughness up keeps the metallic highlight subtle instead of
-    // overpowering the actual (darker) material color.
+    // Semi-matte shop-primed structural steel finish
     const mat = new THREE.MeshStandardMaterial({
       color: new THREE.Color(colorHex),
       roughness: 0.55,
@@ -693,9 +720,60 @@ class BuildingSceneStore {
     if (m.type === 'column') {
       mesh.position.set(m.x1, (m.y1 + m.y2) / 2, m.z1)
     } else {
-      mesh.position.copy(startVec).add(direction.clone().multiplyScalar(0.5))
+      const offsetDir = direction.clone().normalize()
+      const center = startVec.clone().add(offsetDir.clone().multiplyScalar(setbackStart + trimmedLength / 2))
+      mesh.position.copy(center)
       if (length > 0.001) {
         mesh.lookAt(endVec)
+      }
+
+      // Render 3D Shear Connection Plates / Tabs & 2 Bolts at both ends
+      if (m.type === 'beam') {
+        const plateHeight = Math.max(0.25, height * 0.65)
+        const plateThick = 0.035 // ~3/8" plate
+        const plateMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color('#475569'), // structural steel connection plate
+          roughness: 0.5,
+          metalness: 0.6,
+          envMapIntensity: 0.6,
+        })
+        const boltMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color('#94A3B8'),
+          roughness: 0.3,
+          metalness: 0.8,
+        })
+
+        // Connection plate at Start joint
+        const plateLenStart = setbackStart + 0.35
+        const plateGeomStart = new THREE.BoxGeometry(plateThick, plateHeight, plateLenStart)
+        const plateMeshStart = new THREE.Mesh(plateGeomStart, plateMat)
+        plateMeshStart.position.set(0.02, 0, -trimmedLength / 2 + (plateLenStart / 2 - setbackStart))
+        mesh.add(plateMeshStart)
+
+        // 2 Bolts at Start joint
+        const boltGeom = new THREE.CylinderGeometry(0.02, 0.02, plateThick * 1.6, 8)
+        boltGeom.rotateZ(Math.PI / 2)
+        const bolt1Start = new THREE.Mesh(boltGeom, boltMat)
+        bolt1Start.position.set(0.01, plateHeight * 0.25, 0)
+        plateMeshStart.add(bolt1Start)
+        const bolt2Start = new THREE.Mesh(boltGeom, boltMat)
+        bolt2Start.position.set(0.01, -plateHeight * 0.25, 0)
+        plateMeshStart.add(bolt2Start)
+
+        // Connection plate at End joint
+        const plateLenEnd = setbackEnd + 0.35
+        const plateGeomEnd = new THREE.BoxGeometry(plateThick, plateHeight, plateLenEnd)
+        const plateMeshEnd = new THREE.Mesh(plateGeomEnd, plateMat)
+        plateMeshEnd.position.set(0.02, 0, trimmedLength / 2 - (plateLenEnd / 2 - setbackEnd))
+        mesh.add(plateMeshEnd)
+
+        // 2 Bolts at End joint
+        const bolt1End = new THREE.Mesh(boltGeom, boltMat)
+        bolt1End.position.set(0.01, plateHeight * 0.25, 0)
+        plateMeshEnd.add(bolt1End)
+        const bolt2End = new THREE.Mesh(boltGeom, boltMat)
+        bolt2End.position.set(0.01, -plateHeight * 0.25, 0)
+        plateMeshEnd.add(bolt2End)
       }
     }
 
@@ -745,15 +823,19 @@ class BuildingSceneStore {
     group.count--
     this._flushGroup(group)
 
-    // Remove and dispose solid mesh
+    // Remove and dispose solid mesh and all child connection plates
     if (m.mesh) {
       this.scene?.remove(m.mesh)
-      m.mesh.geometry.dispose()
-      if (Array.isArray(m.mesh.material)) {
-        m.mesh.material.forEach(mat => mat.dispose())
-      } else {
-        m.mesh.material.dispose()
-      }
+      m.mesh.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          child.geometry.dispose()
+          if (Array.isArray(child.material)) {
+            child.material.forEach(mat => mat.dispose())
+          } else {
+            child.material.dispose()
+          }
+        }
+      })
       delete m.mesh
     }
 
@@ -777,16 +859,7 @@ class BuildingSceneStore {
         }
       }
     } else {
-      // For beams/braces: check both endpoint orderings. Columns already
-      // required m.floorId === floorId below; beams never did, which meant
-      // two beams from DIFFERENT floors that happened to land at the same
-      // XZ (or, more commonly in practice, two beams from adjacent-but-
-      // misregistered sheets on the SAME floor -- see the registration
-      // note in addPageMembers) could get silently collapsed into one
-      // SceneMember. Requiring the floor match here doesn't fix a bad
-      // registration (two same-floor sheets placed on top of each other
-      // will still spatially collide), but it's a real, always-correct gap
-      // regardless -- members on different floors should never merge.
+      // For beams/braces: check both endpoint orderings.
       const near = this.spatialGrid.findNear(x1, z1, TOL)
       for (const m of near) {
         if (m.type !== type) continue
@@ -868,32 +941,6 @@ class BuildingSceneStore {
   /**
    * Fully replace every column-type SceneMember with the latest set from a
    * merged-model fetch.
-   *
-   * Root-cause fix (2026-07-28, "column line is not rendering" / only the
-   * first extracted floor's columns ever appeared in the 3D model): unlike
-   * beams, columns are not one row per page/floor -- they come from the
-   * backend's Global Column Database (sync_global_columns in
-   * registration.py), which is fully recomputed on every merged-model call
-   * and returns one member per PHYSICAL column, each tagged with
-   * source_page_id = its canonical (always foundation-plan-anchored, per the
-   * position-anchoring fix) page -- i.e. every column's page_id is always
-   * the SAME single page regardless of how many floors now contribute
-   * beam/joist evidence to its top_elev_ft.
-   *
-   * loadModel()'s incremental path used to bucket ALL members (columns
-   * included) by page_id and hand each bucket to addPageMembers(), which
-   * no-ops for a page already in pageLoadedSet. Since a column's page_id
-   * was always that one already-loaded foundation-plan page, extracting
-   * floor 2, floor 3, etc. (which grows each column's real top_elev_ft
-   * further) never got past that early-return: the freshly-recomputed,
-   * taller column set was silently dropped every time, so only whatever
-   * height existed at the very first load ever rendered -- exactly the
-   * reported symptom of columns only showing up for the initial floor.
-   *
-   * Columns aren't page-scoped data; treat them as a single project-wide
-   * table and always replace the whole set on every fetch, independent of
-   * per-page load tracking (which stays correct and unchanged for
-   * beams/braces/joists, which genuinely are one row per floor).
    */
   replaceColumns(rawColumns: RawMember[]) {
     for (const m of [...this.members.values()]) {
@@ -947,16 +994,6 @@ class BuildingSceneStore {
     rawGrids.forEach((g) => {
       if (this.grids.has(g.id)) return
       this.grids.set(g.id, g)
-      // g.start[1]/g.end[1] carry the grid's REAL floor elevation from the
-      // backend (_grids_out() places every grid at its floor's floor_elev),
-      // but this used to hardcode Y=0 for every single one regardless --
-      // so a floor's grid lines always rendered flat on the world origin
-      // instead of at that floor's actual height. Combined with columns
-      // that (correctly) stop short of Y=0 when there's no real floor
-      // below to anchor to, this made every upper floor's grid look like
-      // it was sitting at "ground" while its own columns floated far above
-      // it, when the grid should have been sitting right at the floor
-      // instead, level with where those columns actually terminate.
       const gy1 = g.start[1] ?? 0
       const gy2 = g.end[1] ?? gy1
       pts.push(g.start[0], gy1, g.start[2], g.end[0], gy2, g.end[2])
@@ -991,16 +1028,20 @@ class BuildingSceneStore {
       group.count = 0
       group.lineSegs.geometry.setDrawRange(0, 0)
     }
-    // Dispose/remove existing solid meshes!
+    // Dispose/remove existing solid meshes and connection hardware!
     for (const m of this.members.values()) {
       if (m.mesh) {
         this.scene?.remove(m.mesh)
-        m.mesh.geometry.dispose()
-        if (Array.isArray(m.mesh.material)) {
-          m.mesh.material.forEach(mat => mat.dispose())
-        } else {
-          m.mesh.material.dispose()
-        }
+        m.mesh.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.geometry.dispose()
+            if (Array.isArray(child.material)) {
+              child.material.forEach(mat => mat.dispose())
+            } else {
+              child.material.dispose()
+            }
+          }
+        })
       }
     }
     // Clear grid group
@@ -1012,9 +1053,15 @@ class BuildingSceneStore {
     this.spatialGrid.clear()
     this.pageLoadedSet.clear()
 
-    // Re-populate
+    // Re-populate: Always add all columns FIRST so all beams across all floors
+    // can detect their column joints and attach shear connection tabs!
+    const columns = allMembers.filter(m => m.type === 'column')
+    const nonColumns = allMembers.filter(m => m.type !== 'column')
+
+    this.replaceColumns(columns)
+
     const byPage = new Map<string, RawMember[]>()
-    for (const m of allMembers) {
+    for (const m of nonColumns) {
       if (!byPage.has(m.page_id)) byPage.set(m.page_id, [])
       byPage.get(m.page_id)!.push(m)
     }

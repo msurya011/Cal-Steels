@@ -127,6 +127,18 @@ async def upload_drawing(
     storage_key = generate_storage_key(f"projects/{project_id}/drawings", ext)
     await storage.put(storage_key, data, file.content_type or "application/pdf")
 
+    # Clear any leftover memory caches from previous extractions/drawings
+    try:
+        from main import clear_foundation_columns_cache
+        clear_foundation_columns_cache()
+    except Exception:
+        pass
+    try:
+        from app.engineering.registration import clear_registration_caches
+        clear_registration_caches()
+    except Exception:
+        pass
+
     # Create drawing record
     row = {
         "project_id": str(project_id),

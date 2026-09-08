@@ -1,0 +1,1115 @@
+"""
+Step 1: Deterministic Geometry Pass (Zero LLM / Zero External API Dependencies)
+
+Extracts:
+1. Grid bubbles & axis lines (Vertical & Horizontal Grids) -- CONFIRMED against
+   real vector bubble geometry (page.get_drawings()), not text position alone.
+2. Exact center-to-center Bay Dimensions (Feet & Inches text + inches + pixel span)
+   -- length is ALWAYS geometry (distance / scale), never overwritten by nearby
+   printed text. Printed text is used only to calibrate the scale when no
+   explicit scale is on the sheet, and to flag agreement/disagreement for QA.
+3. Grid Intersections: All (Grid_X, Grid_Y) coordinate pairs with exact (X, Y)
+   points and ready-to-crop bounding boxes for downstream inspection.
+4. Scale detection (explicit scale callouts e.g. 1/8" = 1'-0"), with an
+   explicit "is_explicit" flag -- a guessed/default scale is never silently
+   indistinguishable from a real one.
+
+Fixes vs. the previous version of this module:
+  - Every grid label must be confirmed by a REAL vector bubble shape at that
+    location, not just matching text found anywhere on the sheet. Stray
+    digits (rebar counts, elevations, sheet dimension text, callouts) can no
+    longer be mistaken for grid lines.
+  - Grid selection uses the sheet's real bubble geometry: the densest single
+    row/column of confirmed bubbles per axis, biased toward the sheet's outer
+    margin (real grid bubbles live there; false-positive detail/section
+    callouts scatter through the interior).
+  - A contiguous-run cutoff rejects a same-labeled bubble bleeding in from an
+    unrelated part of a combined/multi-section sheet.
+  - Bay length is always `distance_between_confirmed_points / pts_per_foot`.
+    Printed dimension text is used only (a) to calibrate pts_per_foot when no
+    explicit scale is printed, using the median across several independent
+    matches, and (b) as a QA cross-check flag -- never to replace the number.
+"""
+
+from __future__ import annotations
+import re
+from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
+import fitz  # PyMuPDF
+
+# ---------------------------------------------------------------------------
+# Label patterns
+# ---------------------------------------------------------------------------
+_GRID_LETTER_PRIMARY = re.compile(r"^[A-Z]$")
+_GRID_LETTER_SECONDARY = re.compile(r"^[A-Z]\.\d+$")
+_GRID_NUMBER_PRIMARY = re.compile(r"^\d{1,2}$")
+_GRID_NUMBER_SECONDARY = re.compile(r"^\d{1,2}\.\d+$")
+
+# Dimension-text parsing (unchanged -- this part was already solid)
+_DIM_RE = re.compile(r"""
+    ^
+    (?:\(?\s*)?
+    (?P<feet>\d+)\s*['\u2019]\s*[-\u2013\u2014]?\s*
+    (?:
+        (?P<inches>\d+)
+        (?:\s+(?P<num>\d+)\s*/\s*(?P<den>\d+))?
+        \s*["\u201d]
+    )?
+    (?:\s*\)?\s*)?
+    $
+""", re.VERBOSE)
+
+_INCH_ONLY_RE = re.compile(r"""
+    ^
+    (?:\(?\s*)?
+    (?P<inches>\d+)
+    (?:\s+(?P<num>\d+)\s*/\s*(?P<den>\d+))?
+    \s*["\u201d]
+    (?:\s*\)?\s*)?
+    $
+""", re.VERBOSE)
+
+
+def parse_dimension_string(text: str) -> Optional[float]:
+    """Parse dimension strings like 24'-0", 30'-6 1/2", 8" into decimal feet."""
+    t = text.strip().replace(" ", "")
+    m = _DIM_RE.match(t)
+    if m:
+        feet = float(m.group("feet"))
+        inches = float(m.group("inches") or 0)
+        num = float(m.group("num") or 0)
+        den = float(m.group("den") or 1)
+        return feet + (inches + (num / den if den != 0 else 0)) / 12.0
+
+    m2 = _INCH_ONLY_RE.match(t)
+    if m2:
+        inches = float(m2.group("inches"))
+        num = float(m2.group("num") or 0)
+        den = float(m2.group("den") or 1)
+        return (inches + (num / den if den != 0 else 0)) / 12.0
+    return None
+
+
+def is_valid_dim_text(text: str) -> bool:
+    """Validate if string has valid architectural dimension syntax."""
+    t = text.strip()
+    if not t or len(t) > 25:
+        return False
+    if re.search(r"[Ww]\d+[Xx]\d+|HSS|L\d+x|PL\d+|C\d+x", t):
+        return False
+    if re.match(r"^\d+\s*['\u2019]", t) or re.match(r"^\d+(?:/\d+|\s+\d+/\d+)?\s*[\"\u201d]$", t):
+        return True
+    return False
+
+
+def ft_to_arch(v: float) -> str:
+    feet = int(v)
+    inches = round((v - feet) * 12)
+    if inches == 12:
+        feet += 1
+        inches = 0
+    return f"{feet}'-{inches}\""
+
+
+def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
+    """
+    Detect drawing scale from text blocks (e.g. 1/8" = 1'-0").
+    Returns (pts_per_foot, scale_label, is_explicit).
+    is_explicit is False only when no scale callout was found on the sheet
+    and we had to fall back to a default -- this must never be silently
+    indistinguishable from a real, printed scale.
+    """
+    scale_re = re.compile(
+        r"(\d+/\d+|\d+)\s*[\"\u201d]\s*=\s*(\d+)['\u2019]-\s*(\d+)[\"\u201d]"
+        r"|SCALE\s*:\s*(\d+/\d+|\d+)\s*[\"\u201d]\s*=\s*(\d+)"
+    )
+    for b in text_dict.get("blocks", []):
+        for l in b.get("lines", []):
+            line_str = "".join(sp.get("text", "") for sp in l.get("spans", []))
+            m = scale_re.search(line_str)
+            if m:
+                frac_str = m.group(1) or m.group(4)
+                if "/" in frac_str:
+                    num, den = frac_str.split("/")
+                    inch_val = float(num) / float(den)
+                else:
+                    inch_val = float(frac_str)
+                pts_per_foot = inch_val * 72.0
+                return pts_per_foot, line_str.strip(), True
+
+    return 9.0, "1/8\" = 1'-0\" (DEFAULT -- NOT FOUND ON SHEET)", False
+
+
+# ---------------------------------------------------------------------------
+# Bubble confirmation: a label only counts if it sits on a REAL vector shape
+# ---------------------------------------------------------------------------
+def _label_kind(t: str) -> Optional[Tuple[str, bool]]:
+    """Returns (axis_kind, is_secondary) or None. axis_kind is 'letter' or 'number'."""
+    if _GRID_LETTER_PRIMARY.match(t):
+        return ("letter", False)
+    if _GRID_LETTER_SECONDARY.match(t):
+        return ("letter", True)
+    if _GRID_NUMBER_PRIMARY.match(t):
+        return ("number", False)
+    if _GRID_NUMBER_SECONDARY.match(t):
+        return ("number", True)
+    return None
+
+
+def _find_confirmed_bubbles(page: "fitz.Page", text_dict: dict) -> List[Dict[str, Any]]:
+    """
+    A grid label is only accepted when its text sits on top of a real
+    circle/roundel vector shape from the page's own drawing data. This is
+    the check that keeps stray dimension digits, rebar counts, elevation
+    marks, and callouts from being mistaken for grid bubbles.
+    """
+    rot_mat = page.rotation_matrix if page.rotation != 0 else None
+    drawings = page.get_drawings()
+    bubble_boxes = []
+    for d in drawings:
+        r = d.get("rect")
+        if r is None:
+            continue
+        if rot_mat is not None:
+            r = r * rot_mat
+        w, h = r.width, r.height
+        if w <= 1 or h <= 1:
+            continue
+        aspect = max(w, h) / max(min(w, h), 0.1)
+        if 6 <= w <= 45 and 6 <= h <= 45 and aspect <= 1.6:
+            bubble_boxes.append(r)
+
+    confirmed = []
+    for b in text_dict.get("blocks", []):
+        for l in b.get("lines", []):
+            for sp in l.get("spans", []):
+                t = sp.get("text", "").strip()
+                if not t or len(t) > 5:
+                    continue
+                kind = _label_kind(t)
+                if kind is None:
+                    continue
+                bbox = fitz.Rect(sp.get("bbox", [0, 0, 0, 0]))
+                if rot_mat is not None:
+                    bbox = bbox * rot_mat
+                cx, cy = (bbox.x0 + bbox.x1) / 2.0, (bbox.y0 + bbox.y1) / 2.0
+                for r in bubble_boxes:
+                    if r.x0 - 2 <= cx <= r.x1 + 2 and r.y0 - 2 <= cy <= r.y1 + 2:
+                        confirmed.append({
+                            "text": t, "axis": kind[0], "is_secondary": kind[1],
+                            "cx": cx, "cy": cy,
+                        })
+                        break
+    return confirmed
+
+
+def _label_rank(t: str) -> float:
+    m = re.match(r"^([A-Z])(?:\.(\d+))?$", t)
+    if m:
+        return (ord(m.group(1)) - 65) * 100 + (int(m.group(2)) if m.group(2) else 0)
+    m2 = re.match(r"^(\d+)(?:\.(\d+))?$", t)
+    if m2:
+        return int(m2.group(1)) * 100 + (int(m2.group(2)) if m2.group(2) else 0)
+    return 0.0
+
+
+def _is_valid_grid_band(band: List[Dict[str, Any]], axis: str) -> bool:
+    if not band:
+        return False
+    if axis == "number":
+        nums = []
+        for p in band:
+            m = re.match(r"^(\d+)(?:\.(\d+))?$", p["text"])
+            if m:
+                val = float(m.group(1)) + (float(m.group(2)) / 10.0 if m.group(2) else 0.0)
+                nums.append(val)
+        if not nums or min(nums) > 20:
+            return False
+        if len(set(int(n) for n in nums)) < 2:
+            return False
+        sorted_nums = sorted(nums)
+        large_jumps = sum(1 for i in range(len(sorted_nums) - 1) if sorted_nums[i+1] - sorted_nums[i] > 4.0)
+        if large_jumps > 0 and len(sorted_nums) < 5:
+            return False
+        if large_jumps > len(sorted_nums) * 0.3:
+            return False
+        return True
+    elif axis == "letter":
+        letters = []
+        for p in band:
+            m = re.match(r"^([A-Z])", p["text"])
+            if m:
+                letters.append(ord(m.group(1)) - 65)
+        if not letters:
+            return False
+        if min(letters) > 6:
+            return False
+        if len(set(letters)) < 2:
+            return False
+        sorted_let = sorted(letters)
+        large_jumps = sum(1 for i in range(len(sorted_let) - 1) if sorted_let[i+1] - sorted_let[i] > 4)
+        if large_jumps > len(sorted_let) * 0.3:
+            return False
+        return True
+    return True
+
+
+def _pick_best_grid_band(pts: List[Dict[str, Any]], axis: str, band_key: str, pos_key: str,
+                         page_dim: float, tol: float = 8.0) -> List[Dict[str, Any]]:
+    if not pts:
+        return []
+    buckets: Dict[int, List[Dict[str, Any]]] = {}
+    for p in pts:
+        bkey = round(p[band_key] / tol)
+        buckets.setdefault(bkey, []).append(p)
+
+    candidates = []
+    for b in buckets.values():
+        run = _largest_contiguous_run(b, pos_key)
+        if len(run) >= 2 and _is_valid_grid_band(run, axis):
+            center = sum(p[band_key] for p in run) / len(run)
+            dist_to_edge = min(center, page_dim - center)
+            candidates.append((run, dist_to_edge, len(run)))
+
+    if not candidates:
+        raw_candidates = []
+        for b in buckets.values():
+            run = _largest_contiguous_run(b, pos_key)
+            if len(run) >= 2:
+                center = sum(p[band_key] for p in run) / len(run)
+                dist_to_edge = min(center, page_dim - center)
+                raw_candidates.append((run, dist_to_edge, len(run)))
+        if not raw_candidates:
+            return []
+        raw_candidates.sort(key=lambda x: (x[1], -x[2]))
+        return raw_candidates[0][0]
+
+    candidates.sort(key=lambda x: (x[1], -x[2]))
+    return candidates[0][0]
+
+
+def _largest_contiguous_run(band: List[Dict[str, Any]], pos_key: str) -> List[Dict[str, Any]]:
+    """
+    Reject a same-labeled bubble (or run of bubbles) that jumps in from an
+    unrelated section of a combined sheet.
+    """
+    pts = sorted(band, key=lambda p: p[pos_key])
+    if len(pts) < 3:
+        return pts
+    gaps = [pts[i + 1][pos_key] - pts[i][pos_key] for i in range(len(pts) - 1)]
+    run = [pts[0]]
+    seen_gaps: List[float] = []
+    for i, g in enumerate(gaps):
+        if seen_gaps:
+            med = sorted(seen_gaps)[len(seen_gaps) // 2]
+            if g > max(med * 4.0, 750.0):
+                break
+        run.append(pts[i + 1])
+        seen_gaps.append(g)
+    return run
+
+
+def _build_axis_tracks(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph: float,
+                        band_key: str, pos_key: str, edge: float = 0.24,
+                        widen: float = 85.0, margin: float = 220.0,
+                        min_track_primary: int = 2, max_tracks: int = 4
+                        ) -> List[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+    """
+    Different sheets dimension differently -- some mark grids on one side
+    only, some on both sides of an axis, some repeat a bay-level track and a
+    separate cumulative/overall track further out. The job here is to find
+    and mark EVERY real track that's actually confirmed on the sheet, not to
+    pick a single "best" one and discard the rest.
+
+    axis: 'number' -> grid line position is the bubble's cx (band_key='cy', pos_key='cx')
+    axis: 'letter' -> grid line position is the bubble's cy (band_key='cx', pos_key='cy')
+
+    Returns a list of (ordered chain of {label, is_secondary, coord}, meta) --
+    one entry per distinct confirmed track, most-confident first.
+    """
+    items = [c for c in confirmed if c["axis"] == axis]
+
+    def near_edge(c):
+        return (c["cx"] < pw * edge or c["cx"] > pw * (1 - edge) or
+                c["cy"] < ph * edge or c["cy"] > ph * (1 - edge))
+
+    perim = [c for c in items if near_edge(c)]
+    remaining = [c for c in perim if not c["is_secondary"]]
+
+    tracks: List[Tuple[List[Dict[str, Any]], Dict[str, Any]]] = []
+    used_sides: set = set()
+    page_dim = ph if band_key == "cy" else pw
+
+    for _ in range(max_tracks):
+        if not remaining:
+            break
+        band = _pick_best_grid_band(remaining, axis, band_key, pos_key, page_dim)
+        if len(band) < min_track_primary:
+            break
+
+        band_center = sum(p[band_key] for p in band) / len(band)
+        candidate_side = ("top" if band_center < ph / 2 else "bottom") if band_key == "cy" \
+            else ("left" if band_center < pw / 2 else "right")
+        if candidate_side in used_sides:
+            # discard this band as noise and keep looking, but don't let it
+            # block progress -- remove its points and continue
+            used_ids = {id(p) for p in band}
+            remaining = [c for c in remaining if id(c) not in used_ids]
+            continue
+        used_sides.add(candidate_side)
+        pos_lo = min(p[pos_key] for p in band) - margin
+        pos_hi = max(p[pos_key] for p in band) + margin
+
+        widened = [
+            c for c in perim
+            if abs(c[band_key] - band_center) <= widen and pos_lo <= c[pos_key] <= pos_hi
+        ]
+
+        best_by_label: Dict[str, Dict[str, Any]] = {}
+        for c in widened:
+            cur = best_by_label.get(c["text"])
+            if cur is None or abs(c[band_key] - band_center) < abs(cur[band_key] - band_center):
+                best_by_label[c["text"]] = c
+
+        chain = sorted(best_by_label.values(), key=lambda c: c[pos_key])
+        if band_key == "cy":
+            side = "top" if band_center < ph / 2 else "bottom"
+        else:
+            side = "left" if band_center < pw / 2 else "right"
+
+        meta = {
+            "band_found": True,
+            "side": side,
+            "band_coord": round(band_center, 2),
+            "primary_count": sum(1 for c in chain if not c["is_secondary"]),
+            "secondary_count": sum(1 for c in chain if c["is_secondary"]),
+        }
+        tracks.append((
+            [{"label": c["text"], "is_secondary": c["is_secondary"], "coord": round(c[pos_key], 2)} for c in chain],
+            meta,
+        ))
+
+        # remove this track's primary points from the pool so the next
+        # iteration finds a genuinely different track, not the same one again
+        used_ids = {id(p) for p in band}
+        remaining = [c for c in remaining if id(c) not in used_ids]
+
+    return tracks
+
+
+def _build_axis_chain(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph: float,
+                       band_key: str, pos_key: str, **kwargs) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Back-compat wrapper: returns only the single most-confident track
+    (used for the canonical grid-intersection matrix, which needs one
+    position per grid label, not one per dimensioned side)."""
+    tracks = _build_axis_tracks(confirmed, axis, pw, ph, band_key, pos_key, **kwargs)
+    if not tracks:
+        return [], {"band_found": False}
+    return tracks[0]
+
+
+# ---------------------------------------------------------------------------
+# Length calibration
+# ---------------------------------------------------------------------------
+def _collect_dim_spans(page: "fitz.Page", text_dict: dict) -> List[Dict[str, Any]]:
+    rot_mat = page.rotation_matrix if page.rotation != 0 else None
+    dim_spans = []
+    for b in text_dict.get("blocks", []):
+        for l in b.get("lines", []):
+            for sp in l.get("spans", []):
+                t = sp.get("text", "").strip()
+                if not t or not is_valid_dim_text(t):
+                    continue
+                val = parse_dimension_string(t)
+                if val is None or not (0.5 <= val <= 350.0):
+                    continue
+                bbox = fitz.Rect(sp.get("bbox", [0, 0, 0, 0]))
+                if rot_mat is not None:
+                    bbox = bbox * rot_mat
+                cx, cy = (bbox.x0 + bbox.x1) / 2.0, (bbox.y0 + bbox.y1) / 2.0
+                dim_spans.append({
+                    "text": t, "val_ft": val,
+                    "cx": cx, "cy": cy,
+                })
+    return dim_spans
+
+
+def _calibrate_pts_per_foot(chain: List[Dict[str, Any]], dim_spans: List[Dict[str, Any]],
+                             pos_key: str, other_coord: float) -> Optional[float]:
+    """Cross-check consecutive-bay pixel spans against nearby printed dimension
+    text and take the median ratio -- robust to a handful of mismatches."""
+    candidates = []
+    for i in range(len(chain) - 1):
+        p1, p2 = chain[i], chain[i + 1]
+        span = abs(p2["coord"] - p1["coord"])
+        if span < 5:
+            continue
+        mid = (p1["coord"] + p2["coord"]) / 2.0
+        for d in dim_spans:
+            d_pos = d[pos_key]
+            d_other = d["cy"] if pos_key == "cx" else d["cx"]
+            if abs(d_pos - mid) <= max(span * 0.15, 20) and abs(d_other - other_coord) <= 60:
+                candidates.append(span / d.get("val_ft", 0) if d.get("val_ft") else None)
+    candidates = [c for c in candidates if c]
+    if len(candidates) < 3:
+        return None
+    return sorted(candidates)[len(candidates) // 2]
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+def run_deterministic_geometry_pass(
+    pdf_path: str | Path, page_number: int = 0,
+    override_pts_per_foot: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    override_pts_per_foot: when the caller already knows the page's
+    explicitly-selected scale (e.g. the scale the user picked for this page
+    in the app), pass it here so it's used as the authoritative value
+    instead of this module's own on-sheet scale-text detection -- the
+    user's explicit selection always outranks a guess read off the sheet.
+    """
+    doc = fitz.open(str(pdf_path))
+    if page_number < 0 or page_number >= len(doc):
+        raise ValueError(f"Page index {page_number} out of range (0-{len(doc)-1})")
+
+    page = doc[page_number]
+    rect = page.rect
+    # _find_confirmed_bubbles and _collect_dim_spans both transform every
+    # coordinate through page.rotation_matrix when the page carries a
+    # rotation flag (common for a landscape sheet saved as a rotated
+    # portrait page) -- putting cx/cy into the sheet's actual DISPLAYED
+    # orientation. A 90 or 270 degree rotation swaps width and height in
+    # that displayed space, so page_w/page_h must swap too, or every
+    # perimeter/edge and left-vs-right-of-center check downstream compares
+    # rotated coordinates against the wrong, un-rotated page box -- which
+    # silently discards an entire axis's real confirmed bubbles as "not
+    # near any edge" even though they sit right on the sheet's margin.
+    if page.rotation in (90, 270):
+        page_w, page_h = rect.height, rect.width
+    else:
+        page_w, page_h = rect.width, rect.height
+    text_dict = page.get_text("dict")
+
+    if override_pts_per_foot and override_pts_per_foot > 0:
+        pts_per_foot = override_pts_per_foot
+        scale_str = f"USER-SELECTED SCALE ({round(override_pts_per_foot,3)} pts/ft)"
+        is_explicit_scale = True
+    else:
+        pts_per_foot, scale_str, is_explicit_scale = detect_scale_factor(text_dict)
+    dim_spans = _collect_dim_spans(page, text_dict)
+
+    confirmed = _find_confirmed_bubbles(page, text_dict)
+
+    # Dynamic orientation detection: test both horizontal and vertical bands
+    num_tracks_h = _build_axis_tracks(confirmed, "number", page_w, page_h, band_key="cy", pos_key="cx")
+    num_tracks_v = _build_axis_tracks(confirmed, "number", page_w, page_h, band_key="cx", pos_key="cy")
+    let_tracks_h = _build_axis_tracks(confirmed, "letter", page_w, page_h, band_key="cy", pos_key="cx")
+    let_tracks_v = _build_axis_tracks(confirmed, "letter", page_w, page_h, band_key="cx", pos_key="cy")
+
+    score_case1 = sum(len(t[0]) for t in num_tracks_h) + sum(len(t[0]) for t in let_tracks_v)
+    score_case2 = sum(len(t[0]) for t in let_tracks_h) + sum(len(t[0]) for t in num_tracks_v)
+
+    if score_case1 >= score_case2:
+        # Case 1 (Standard): Numbers along X (vertical grid lines), Letters along Y (horizontal grid lines)
+        v_tracks = num_tracks_h
+        h_tracks = let_tracks_v
+        v_axis_type = "number"
+        h_axis_type = "letter"
+    else:
+        # Case 2 (Rotated / Portrait): Letters along X (vertical grid lines), Numbers along Y (horizontal grid lines)
+        v_tracks = let_tracks_h
+        h_tracks = num_tracks_v
+        v_axis_type = "letter"
+        h_axis_type = "number"
+
+    def _drop_cross_track_mismatches(tracks: List[Tuple[List[Dict[str, Any]], Dict[str, Any]]]
+                                      ) -> List[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+        if len(tracks) < 2:
+            return tracks
+        primary_by_label = {p["label"]: p["coord"] for p in tracks[0][0]}
+        cleaned = [tracks[0]]
+        for chain, meta in tracks[1:]:
+            kept = [
+                p for p in chain
+                if p["label"] not in primary_by_label or abs(p["coord"] - primary_by_label[p["label"]]) <= 20.0
+            ]
+            meta = dict(meta)
+            meta["primary_count"] = sum(1 for p in kept if not p["is_secondary"])
+            meta["secondary_count"] = sum(1 for p in kept if p["is_secondary"])
+            cleaned.append((kept, meta))
+        return cleaned
+
+    v_tracks = _drop_cross_track_mismatches(v_tracks)
+    h_tracks = _drop_cross_track_mismatches(h_tracks)
+    # A track that lost every point to cross-track validation isn't a real
+    # track at all -- it was fully bogus, not just partially noisy. Drop it
+    # rather than reporting an empty, misleading "confirmed track."
+    v_tracks = [(chain, meta) for chain, meta in v_tracks if len(chain) >= 2]
+    h_tracks = [(chain, meta) for chain, meta in h_tracks if len(chain) >= 2]
+
+    v_chain, v_meta = (v_tracks[0] if v_tracks else ([], {"band_found": False}))
+    h_chain, h_meta = (h_tracks[0] if h_tracks else ([], {"band_found": False}))
+
+    # Perpendicular band coordinate for each axis
+    v_band_cy = None
+    v_labels = {p["label"] for p in v_chain}
+    cys = [c["cy"] for c in confirmed if c["axis"] == v_axis_type and c["text"] in v_labels]
+    if cys:
+        v_band_cy = sum(cys) / len(cys)
+
+    h_band_cx = None
+    h_labels = {p["label"] for p in h_chain}
+    cxs = [c["cx"] for c in confirmed if c["axis"] == h_axis_type and c["text"] in h_labels]
+    if cxs:
+        h_band_cx = sum(cxs) / len(cxs)
+
+    if not is_explicit_scale:
+        calibrated = None
+        if v_chain and v_band_cy is not None:
+            calibrated = _calibrate_pts_per_foot(v_chain, dim_spans, pos_key="cx", other_coord=v_band_cy)
+        if calibrated is None and h_chain and h_band_cx is not None:
+            calibrated = _calibrate_pts_per_foot(h_chain, dim_spans, pos_key="cy", other_coord=h_band_cx)
+        if calibrated:
+            pts_per_foot = calibrated
+            scale_str = f"CALIBRATED FROM PRINTED DIMENSIONS ({round(calibrated,3)} pts/ft) -- no explicit sheet scale found"
+            scale_source = "calibrated_from_printed_dimensions"
+        else:
+            scale_source = "default_guess_unverified"
+    else:
+        scale_source = "explicit_sheet_scale"
+
+    def _make_bays(chain: List[Dict[str, Any]], axis_letter: str, band_coord: Optional[float],
+                    reference_coords: Optional[List[float]] = None) -> List[Dict[str, Any]]:
+        bays = []
+        pos_key = "cx" if axis_letter == "V" else "cy"
+        other_key = "cy" if axis_letter == "V" else "cx"
+
+        # This chain's own typical bay spacing -- used below so the
+        # reference-gap check only fires on a genuinely ANOMALOUS span for
+        # THIS track, not on every pair just because a denser, independent
+        # track (e.g. the opposite side of the building, with its own
+        # different sub-grids) happens to have a point in between. Two
+        # tracks legitimately covering different bay breakdowns is normal;
+        # this guard is only for the case where THIS track itself skipped
+        # over a real intermediate grid it should have had.
+        raw_spans = [abs(chain[i + 1]["coord"] - chain[i]["coord"]) for i in range(len(chain) - 1)]
+        raw_spans = [s for s in raw_spans if s >= 5.0]
+        median_span = sorted(raw_spans)[len(raw_spans) // 2] if raw_spans else None
+
+        for i in range(len(chain) - 1):
+            p1, p2 = chain[i], chain[i + 1]
+            span_px = abs(p2["coord"] - p1["coord"])
+            if span_px < 5.0:
+                continue
+            # If a denser track on this same axis has a confirmed grid line
+            # strictly between these two points AND this particular span is
+            # anomalously large next to this track's own typical bay size
+            # (roughly >1.8x the local median), this track is missing that
+            # intermediate grid -- draw nothing here rather than a single
+            # span that silently swallows several real bays. A real gap is
+            # better than a misleadingly long "bay." A normal-sized bay is
+            # never rejected just because a different, independent track
+            # happens to have an unrelated point in the same coordinate
+            # range.
+            if reference_coords and median_span and span_px > median_span * 1.8:
+                lo, hi = min(p1["coord"], p2["coord"]), max(p1["coord"], p2["coord"])
+                if any(lo + 1.0 < rc < hi - 1.0 for rc in reference_coords):
+                    continue
+            calc_ft = span_px / pts_per_foot if pts_per_foot > 0 else 0.0
+            mid = (p1["coord"] + p2["coord"]) / 2.0
+            # Candidates centered between the two grid points; among those,
+            # prefer whichever sits on the dimension track CLOSEST to the
+            # bubble row/column itself (the innermost, per-bay track), not
+            # a farther-out cumulative/overall track that happens to also
+            # fall within the x/y window.
+            candidates = [d for d in dim_spans if abs(d[pos_key] - mid) <= span_px * 0.35]
+            match = None
+            if candidates and band_coord is not None:
+                match = min(candidates, key=lambda d: abs(d[other_key] - band_coord))
+            elif candidates:
+                match = candidates[0]
+            agrees = None
+            if match is not None:
+                agrees = abs(match["val_ft"] - calc_ft) <= max(0.3, calc_ft * 0.03)
+            bays.append({
+                "from_grid": p1["label"],
+                "to_grid": p2["label"],
+                "span_points": round(span_px, 2),
+                "dimension_text": ft_to_arch(calc_ft),
+                "length_inches": round(calc_ft * 12.0, 1),
+                "ocr_text": match["text"] if match else None,
+                "agrees_with_ocr": agrees,
+                "flagged": (agrees is False),
+            })
+        return bays
+
+    def _extend_chain_with_local_confirmed(chain: List[Dict[str, Any]], axis_type: str,
+                                            band_key: str, band_center: float, pos_key: str,
+                                            tol: float = 70.0) -> List[Dict[str, Any]]:
+        """
+        A continuation track (opposite-margin case) starts as a copy of the
+        chain already confirmed on the OTHER side -- but a sheet can also
+        place a bubble that ONLY appears on this side (e.g. an extra
+        sub-grid like 6.5/6.8 dimensioned only at the bottom, not repeated
+        at the top). Pull in any confirmed bubble of the right axis whose
+        band position sits near this track's own band, that isn't already
+        in the chain, so that bubble gets its own bay boundary instead of
+        being silently absorbed into a neighboring span.
+        """
+        existing_labels = {p["label"] for p in chain}
+        existing_ranks = [_label_rank(p["label"]) for p in chain]
+        if not existing_ranks:
+            return chain
+        lo_rank, hi_rank = min(existing_ranks), max(existing_ranks)
+        extra = [
+            c for c in confirmed
+            if c["axis"] == axis_type
+            and c["text"] not in existing_labels
+            and abs(c[band_key] - band_center) <= tol
+            # Interior-insertion only: a genuine extra sub-grid (6.5, 6.8,
+            # B.7...) always falls BETWEEN two grids this chain already
+            # confirms. A label whose rank falls outside the chain's own
+            # [min, max] range is not an insertion into this run of grids at
+            # all -- it's an unrelated symbol that happens to pass the same
+            # circle+text bubble test (a compass "N", a detail callout, a
+            # section marker). Reject those generically instead of trying to
+            # blacklist specific letters.
+            and lo_rank <= _label_rank(c["text"]) <= hi_rank
+        ]
+        if not extra:
+            return chain
+        merged = list(chain) + [
+            {"label": c["text"], "is_secondary": c["is_secondary"], "coord": round(c[pos_key], 2)}
+            for c in extra
+        ]
+        merged.sort(key=lambda p: p["coord"])
+        return merged
+
+    def _track_confidently_confirmed(bays: List[Dict[str, Any]], has_local_bubble_evidence: bool = False) -> bool:
+        """
+        Gate for accepting a dimension track that has NO confirmed bubbles of
+        its own (the opposite-margin / same-grid-continuation case) -- it is
+        only backed by nearby printed length text, so that text needs to
+        actually agree with the geometry, not just exist. An absolute count
+        of agreeing bays isn't enough on its own: a track where most of its
+        matched bays actively DISAGREE with the geometry is more likely a
+        stray, unrelated block of dimension text than a real continuation of
+        this grid -- reject it rather than draw a mostly-wrong track.
+
+        When this track's chain was extended with a bubble confirmed
+        independently AT this track's own position (see
+        _extend_chain_with_local_confirmed) it already has real geometric
+        evidence of its own, same as any other confirmed track -- OCR
+        agreement is then just per-bay QA (as it is everywhere else in this
+        module), not a precondition for existing, so this gate is skipped.
+        """
+        if has_local_bubble_evidence:
+            return True
+        matched = [b for b in bays if b.get("agrees_with_ocr") is not None]
+        agreeing = [b for b in matched if b["agrees_with_ocr"] is True]
+        if len(matched) < 2:
+            return False
+        if len(agreeing) < max(2, len(bays) // 3):
+            return False
+        return (len(agreeing) / len(matched)) >= 0.7
+
+    horizontal_bays = _make_bays(v_chain, "V", v_band_cy)  # numbers -> vertical grid lines -> horizontal bay spacing
+    vertical_bays = _make_bays(h_chain, "H", h_band_cx)    # letters -> horizontal grid lines -> vertical bay spacing
+
+    # Every confirmed track gets its own marked dimension line -- this is
+    # what lets a 2-side drawing and a 4-side drawing both come out right,
+    # instead of always forcing exactly one line per axis. The richest
+    # (first/densest) track's grid coordinates are used as the reference
+    # set so a sparser track never draws a span across a gap it didn't
+    # actually confirm.
+    v_reference_coords = [p["coord"] for p in v_chain]
+    h_reference_coords = [p["coord"] for p in h_chain]
+
+    # Building envelope bounding box from detected grid chains
+    min_v_x = min(v_reference_coords) if v_reference_coords else 0.0
+    max_v_x = max(v_reference_coords) if v_reference_coords else page_w
+    min_h_y = min(h_reference_coords) if h_reference_coords else 0.0
+    max_h_y = max(h_reference_coords) if h_reference_coords else page_h
+
+    horizontal_dimension_tracks = []
+    for ti, (chain, meta) in enumerate(v_tracks):
+        band_coord = meta.get("band_coord")
+        # Enforce that horizontal dimension track sits on perimeter outside
+        # framing -- but only when the OTHER axis (letters, here) actually
+        # confirmed a building envelope to check against. When that other
+        # axis found nothing at all (h_reference_coords empty), min_h_y/
+        # max_h_y fall back to 0.0/page_h, which isn't "the building spans
+        # the full page" -- it's "we don't know" -- and treating it as a
+        # real envelope would reject every legitimate numbers-axis track
+        # on a sheet where only one axis happened to confirm bubbles.
+        if h_reference_coords and meta["side"] == "top" and band_coord is not None and band_coord > min_h_y + 20.0:
+            continue
+        if h_reference_coords and meta["side"] == "bottom" and band_coord is not None and band_coord < max_h_y - 20.0:
+            continue
+        ref = v_reference_coords if ti > 0 else None
+        bays = _make_bays(chain, "V", band_coord, reference_coords=ref)
+        horizontal_dimension_tracks.append({
+            "side": meta["side"],
+            "band_coord": band_coord,
+            "primary_count": meta["primary_count"],
+            "secondary_count": meta["secondary_count"],
+            "grids": chain,
+            "bays": bays,
+        })
+
+    # Check if opposite margins have dimension text missed due to lack of repeated bubbles
+    existing_h_sides = {t["side"] for t in horizontal_dimension_tracks}
+    if "bottom" not in existing_h_sides and v_chain and max_h_y < page_h - 30.0:
+        # Candidate dimension texts strictly below building envelope
+        bot_dims = [d for d in dim_spans if d["cy"] > max_h_y + 15.0 and (min_v_x - 100.0 <= d["cx"] <= max_v_x + 100.0)]
+        if len(bot_dims) >= 2:
+            cy_buckets = {}
+            for d in bot_dims:
+                key = round(d["cy"] / 25.0) * 25.0
+                cy_buckets.setdefault(key, []).append(d)
+            if cy_buckets:
+                best_cy_key = max(cy_buckets.keys(), key=lambda k: len(cy_buckets[k]))
+                best_bot_dims = cy_buckets[best_cy_key]
+                if len(best_bot_dims) >= 2:
+                    avg_cy = sum(d["cy"] for d in best_bot_dims) / len(best_bot_dims)
+                    if avg_cy > max_h_y + 15.0:
+                        ext_chain = _extend_chain_with_local_confirmed(
+                            v_chain, v_axis_type, "cy", avg_cy, "cx")
+                        bays = _make_bays(ext_chain, "V", avg_cy)
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(v_chain)):
+                            horizontal_dimension_tracks.append({
+                                "side": "bottom",
+                                "band_coord": round(avg_cy, 2),
+                                "primary_count": sum(1 for p in ext_chain if not p["is_secondary"]),
+                                "secondary_count": sum(1 for p in ext_chain if p["is_secondary"]),
+                                "grids": ext_chain,
+                                "bays": bays,
+                            })
+
+    if "top" not in existing_h_sides and v_chain and min_h_y > 30.0:
+        # Candidate dimension texts strictly above building envelope
+        top_dims = [d for d in dim_spans if d["cy"] < min_h_y - 15.0 and (min_v_x - 100.0 <= d["cx"] <= max_v_x + 100.0)]
+        if len(top_dims) >= 2:
+            cy_buckets = {}
+            for d in top_dims:
+                key = round(d["cy"] / 25.0) * 25.0
+                cy_buckets.setdefault(key, []).append(d)
+            if cy_buckets:
+                best_cy_key = max(cy_buckets.keys(), key=lambda k: len(cy_buckets[k]))
+                best_top_dims = cy_buckets[best_cy_key]
+                if len(best_top_dims) >= 2:
+                    avg_cy = sum(d["cy"] for d in best_top_dims) / len(best_top_dims)
+                    if avg_cy < min_h_y - 15.0:
+                        ext_chain = _extend_chain_with_local_confirmed(
+                            v_chain, v_axis_type, "cy", avg_cy, "cx")
+                        bays = _make_bays(ext_chain, "V", avg_cy)
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(v_chain)):
+                            horizontal_dimension_tracks.append({
+                                "side": "top",
+                                "band_coord": round(avg_cy, 2),
+                                "primary_count": sum(1 for p in ext_chain if not p["is_secondary"]),
+                                "secondary_count": sum(1 for p in ext_chain if p["is_secondary"]),
+                                "grids": ext_chain,
+                                "bays": bays,
+                            })
+
+    vertical_dimension_tracks = []
+    for ti, (chain, meta) in enumerate(h_tracks):
+        band_coord = meta.get("band_coord")
+        # Enforce that vertical dimension track sits on perimeter outside
+        # framing -- same reasoning as the horizontal loop above: only
+        # apply this when the numbers axis actually confirmed a real
+        # building envelope (v_reference_coords non-empty). Otherwise
+        # min_v_x/max_v_x are meaningless 0.0/page_w placeholders and this
+        # guard would wrongly reject every letters-axis track on a sheet
+        # where the numbers axis alone failed to confirm any bubbles.
+        if v_reference_coords and meta["side"] == "left" and band_coord is not None and band_coord > min_v_x + 20.0:
+            continue
+        if v_reference_coords and meta["side"] == "right" and band_coord is not None and band_coord < max_v_x - 20.0:
+            continue
+        ref = h_reference_coords if ti > 0 else None
+        bays = _make_bays(chain, "H", band_coord, reference_coords=ref)
+        vertical_dimension_tracks.append({
+            "side": meta["side"],
+            "band_coord": band_coord,
+            "primary_count": meta["primary_count"],
+            "secondary_count": meta["secondary_count"],
+            "grids": chain,
+            "bays": bays,
+        })
+
+    # Check if opposite margins have dimension text missed due to lack of repeated bubbles
+    existing_v_sides = {t["side"] for t in vertical_dimension_tracks}
+    if "left" not in existing_v_sides and h_chain and min_v_x > 30.0:
+        # Candidate dimension texts strictly to the left of building envelope
+        left_dims = [d for d in dim_spans if d["cx"] < min_v_x - 15.0 and (min_h_y - 100.0 <= d["cy"] <= max_h_y + 100.0)]
+        if len(left_dims) >= 2:
+            cx_buckets = {}
+            for d in left_dims:
+                key = round(d["cx"] / 25.0) * 25.0
+                cx_buckets.setdefault(key, []).append(d)
+            if cx_buckets:
+                best_cx_key = max(cx_buckets.keys(), key=lambda k: len(cx_buckets[k]))
+                best_left_dims = cx_buckets[best_cx_key]
+                if len(best_left_dims) >= 2:
+                    avg_cx = sum(d["cx"] for d in best_left_dims) / len(best_left_dims)
+                    if avg_cx < min_v_x - 15.0:
+                        ext_chain = _extend_chain_with_local_confirmed(
+                            h_chain, h_axis_type, "cx", avg_cx, "cy")
+                        bays = _make_bays(ext_chain, "H", avg_cx)
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(h_chain)):
+                            vertical_dimension_tracks.append({
+                                "side": "left",
+                                "band_coord": round(avg_cx, 2),
+                                "primary_count": sum(1 for p in ext_chain if not p["is_secondary"]),
+                                "secondary_count": sum(1 for p in ext_chain if p["is_secondary"]),
+                                "grids": ext_chain,
+                                "bays": bays,
+                            })
+
+    if "right" not in existing_v_sides and h_chain and max_v_x < page_w - 30.0:
+        # Candidate dimension texts strictly to the right of building envelope
+        right_dims = [d for d in dim_spans if d["cx"] > max_v_x + 15.0 and (min_h_y - 100.0 <= d["cy"] <= max_h_y + 100.0)]
+        if len(right_dims) >= 2:
+            cx_buckets = {}
+            for d in right_dims:
+                key = round(d["cx"] / 25.0) * 25.0
+                cx_buckets.setdefault(key, []).append(d)
+            if cx_buckets:
+                best_cx_key = max(cx_buckets.keys(), key=lambda k: len(cx_buckets[k]))
+                best_right_dims = cx_buckets[best_cx_key]
+                if len(best_right_dims) >= 2:
+                    avg_cx = sum(d["cx"] for d in best_right_dims) / len(best_right_dims)
+                    if avg_cx > max_v_x + 15.0:
+                        ext_chain = _extend_chain_with_local_confirmed(
+                            h_chain, h_axis_type, "cx", avg_cx, "cy")
+                        bays = _make_bays(ext_chain, "H", avg_cx)
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(h_chain)):
+                            vertical_dimension_tracks.append({
+                                "side": "right",
+                                "band_coord": round(avg_cx, 2),
+                                "primary_count": sum(1 for p in ext_chain if not p["is_secondary"]),
+                                "secondary_count": sum(1 for p in ext_chain if p["is_secondary"]),
+                                "grids": ext_chain,
+                                "bays": bays,
+                            })
+
+
+
+    v_grids = [{"label": p["label"], "x": p["coord"], "is_secondary": p["is_secondary"]} for p in v_chain]
+    h_grids = [{"label": p["label"], "y": p["coord"], "is_secondary": p["is_secondary"]} for p in h_chain]
+
+    intersections = []
+    CROP_HALF_SIZE = 50.0
+    for vg in v_grids:
+        for hg in h_grids:
+            ix, iy = vg["x"], hg["y"]
+            crop_bbox = [
+                max(0.0, ix - CROP_HALF_SIZE), max(0.0, iy - CROP_HALF_SIZE),
+                min(page_w, ix + CROP_HALF_SIZE), min(page_h, iy + CROP_HALF_SIZE),
+            ]
+            intersections.append({
+                "grid_id": f"{vg['label']}-{hg['label']}",
+                "grid_x_label": vg["label"], "grid_y_label": hg["label"],
+                "x": ix, "y": iy,
+                "crop_bbox": [round(c, 2) for c in crop_bbox],
+            })
+
+    v_coords = [g["x"] for g in v_grids]
+    h_coords = [g["y"] for g in h_grids]
+    envelope = {
+        "min_x": min(v_coords) if v_coords else 0.0, "max_x": max(v_coords) if v_coords else page_w,
+        "min_y": min(h_coords) if h_coords else 0.0, "max_y": max(h_coords) if h_coords else page_h,
+        "total_width_points": round(max(v_coords) - min(v_coords), 2) if v_coords else 0.0,
+        "total_height_points": round(max(h_coords) - min(h_coords), 2) if h_coords else 0.0,
+    }
+
+    doc.close()
+
+    return {
+        "status": "SUCCESS",
+        "page_dimensions": {"width": page_w, "height": page_h},
+        "scale": {
+            "scale_string": scale_str,
+            "points_per_foot": round(pts_per_foot, 4),
+            "is_explicit": is_explicit_scale,
+            "source": scale_source,
+        },
+        "vertical_grids": v_grids,
+        "horizontal_grids": h_grids,
+        "horizontal_dimension_tracks": horizontal_dimension_tracks,
+        "vertical_dimension_tracks": vertical_dimension_tracks,
+        "horizontal_dimension_track_count": len(horizontal_dimension_tracks),
+        "vertical_dimension_track_count": len(vertical_dimension_tracks),
+        "vertical_axis_meta": v_meta,
+        "horizontal_axis_meta": h_meta,
+        "horizontal_bays": horizontal_bays,
+        "vertical_bays": vertical_bays,
+        "intersections": intersections,
+        "envelope": envelope,
+        "total_intersections_count": len(intersections),
+        "total_horizontal_bays_count": len(horizontal_bays),
+        "total_vertical_bays_count": len(vertical_bays),
+    }
+
+
+def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Flatten every confirmed dimension track (both axes, every side found) into
+    the flat list shape the existing frontend already expects -- the same
+    {id, axis, from_grid, to_grid, label, length_ft, text, x1, y1, x2, y2,
+    source, ocr_text, scale_source} objects the previous extract_grid_dimensions()
+    produced, with x/y normalized 0-1 by page width/height. This means
+    DimensionLine.tsx / OverlayLayer.tsx need no changes to render this --
+    they just now receive one entry per real, confirmed segment, on however
+    many sides/tracks the sheet actually has, instead of a single assumed side.
+    """
+    pw = results["page_dimensions"]["width"]
+    ph = results["page_dimensions"]["height"]
+    scale_source = results["scale"]["source"]
+    out: List[Dict[str, Any]] = []
+
+    for ti, track in enumerate(results["horizontal_dimension_tracks"]):  # numbers axis -> axis "V"
+        y = track["band_coord"]
+        for bay in track["bays"]:
+            g1 = next(g for g in track["grids"] if g["label"] == bay["from_grid"])
+            g2 = next(g for g in track["grids"] if g["label"] == bay["to_grid"])
+            out.append({
+                "id": f"dim_v_{bay['from_grid']}_{bay['to_grid']}_{track['side']}_{ti}",
+                "axis": "V",
+                "from_grid": bay["from_grid"],
+                "to_grid": bay["to_grid"],
+                "label": f"{bay['from_grid']}–{bay['to_grid']}",
+                "length_ft": round(bay["length_inches"] / 12.0, 2),
+                "text": bay["dimension_text"],
+                "x1": round(g1["coord"] / pw, 4),
+                "y1": round(y / ph, 4),
+                "x2": round(g2["coord"] / pw, 4),
+                "y2": round(y / ph, 4),
+                "source": "scale_verified" if bay["agrees_with_ocr"] else "scale_computed",
+                "ocr_text": bay["ocr_text"],
+                "scale_source": scale_source,
+                "side": track["side"],
+                "flagged": bay["flagged"],
+            })
+
+    for ti, track in enumerate(results["vertical_dimension_tracks"]):  # letters axis -> axis "H"
+        x = track["band_coord"]
+        for bay in track["bays"]:
+            g1 = next(g for g in track["grids"] if g["label"] == bay["from_grid"])
+            g2 = next(g for g in track["grids"] if g["label"] == bay["to_grid"])
+            out.append({
+                "id": f"dim_h_{bay['from_grid']}_{bay['to_grid']}_{track['side']}_{ti}",
+                "axis": "H",
+                "from_grid": bay["from_grid"],
+                "to_grid": bay["to_grid"],
+                "label": f"{bay['from_grid']}–{bay['to_grid']}",
+                "length_ft": round(bay["length_inches"] / 12.0, 2),
+                "text": bay["dimension_text"],
+                "x1": round(x / pw, 4),
+                "y1": round(g1["coord"] / ph, 4),
+                "x2": round(x / pw, 4),
+                "y2": round(g2["coord"] / ph, 4),
+                "source": "scale_verified" if bay["agrees_with_ocr"] else "scale_computed",
+                "ocr_text": bay["ocr_text"],
+                "scale_source": scale_source,
+                "side": track["side"],
+                "flagged": bay["flagged"],
+            })
+
+    return out
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+    import os
+
+    default_pdf = r"d:\Steel-ghost 2\Steel-ghost\AI_Extraction\pdf's\Structural (CCD#2)-4-8.pdf"
+    target_pdf = sys.argv[1] if len(sys.argv) > 1 else default_pdf
+    page_num = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+    if not os.path.exists(target_pdf):
+        print(f"File not found: {target_pdf}")
+        sys.exit(1)
+
+    print(f"--- Running Step 1 (fixed): Deterministic Geometry Pass on: {Path(target_pdf).name} (page {page_num+1}) ---")
+    results = run_deterministic_geometry_pass(target_pdf, page_number=page_num)
+
+    print(f"\n[SCALE]: {results['scale']['scale_string']}  ({results['scale']['points_per_foot']} pts/ft)  explicit={results['scale']['is_explicit']}  source={results['scale']['source']}")
+    print(f"\n[VERTICAL GRIDS] ({len(results['vertical_grids'])}) side={results['vertical_axis_meta'].get('side')} primary={results['vertical_axis_meta'].get('primary_count')} secondary={results['vertical_axis_meta'].get('secondary_count')}:")
+    print("  " + ", ".join(f"{g['label']}@{g['x']}" for g in results['vertical_grids']))
+    print(f"\n[HORIZONTAL GRIDS] ({len(results['horizontal_grids'])}) side={results['horizontal_axis_meta'].get('side')} primary={results['horizontal_axis_meta'].get('primary_count')} secondary={results['horizontal_axis_meta'].get('secondary_count')}:")
+    print("  " + ", ".join(f"{g['label']}@{g['y']}" for g in results['horizontal_grids']))
+
+    print(f"\n[HORIZONTAL BAYS] ({len(results['horizontal_bays'])}):")
+    for bay in results["horizontal_bays"]:
+        flag = "  [FLAGGED: disagrees with sheet text]" if bay["flagged"] else ""
+        ocr = f"  (sheet says: {bay['ocr_text']})" if bay["ocr_text"] else ""
+        print(f"  {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{ocr}{flag}")
+
+    print(f"\n[VERTICAL BAYS] ({len(results['vertical_bays'])}):")
+    for bay in results["vertical_bays"]:
+        flag = "  [FLAGGED: disagrees with sheet text]" if bay["flagged"] else ""
+        ocr = f"  (sheet says: {bay['ocr_text']})" if bay["ocr_text"] else ""
+        print(f"  {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{ocr}{flag}")
+
+    print(f"\n[INTERSECTIONS]: {results['total_intersections_count']} grid intersections generated with crop bounding boxes.")
+
+    print(f"\n[HORIZONTAL DIMENSION TRACKS] (numbers axis): {results['horizontal_dimension_track_count']} track(s) found")
+    for ti, track in enumerate(results["horizontal_dimension_tracks"]):
+        print(f"  Track {ti+1}: side={track['side']}  primary={track['primary_count']}  secondary={track['secondary_count']}  grids=[{', '.join(g['label'] for g in track['grids'])}]")
+        for bay in track["bays"]:
+            flag = "  [FLAGGED]" if bay["flagged"] else ""
+            print(f"      {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{flag}")
+
+    print(f"\n[VERTICAL DIMENSION TRACKS] (letters axis): {results['vertical_dimension_track_count']} track(s) found")
+    for ti, track in enumerate(results["vertical_dimension_tracks"]):
+        print(f"  Track {ti+1}: side={track['side']}  primary={track['primary_count']}  secondary={track['secondary_count']}  grids=[{', '.join(g['label'] for g in track['grids'])}]")
+        for bay in track["bays"]:
+            flag = "  [FLAGGED]" if bay["flagged"] else ""
+            print(f"      {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{flag}")
+    page_num = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+    if not os.path.exists(target_pdf):
+        print(f"File not found: {target_pdf}")
+        sys.exit(1)
+
+    print(f"--- Running Step 1 (fixed): Deterministic Geometry Pass on: {Path(target_pdf).name} (page {page_num+1}) ---")
+    results = run_deterministic_geometry_pass(target_pdf, page_number=page_num)
+
+    print(f"\n[SCALE]: {results['scale']['scale_string']}  ({results['scale']['points_per_foot']} pts/ft)  explicit={results['scale']['is_explicit']}  source={results['scale']['source']}")
+    print(f"\n[VERTICAL GRIDS] ({len(results['vertical_grids'])}) side={results['vertical_axis_meta'].get('side')} primary={results['vertical_axis_meta'].get('primary_count')} secondary={results['vertical_axis_meta'].get('secondary_count')}:")
+    print("  " + ", ".join(f"{g['label']}@{g['x']}" for g in results['vertical_grids']))
+    print(f"\n[HORIZONTAL GRIDS] ({len(results['horizontal_grids'])}) side={results['horizontal_axis_meta'].get('side')} primary={results['horizontal_axis_meta'].get('primary_count')} secondary={results['horizontal_axis_meta'].get('secondary_count')}:")
+    print("  " + ", ".join(f"{g['label']}@{g['y']}" for g in results['horizontal_grids']))
+
+    print(f"\n[HORIZONTAL BAYS] ({len(results['horizontal_bays'])}):")
+    for bay in results["horizontal_bays"]:
+        flag = "  [FLAGGED: disagrees with sheet text]" if bay["flagged"] else ""
+        ocr = f"  (sheet says: {bay['ocr_text']})" if bay["ocr_text"] else ""
+        print(f"  {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{ocr}{flag}")
+
+    print(f"\n[VERTICAL BAYS] ({len(results['vertical_bays'])}):")
+    for bay in results["vertical_bays"]:
+        flag = "  [FLAGGED: disagrees with sheet text]" if bay["flagged"] else ""
+        ocr = f"  (sheet says: {bay['ocr_text']})" if bay["ocr_text"] else ""
+        print(f"  {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{ocr}{flag}")
+
+    print(f"\n[INTERSECTIONS]: {results['total_intersections_count']} grid intersections generated with crop bounding boxes.")
+
+    print(f"\n[HORIZONTAL DIMENSION TRACKS] (numbers axis): {results['horizontal_dimension_track_count']} track(s) found")
+    for ti, track in enumerate(results["horizontal_dimension_tracks"]):
+        print(f"  Track {ti+1}: side={track['side']}  primary={track['primary_count']}  secondary={track['secondary_count']}  grids=[{', '.join(g['label'] for g in track['grids'])}]")
+        for bay in track["bays"]:
+            flag = "  [FLAGGED]" if bay["flagged"] else ""
+            print(f"      {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{flag}")
+
+    print(f"\n[VERTICAL DIMENSION TRACKS] (letters axis): {results['vertical_dimension_track_count']} track(s) found")
+    for ti, track in enumerate(results["vertical_dimension_tracks"]):
+        print(f"  Track {ti+1}: side={track['side']}  primary={track['primary_count']}  secondary={track['secondary_count']}  grids=[{', '.join(g['label'] for g in track['grids'])}]")
+        for bay in track["bays"]:
+            flag = "  [FLAGGED]" if bay["flagged"] else ""
+            print(f"      {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{flag}")

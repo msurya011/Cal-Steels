@@ -5,13 +5,13 @@ import { useWorkspaceStore } from '../../../lib/stores/workspaceStore'
 export function useMembers(pageId: string | null) {
   const queryClient = useQueryClient()
 
-  // Query: Get all members for page (cached in memory for instant page navigation)
+  // Query: Get all members for page (with cache to make navigation instant)
   const { data: members = [], isLoading, error } = useQuery({
     queryKey: ['members', pageId],
     queryFn: () => (pageId ? membersApi.list(pageId) : Promise.resolve([])),
     enabled: !!pageId,
-    staleTime: 1000 * 60 * 5, // 5 minutes fresh
-    gcTime: 1000 * 60 * 30,    // 30 minutes in memory cache
+    staleTime: 1000 * 60,
+    gcTime: 1000 * 60 * 10,
   })
 
   // Every mutation below also calls bumpModelRefresh(pageId) -- previously
@@ -77,6 +77,10 @@ export function useMembers(pageId: string | null) {
     mutationFn: (options: any) => {
       if (!pageId) throw new Error('No active page')
       return membersApi.analyse(pageId, options)
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['members', pageId] })
+      if (pageId) useWorkspaceStore.getState().bumpModelRefresh(pageId)
     },
   })
 

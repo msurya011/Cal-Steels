@@ -255,8 +255,8 @@ export const floorsApi = {
       method: 'PATCH',
       body: JSON.stringify({ floor_id: floorId, zone_label: zoneLabel }),
     }),
-  overrideRegistration: (pageId: string, data: { tx_ft?: number; ty_ft?: number; rotation_deg?: number }) =>
-    apiFetch(`/api/v1/pages/${pageId}/registration`, { method: 'PATCH', body: JSON.stringify(data) }),
+  getGridDimensions: (pageId: string, scaleNum?: number | null) =>
+    apiFetch(`/api/v1/pages/${pageId}/grid-dimensions${scaleNum ? `?scale_num=${scaleNum}` : ''}`),
 }
 
 // ── CONFIG API ───────────────────────────────────────────────────────────────

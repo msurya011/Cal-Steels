@@ -74,6 +74,7 @@ export interface LayerPreset {
     reactions: boolean
     columnProjections: boolean
     lengthFilter: boolean
+    gridDimensions: boolean
   }
   colorMode: 'kind' | 'status' | 'sequence' | 'weight' | 'labor_code' | 'paint'
 }
@@ -95,6 +96,7 @@ export interface LayersState {
     reactions: boolean
     columnProjections: boolean
     lengthFilter: boolean
+    gridDimensions: boolean
   }
   colorMode: 'kind' | 'status' | 'sequence' | 'weight' | 'labor_code' | 'paint'
   activePresetId: string | null
@@ -120,6 +122,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
+      gridDimensions: true,
     },
     colorMode: 'kind'
   },
@@ -141,6 +144,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       reactions: false,
       columnProjections: false,
       lengthFilter: false,
+      gridDimensions: false,
     },
     colorMode: 'kind'
   },
@@ -162,6 +166,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
+      gridDimensions: true,
     },
     colorMode: 'status'
   },
@@ -183,6 +188,7 @@ export const DEFAULT_PRESETS: LayerPreset[] = [
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
+      gridDimensions: true,
     },
     colorMode: 'kind'
   }
@@ -200,6 +206,7 @@ const getInitialLayers = (): LayersState => {
         if (parsed.aids.reactions === undefined) parsed.aids.reactions = false
         if (parsed.aids.columnProjections === undefined) parsed.aids.columnProjections = true
         if (parsed.aids.lengthFilter === undefined) parsed.aids.lengthFilter = false
+        if (parsed.aids.gridDimensions === undefined) parsed.aids.gridDimensions = true
         if (parsed.classColors) {
           if (parsed.classColors.beam === '#BE185D') parsed.classColors.beam = '#8B5CF6'
           if (parsed.classColors.joist === '#7C3AED' || parsed.classColors.joist === '#06B6D4') parsed.classColors.joist = '#10B981'
@@ -227,6 +234,7 @@ const getInitialLayers = (): LayersState => {
       reactions: false,
       columnProjections: true,
       lengthFilter: false,
+      gridDimensions: true,
     },
     colorMode: 'kind',
     activePresetId: null,
@@ -366,6 +374,9 @@ interface WorkspaceState {
   setWrapperSize: (w: number, h: number) => void
   setImageNaturalWidth: (w: number | null) => void
   setImageAspect: (a: number) => void
+  pageGridDimensions: Record<string, any[]>
+  gridDimensions: any[]
+  setGridDimensions: (pageIdOrDims: any, maybeDims?: any[]) => void
   resetTakeoffState: () => void
 
   // Member Segregation mutations
@@ -527,11 +538,53 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
   triggerResetView: () => set((state) => ({ resetViewSignal: state.resetViewSignal + 1, zoomLevel: 1.0 })),
   selectMember: (id) => set({ selectedMemberId: id, selection: id ? new Set([id]) : new Set() }),
   setActiveTab: (tab) => set({ activeTab: tab }),
-  setCurrentPage: (id, idx) => set({ currentPageId: id, currentPageIndex: idx }),
-  setScale: (label, ratio) => set({ selectedScale: label, selectedRatio: ratio }),
+  setCurrentPage: (id, idx) =>
+    set((s) => {
+      if (s.currentPageId === id && s.currentPageIndex === idx) return s
+      return {
+        currentPageId: id,
+        currentPageIndex: idx,
+        gridDimensions: (id && s.pageGridDimensions && s.pageGridDimensions[id]) ? s.pageGridDimensions[id] : [],
+      }
+    }),
+  setScale: (label, ratio) =>
+    set((s) => {
+      if (s.selectedScale === label && s.selectedRatio === ratio) return s
+      return { selectedScale: label, selectedRatio: ratio }
+    }),
+
   setWrapperSize: (w, h) => set({ wrapperSize: { w, h } }),
   setImageNaturalWidth: (w) => set({ imageNaturalWidth: w }),
   setImageAspect: (a) => set({ imageAspect: a }),
+  pageGridDimensions: {},
+  gridDimensions: [],
+  setGridDimensions: (pageIdOrDims: any, maybeDims?: any[]) => {
+    if (typeof pageIdOrDims === 'string') {
+      const pageId = pageIdOrDims
+      const dims = maybeDims || []
+      set((s) => {
+        const prev = s.pageGridDimensions?.[pageId]
+        if (prev === dims) return s
+        if (Array.isArray(prev) && Array.isArray(dims) && prev.length === 0 && dims.length === 0) return s
+        return {
+          pageGridDimensions: { ...s.pageGridDimensions, [pageId]: dims },
+          gridDimensions: s.currentPageId === pageId ? dims : s.gridDimensions,
+        }
+      })
+    } else {
+      const dims = pageIdOrDims || []
+      set((s) => {
+        if (s.gridDimensions === dims) return s
+        if (Array.isArray(s.gridDimensions) && Array.isArray(dims) && s.gridDimensions.length === 0 && dims.length === 0) return s
+        return {
+          gridDimensions: dims,
+          pageGridDimensions: s.currentPageId
+            ? { ...s.pageGridDimensions, [s.currentPageId]: dims }
+            : s.pageGridDimensions,
+        }
+      })
+    }
+  },
   resetTakeoffState: () =>
     set((state) => {
       const defaultLayers = {
@@ -551,6 +604,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
           reactions: false,
           columnProjections: true,
           lengthFilter: false,
+          gridDimensions: true,
         },
         colorMode: 'kind' as const,
         activePresetId: null,

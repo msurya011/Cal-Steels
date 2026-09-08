@@ -60,17 +60,88 @@ export default function TakeoffWorkspacePage() {
     }
   }, [pages, currentPageId, setCurrentPage, setScale])
 
-  // Sync selectedScale when active page changes
+  // Preload drawing images in browser memory for instantaneous page switching
+  useEffect(() => {
+    if (pages && pages.length > 0) {
+      pages.forEach((p: any) => {
+        if (p.image_url) {
+          const img = new Image()
+          img.src = p.image_url
+        }
+        if (p.thumb_url) {
+          const thumb = new Image()
+          thumb.src = p.thumb_url
+        }
+      })
+    }
+  }, [pages])
+
+  // Sync selectedScale when active page changes. Don't mark this page as
+  // "synced" until its record actually shows up in `pages` -- on first
+  // mount `pages` is often still an empty array while the query is in
+  // flight, and if we stamp prevPageId.current before the real record
+  // arrives, this effect's guard (`currentPageId !== prevPageId.current`)
+  // permanently skips the real sync once `pages` finally loads. That left
+  // the scale dropdown stuck on "Select an option" even for a page whose
+  // scale was already saved in the database, which looked like grid
+  // dimension lines were appearing "with no scale set" when a scale had
+  // actually been set earlier -- the dropdown just never caught up.
+  //
+  // The mirror-image bug: when the NEW page has NO scale of its own, we
+  // used to just skip calling setScale entirely -- which left whatever
+  // scale the PREVIOUS page had showing in the toolbar (e.g. switching
+  // from a "1/8" = 1'-0"" page to a brand-new page with no scale yet
+  // still showed "1/8" = 1'-0"" up top). That's a display bug only --
+  // the grid-dimensions fetch is independently gated on THIS page's own
+  // scale_num in the database, so no dimension lines get fabricated from
+  // it -- but it made it look like the app "had a scale" and still failed
+  // to mark the grid. Explicitly clear the display when the new page has
+  // no scale of its own, so the toolbar always reflects the page actually
+  // on screen.
   const prevPageId = React.useRef<string | null>(null)
   useEffect(() => {
-    if (currentPageId && currentPageId !== prevPageId.current) {
+    if (!currentPageId) return
+    const p = pages.find((pg: any) => pg.id === currentPageId)
+    if (!p) return // pages not loaded yet -- retry once `pages` updates
+    if (currentPageId !== prevPageId.current) {
       prevPageId.current = currentPageId
-      const p = pages.find((pg: any) => pg.id === currentPageId)
-      if (p && (p.scale_label || p.scale_num)) {
+      if (p.scale_label || p.scale_num) {
         setScale(p.scale_label, p.scale_num)
+      } else {
+        setScale(null, null)
       }
     }
   }, [currentPageId, pages, setScale])
+
+  // Load grid dimensions for active page (strictly keyed by pageId, only when scale is set)
+  useEffect(() => {
+    if (!currentPageId) {
+      useWorkspaceStore.getState().setGridDimensions([])
+      return
+    }
+
+    const page = pages.find((p: any) => p.id === currentPageId)
+    const hasScale = Boolean((page && page.scale_num && page.scale_num > 0) || (selectedRatio && selectedRatio > 0))
+    if (!hasScale) {
+      useWorkspaceStore.getState().setGridDimensions(currentPageId, [])
+      return
+    }
+
+    let isCurrent = true
+    floorsApi.getGridDimensions(currentPageId).then((dims) => {
+      if (isCurrent && useWorkspaceStore.getState().currentPageId === currentPageId) {
+        useWorkspaceStore.getState().setGridDimensions(currentPageId, Array.isArray(dims) ? dims : [])
+      }
+    }).catch(() => {
+      if (isCurrent && useWorkspaceStore.getState().currentPageId === currentPageId) {
+        useWorkspaceStore.getState().setGridDimensions(currentPageId, [])
+      }
+    })
+    return () => {
+      isCurrent = false
+    }
+  }, [currentPageId, selectedRatio])
+
 
   // Query/Mutations: members
   const {
@@ -212,6 +283,13 @@ export default function TakeoffWorkspacePage() {
       
       await updatePage({ pageId, data })
       toast.success('Page settings saved')
+      if (data.scale_num && pageId === currentPageId) {
+        floorsApi.getGridDimensions(pageId).then((dims) => {
+          if (Array.isArray(dims) && useWorkspaceStore.getState().currentPageId === pageId) {
+            useWorkspaceStore.getState().setGridDimensions(pageId, dims)
+          }
+        }).catch(() => {})
+      }
     } catch (err: any) {
       toast.error(err.message || 'Failed to save page settings')
     }
@@ -293,17 +371,17 @@ export default function TakeoffWorkspacePage() {
           toast.error(`Extraction failed: ${job.error || 'unknown error'}`, { id: 'analysis-toast' })
         } else {
           toast.success(job.message || 'Member extraction completed!', { id: 'analysis-toast' })
+          if (job.result?.grid_dimensions && extractedPageId) {
+            useWorkspaceStore.getState().setGridDimensions(extractedPageId, job.result.grid_dimensions)
+          } else if (extractedPageId) {
+            floorsApi.getGridDimensions(extractedPageId).then((dims) => {
+              if (Array.isArray(dims)) useWorkspaceStore.getState().setGridDimensions(extractedPageId, dims)
+            }).catch(() => {})
+          }
+
           if (extractedPageId) clearPageDirty(extractedPageId)
           queryClient.invalidateQueries({ queryKey: ['members'] })
           queryClient.invalidateQueries({ queryKey: ['pages'] })
-          // Live-merge this page's newly extracted members into the 3D
-          // viewer's persistent scene immediately -- matches the reference
-          // product, where the model updates the instant a sheet finishes
-          // extracting instead of requiring a manual "Build"/reload.
-          // MUST pass the page id: the 3D viewer's incremental loader keys
-          // its "already loaded this page, skip" guard off lastEditedPageId,
-          // so a bare bumpModelRefresh() here silently failed to re-merge a
-          // re-extracted (or newly extracted alongside already-loaded) page.
           bumpModelRefresh(extractedPageId)
         }
       } catch {
@@ -358,10 +436,12 @@ export default function TakeoffWorkspacePage() {
               toast.error(`Analysis failed: ${error}`, { id: 'analysis-toast' })
             } else {
               toast.success('Member extraction completed successfully!', { id: 'analysis-toast' })
-              if (extractingPageId) clearPageDirty(extractingPageId)
-              // Same fix as the polling path above: pass the page id so the
-              // 3D viewer's incremental loader actually re-merges this page
-              // instead of treating it as already-loaded and skipping it.
+              if (extractingPageId) {
+                clearPageDirty(extractingPageId)
+                floorsApi.getGridDimensions(extractingPageId).then((dims) => {
+                  if (Array.isArray(dims)) useWorkspaceStore.getState().setGridDimensions(extractingPageId, dims)
+                }).catch(() => {})
+              }
               bumpModelRefresh(extractingPageId ?? undefined)
             }
             setAnalysingState(false)
@@ -586,6 +666,11 @@ export default function TakeoffWorkspacePage() {
         data: { scale_label: label, scale_num: ratio },
       })
       toast.success(`Scale updated to ${label}`)
+      floorsApi.getGridDimensions(currentPageId).then((dims) => {
+        if (Array.isArray(dims) && useWorkspaceStore.getState().currentPageId === currentPageId) {
+          useWorkspaceStore.getState().setGridDimensions(currentPageId, dims)
+        }
+      }).catch(() => {})
     } catch {
       toast.error('Failed to save scale setting')
     }

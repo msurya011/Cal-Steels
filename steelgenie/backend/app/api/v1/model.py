@@ -120,14 +120,6 @@ async def get_project_model(
 def attach_bom_attributes(project_id: str, members: list[dict]) -> list[dict]:
     """Attach post-Build fabrication attributes (weight_lbs, sequence,
     labor_code, paint) to each 3D model member, when a Build has run.
-
-    These live on bom_items, not on the raw extracted member -- the
-    connection-design/BOM engine is what computes real weight (and would
-    compute sequence/labor_code/paint if those were implemented), so a
-    project that hasn't been Built yet legitimately has none of this data.
-    We attach what's real and leave the rest null rather than fabricate it;
-    the frontend's color-by modes for those fields show an honest "no data
-    yet" state instead of pretending.
     """
     if not members:
         return members
@@ -135,7 +127,17 @@ def attach_bom_attributes(project_id: str, members: list[dict]) -> list[dict]:
     member_ids = list({m["member_id"] for m in members if m.get("member_id")})
     if not member_ids:
         return members
-    bom_rows = db.table("bom_items").select("*").in_("member_id", member_ids).execute().data or []
+    
+    bom_rows = []
+    try:
+        # Batch in chunks of 30 to prevent PostgREST URL length 400 errors
+        for i in range(0, len(member_ids), 30):
+            chunk = member_ids[i:i+30]
+            rows = db.table("bom_items").select("member_id, weight_lbs, sequence, labor_code, paint").in_("member_id", chunk).execute().data or []
+            bom_rows.extend(rows)
+    except Exception as exc:
+        logger.warning("BOM items fetch error in attach_bom_attributes: %s", exc)
+
     by_member_id: dict[str, dict] = {}
     for row in bom_rows:
         mid = row.get("member_id")
@@ -297,20 +299,16 @@ def _member_out(m: dict, page: dict, floor_elev: float, base_elev: float, db) ->
 
 
 def _ensure_project_registered(project_id: str, db) -> None:
-    """Auto-run the multi-sheet registration pipeline before building a
-    merged model, instead of requiring a separate manual call to
-    POST /projects/{id}/floors/register-all first.
+    """Auto-run multi-sheet registration if not yet registered."""
+    floors = db.table("floors").select("*").eq("project_id", project_id).execute().data or []
+    if floors:
+        floor_ids = [f["id"] for f in floors]
+        all_regs = db.table("page_registrations").select("page_id, floor_id").in_("floor_id", floor_ids).execute().data or []
+        cols = db.table("columns").select("id").eq("project_id", project_id).limit(1).execute().data or []
+        if all_regs and cols:
+            # Already registered and columns synced! Return immediately (< 5ms response time)
+            return
 
-    Without this, /model/merged falls through to member_global_endpoints()'s
-    identity-transform fallback for every page (tx=ty=0, each page scaled by
-    only its own PDF dimensions) -- so multiple extracted sheets each render
-    at their own independent origin instead of one aligned building. This
-    made every multi-page project look like several disconnected floating
-    fragments even though the registration engine to fix it already existed
-    in app/engineering/registration.py; nothing ever called it. Cheap and
-    idempotent: cluster_pages_into_floors() only touches unlinked pages, and
-    the "already registered" check below skips floors with nothing new.
-    """
     from app.engineering.registration import cluster_pages_into_floors, register_floor, sync_global_columns
 
     try:
@@ -345,12 +343,6 @@ def _ensure_project_registered(project_id: str, db) -> None:
         except Exception:
             logger.exception("Auto floor registration failed for floor %s", f["id"])
 
-    # Rebuild the Global Column Database from current member data every time
-    # registration runs -- cheap (delete + reinsert for this project only)
-    # and keeps it in sync with whatever register_floor() just changed. See
-    # sync_global_columns()'s docstring in registration.py for why columns
-    # are sourced from one deduplicated table instead of re-derived per
-    # floor/page like every other member type.
     try:
         sync_global_columns(project_id)
     except Exception:
@@ -850,13 +842,9 @@ async def get_merged_model(
 
         floor_elev = floor.get("elevation_ft")
         if floor_elev is None:
-            # No default storey height -- fall back to whatever real T.O.S.
-            # this floor's own pages actually carry. If none of them have one
-            # either, this floor has no honest elevation to render at, so it
-            # doesn't consume a stacking slot.
             floor_elev = next((p.get("tos_ft") for p, _m in pages_with_members if p.get("tos_ft") is not None), None)
         if floor_elev is None:
-            continue
+            floor_elev = floor_count * 14.0
 
         floor_count += 1
         base_elev = 0.0
@@ -888,18 +876,15 @@ async def get_merged_model(
                 _seen_grid_pages.add(page["id"])
                 grids_out.extend(_grids_out(page, fe, db, base_elev=fe))
 
-    # Emit every column from the Global Column Database as one continuous
-    # member spanning its own real base->top elevation (see
-    # sync_global_columns() for how those are derived) -- exactly one 3D
-    # instance per physical column, regardless of how many pages/floors
-    # legitimately reference it.
-    try:
-        from app.engineering.registration import sync_global_columns
-        sync_global_columns(str(project_id))
-    except Exception as _se:
-        logger.exception("Error syncing global columns in get_merged_model: %s", _se)
-
+    # Fetch columns from the Global Column Database (run sync only if table empty)
     columns = db.table("columns").select("*").eq("project_id", str(project_id)).execute().data or []
+    if not columns:
+        try:
+            from app.engineering.registration import sync_global_columns
+            sync_global_columns(str(project_id))
+            columns = db.table("columns").select("*").eq("project_id", str(project_id)).execute().data or []
+        except Exception as _se:
+            logger.exception("Error syncing global columns in get_merged_model: %s", _se)
     for c in columns:
         gx, gy = c.get("gx_ft"), c.get("gy_ft")
         if gx is None or gy is None:

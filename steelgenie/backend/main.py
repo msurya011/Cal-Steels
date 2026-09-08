@@ -83,6 +83,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 # ── Database ──────────────────────────────────────────────────────────────────
 supabase_client = None
 try:
@@ -125,19 +133,18 @@ JOIST_PATTERNS = [
 
 STEEL_PATTERNS = [
     # W-sections: depth 1-2 digits, weight 2-3 digits (all real W shapes ≥ W4X13).
-    # The (?!\d) lookahead prevents matching partial OCR reads like "W16X3" from
-    # "W16X31" or "W16X3128" (garbage from adjacent load annotations).
-    r'W\d{1,2}[Xx]\d{2,3}(?!\d)',
-    # Abbreviated W-sections (depth only, no weight) — drawings that label beams
-    # as "W12", "W16" etc. without lbs/ft.  The negative lookaheads/lookbehinds
-    # prevent matching mid-word (e.g. "HSS10X8X3/8" or "W12X26").
-    r'(?<![A-Z0-9])W\d{1,2}(?![Xx\d])',
-    r'HSS[\d.]+[Xx][\d.]+(?:[Xx][\d.]+(?:/[\d.]+)?)?',  # HSS6X6, HSS6X6X1/4, HSS7.00X0.50
-    r'L\d+[Xx]\d+',
-    r'C\d+[Xx]\d+',
-    r'MC\d+[Xx]\d+',
-    r'ISA[\dXx]+',
-    r'PIPE[\d.]+',
+    # Allows optional spaces around X: "W16X31", "W16 X 31", "W 16 X 31"
+    r'W\s*\d{1,2}\s*[Xx]\s*\d{2,3}(?!\d)',
+    # Abbreviated W-sections (depth only, no weight) — drawings that label beams as "W12", "W16"
+    r'(?<![A-Z0-9])W\s*\d{1,2}(?![Xx\d])',
+    r'HSS\s*[\d.]+\s*[Xx]\s*[\d.]+(?:\s*[Xx]\s*[\d.]+(?:/[\d.]+)?|\s*/\s*[\d.]+)?',  # HSS6X6, HSS6X6X1/4
+    r'WT\s*\d{1,2}\s*[Xx]\s*\d{1,3}',
+    r'HP\s*\d{1,2}\s*[Xx]\s*\d{2,3}',
+    r'L\s*\d+\s*[Xx]\s*\d+(?:\s*[Xx]\s*[\d./]+)?',
+    r'C\s*\d+\s*[Xx]\s*[\d.]+',
+    r'MC\s*\d+\s*[Xx]\s*[\d.]+',
+    r'ISA\s*[\dXx]+',
+    r'PIPE\s*[\d.]+',
     # SJI Joists (K, LH, DLH, JG, KSP)
     *JOIST_PATTERNS,
 ]
@@ -906,7 +913,7 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             # a column back TO that column: a column between the matched piece
             # and the chained end means we crossed into a neighbouring beam.
             _om_x1, _om_y1, _om_x2, _om_y2 = lx1, ly1, lx2, ly2   # original extent
-            _is_heavy_girder = bool(re.match(r'^(?:W3[0-9]|W4[0-9]|W27X[1-9])', p.get("profile", "")))
+            _is_heavy_girder = bool(re.match(r'^(?:W3[0-9]|W4[0-9]|W27X[1-9])', (p.get("profile") or "")))
             _chain_gap_tol = (max(35.0, pts_per_foot * 14.0) if pts_per_foot > 0 else 120.0) if _is_heavy_girder else 4.0
             _c1, _c2, _c3, _c4, _cln = _extend_with_thin_segs(
                 lx1, ly1, lx2, ly2, all_lines,
@@ -3247,7 +3254,7 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
         # 15% of the plan on this axis (checking both edges, since some
         # sheets label both the near and far side) over one that's merely
         # bigger but sits deeper inside the plan.
-        EDGE_MARGIN = 0.15 * span
+        EDGE_MARGIN = 0.35 * span
         edge_groups = [
             grp for grp in candidate_groups
             if (sum(p[axis_idx] for p in grp) / len(grp)) <= lo + EDGE_MARGIN
@@ -3279,24 +3286,48 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
         actually a grid: e.g. a printed load/area schedule table can have a
         tight column of numbers (tripping the band filter) whose VALUES
         don't track position — real grid bubbles are always laid out in
-        ascending (or descending) order along the edge they're printed on,
-        a schedule table's numbers are not. If fewer than min_frac of
-        consecutive (position-sorted) pairs are non-decreasing or
-        non-increasing, this isn't a real grid — drop it entirely rather
-        than risk persisting a wrong "confident" label.
+        ascending (or descending) order along the edge they're printed on.
+        Groups points by band (columns vs rows) and evaluates monotonicity
+        along that band's variation axis (Y for columns, X for rows).
         """
         if len(pts) < 3:
             return pts
-        xs_spread = max(p[1] for p in pts) - min(p[1] for p in pts)
-        ys_spread = max(p[2] for p in pts) - min(p[2] for p in pts)
-        axis_idx = 1 if xs_spread >= ys_spread else 2
-        sv = sorted(pts, key=lambda p: p[axis_idx])
-        vals = [_label_rank(p[0]) for p in sv]
-        n = len(vals) - 1
-        inc = sum(1 for i in range(n) if vals[i + 1] >= vals[i])
-        dec = sum(1 for i in range(n) if vals[i + 1] <= vals[i])
-        frac = max(inc, dec) / n
-        return pts if frac >= min_frac else []
+        cols: dict[int, list] = {}
+        for p in pts:
+            cols.setdefault(round(p[1] / 60.0), []).append(p)
+        rows: dict[int, list] = {}
+        for p in pts:
+            rows.setdefault(round(p[2] / 60.0), []).append(p)
+        
+        max_col_size = max((len(c) for c in cols.values()), default=0)
+        max_row_size = max((len(r) for r in rows.values()), default=0)
+        
+        kept = []
+        if max_col_size >= max_row_size:
+            for col_pts in cols.values():
+                if len(col_pts) < 3:
+                    kept.extend(col_pts)
+                    continue
+                sp = sorted(col_pts, key=lambda p: p[2])
+                vals = [_label_rank(p[0]) for p in sp]
+                n = len(vals) - 1
+                inc = sum(1 for i in range(n) if vals[i + 1] >= vals[i])
+                dec = sum(1 for i in range(n) if vals[i + 1] <= vals[i])
+                if max(inc, dec) / n >= min_frac:
+                    kept.extend(col_pts)
+        else:
+            for row_pts in rows.values():
+                if len(row_pts) < 3:
+                    kept.extend(row_pts)
+                    continue
+                sp = sorted(row_pts, key=lambda p: p[1])
+                vals = [_label_rank(p[0]) for p in sp]
+                n = len(vals) - 1
+                inc = sum(1 for i in range(n) if vals[i + 1] >= vals[i])
+                dec = sum(1 for i in range(n) if vals[i + 1] <= vals[i])
+                if max(inc, dec) / n >= min_frac:
+                    kept.extend(row_pts)
+        return kept if kept else pts
 
     letter_pts = _monotonic_filter(_dominant_band(letter_pts))
     number_pts = _monotonic_filter(_dominant_band(number_pts))
@@ -3399,6 +3430,371 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
     return v_grid, h_grid, v_labels, h_labels
 
 
+# ── Grid Dimension Extraction ──────────────────────────────────────────────────
+def parse_dimension_string(s: str) -> float | None:
+    """Parse an architectural dimension string (e.g. 31'-4", 31'-4 1/2", 216'-0 5/8", 20', 16") into decimal feet."""
+    if not s:
+        return None
+    s = s.strip()
+    m = re.search(r"(\d+)\s*['’](?:\s*[-–]\s*(\d+(?:\s+\d+/\d+|\.\d+|/\d+)?)\s*[\"”]?)?", s)
+    if not m:
+        m2 = re.search(r"^(\d+(?:\s+\d+/\d+)?)\s*[\"”]$", s)
+        if m2:
+            val_str = m2.group(1)
+            if '/' in val_str:
+                parts = val_str.split()
+                if len(parts) == 2:
+                    whole = float(parts[0])
+                    num, den = map(float, parts[1].split('/'))
+                    return (whole + num/den) / 12.0
+                elif len(parts) == 1:
+                    num, den = map(float, parts[0].split('/'))
+                    return (num/den) / 12.0
+            return float(val_str) / 12.0
+        return None
+    
+    feet = float(m.group(1))
+    inch_part = m.group(2)
+    if not inch_part:
+        return feet
+    inch_part = inch_part.strip()
+    if ' ' in inch_part:
+        w, frac = inch_part.split(' ', 1)
+        whole = float(w)
+        num, den = map(float, frac.split('/'))
+        return feet + (whole + num/den) / 12.0
+    elif '/' in inch_part:
+        num, den = map(float, inch_part.split('/'))
+        return feet + (num/den) / 12.0
+    else:
+        return feet + float(inch_part) / 12.0
+
+
+def ft_to_arch_str(ft_val: float) -> str:
+    """Convert decimal feet to architectural feet-inches string (e.g. 31.33 -> 31'-4")."""
+    feet = int(ft_val)
+    inches = (ft_val - feet) * 12.0
+    int_inches = int(round(inches))
+    if int_inches == 12:
+        feet += 1
+        int_inches = 0
+    return f"{feet}'-{int_inches}\""
+
+
+_IGNORE_DIM_PREFIXES = ("T.O.S", "TOC", "T.O.", "EL.", "ELEV", "SCALE", "FINISH", "DETAIL", "SECTION", "#", "REBAR", "BAR", "DECK", "CONC")
+
+def is_valid_dim_text(text: str) -> bool:
+    """Check if text span is a valid architectural dimension (e.g. 31'-4", 33'-0", 12'-0 5/8", 10", 2'-3 5/8")."""
+    t = text.strip().upper()
+    if any(t.startswith(p) or p in t for p in _IGNORE_DIM_PREFIXES):
+        return False
+    if re.match(r"^\d+\s*['’]", t) or re.match(r"^\d+(?:/\d+|\s+\d+/\d+)?\s*[\"”]$", t):
+        return True
+    return False
+
+
+def extract_grid_dimensions(page, page_w: float, page_h: float, plan_bounds: tuple,
+                            v_grid: list, h_grid: list,
+                            v_labels: dict, h_labels: dict,
+                            pts_per_foot: float, text_dict: dict = None,
+                            is_explicit_scale: bool = True) -> list[dict]:
+    """
+    Extract clean, non-overlapping consecutive grid-to-grid bay dimension lines and outer total lines.
+    - Consecutive bay chain along the inner track (every bay: A-A.5, A.5-B, B-B.2, B.2-B.3, B.3-B.6...)
+    - Full building total dimension along the outer track (A-D TOTAL, 1-7.2 TOTAL)
+    - Zero duplicate overlapping lines, exact grid bubble snap.
+    """
+    if not v_grid and not h_grid:
+        return []
+    
+    ppf = pts_per_foot if (pts_per_foot and pts_per_foot > 0) else 9.0
+    td = text_dict or page.get_text("dict")
+    scale_source = "explicit" if is_explicit_scale else "guessed"
+    
+    # 1. Collect all dimension text spans across the drawing
+    dim_spans: list[dict] = []
+    for b in td.get("blocks", []):
+        for l in b.get("lines", []):
+            for sp in l.get("spans", []):
+                t = sp.get("text", "").strip()
+                if not is_valid_dim_text(t):
+                    continue
+                val = parse_dimension_string(t)
+                if val is not None and 0.5 <= val <= 350.0:
+                    cx = (sp["bbox"][0] + sp["bbox"][2]) / 2
+                    cy = (sp["bbox"][1] + sp["bbox"][3]) / 2
+                    dim_spans.append({
+                        "text": t,
+                        "val_ft": val,
+                        "cx": cx,
+                        "cy": cy,
+                        "bbox": sp["bbox"]
+                    })
+    
+    results: list[dict] = []
+    sorted_v = sorted(set(v_grid)) if v_grid else []
+    sorted_h = sorted(set(h_grid)) if h_grid else []
+    
+    min_h = min(h_grid) if h_grid else (plan_bounds[1] if plan_bounds else page_h * 0.2)
+    max_h = max(h_grid) if h_grid else (plan_bounds[3] if plan_bounds else page_h * 0.8)
+    min_v = min(v_grid) if v_grid else (plan_bounds[0] if plan_bounds else page_w * 0.2)
+    max_v = max(v_grid) if v_grid else (plan_bounds[2] if plan_bounds else page_w * 0.8)
+    
+    # Extract raw bubble points per margin using physical coordinate alignment to actual grid lines
+    all_bubbles_raw = []
+    for b in td.get("blocks", []):
+        for l in b.get("lines", []):
+            for sp in l.get("spans", []):
+                t = sp.get("text", "").strip()
+                bbox = sp.get("bbox", [])
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                if _GRID_LETTER.match(t) or _GRID_NUMBER.match(t):
+                    all_bubbles_raw.append((t, cx, cy))
+
+    v_bubbles_raw = [b for b in all_bubbles_raw if any(abs(b[1] - vx) <= 25.0 for vx in sorted_v)]
+    h_bubbles_raw = [b for b in all_bubbles_raw if any(abs(b[2] - hy) <= 25.0 for hy in sorted_h)]
+
+    # ── 1. Vertical Grid Lines (Horizontal Top & Bottom Tracks) ─────────────────
+    def _extract_side_band(b_list, is_x_axis=True):
+        if not b_list:
+            return []
+        coord_idx = 1 if is_x_axis else 2
+        var_idx = 2 if is_x_axis else 1
+        buckets = {}
+        for b in b_list:
+            key = round(b[coord_idx] / 10.0) * 10.0
+            buckets.setdefault(key, []).append(b)
+        best_bucket = max(buckets.values(), key=len) if buckets else []
+        if len(best_bucket) >= 3:
+            return sorted(best_bucket, key=lambda b: b[var_idx])
+        return []
+
+    top_band_raw = _extract_side_band([b for b in all_bubbles_raw if b[2] < page_h * 0.35 and any(abs(b[1] - vx) <= 25.0 for vx in sorted_v)], is_x_axis=False)
+    bot_band_raw = _extract_side_band([b for b in all_bubbles_raw if b[2] > page_h * 0.65 and any(abs(b[1] - vx) <= 25.0 for vx in sorted_v)], is_x_axis=False)
+    left_band_raw = _extract_side_band([b for b in all_bubbles_raw if b[1] < page_w * 0.35 and any(abs(b[2] - hy) <= 25.0 for hy in sorted_h)], is_x_axis=True)
+    right_band_raw = _extract_side_band([b for b in all_bubbles_raw if b[1] > page_w * 0.65 and any(abs(b[2] - hy) <= 25.0 for hy in sorted_h)], is_x_axis=True)
+
+    top_v_grids = [b[1] for b in top_band_raw] if top_band_raw else sorted_v
+    top_v_labels = {b[1]: b[0] for b in top_band_raw} if top_band_raw else v_labels
+    bot_v_grids = [b[1] for b in bot_band_raw] if bot_band_raw else sorted_v
+    bot_v_labels = {b[1]: b[0] for b in bot_band_raw} if bot_band_raw else v_labels
+
+    left_h_grids = [b[2] for b in left_band_raw] if left_band_raw else sorted_h
+    left_h_labels = {b[2]: b[0] for b in left_band_raw} if left_band_raw else h_labels
+    right_h_grids = [b[2] for b in right_band_raw] if right_band_raw else sorted_h
+    right_h_labels = {b[2]: b[0] for b in right_band_raw} if right_band_raw else h_labels
+
+    def _find_validated_tracks(cands, grid_coords, is_horizontal_track=True):
+        if len(cands) < 2:
+            return []
+        buckets: dict[float, list] = {}
+        for ds in cands:
+            pos = ds["cy"] if is_horizontal_track else ds["cx"]
+            key = round(pos / 20.0) * 20.0
+            buckets.setdefault(key, []).append(ds)
+        
+        scored_tracks = []
+        for track_pos, bucket_cands in buckets.items():
+            if len(bucket_cands) < 2:
+                continue
+            matching_spans = []
+            for dt in bucket_cands:
+                p_coord = dt["cx"] if is_horizontal_track else dt["cy"]
+                dim_val = dt["val_ft"]
+                for i in range(len(grid_coords) - 1):
+                    g1 = grid_coords[i]
+                    g2 = grid_coords[i+1]
+                    if g1 - 25.0 <= p_coord <= g2 + 25.0:
+                        calc_ft = abs(g2 - g1) / ppf
+                        err = abs(dim_val - calc_ft)
+                        tol = max(2.0, calc_ft * 0.18)
+                        if err <= tol:
+                            matching_spans.append((dt, g1, g2, calc_ft, err))
+                            break
+            if len(matching_spans) >= 2 or (len(bucket_cands) >= 3 and len(matching_spans) >= 1):
+                scored_tracks.append((len(matching_spans), len(bucket_cands), track_pos, bucket_cands))
+        
+        if not scored_tracks:
+            return []
+        # Return only the single highest-scoring, cleanest track for this margin
+        scored_tracks.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        best = scored_tracks[0]
+        return [(best[3], best[2])]
+
+    if len(sorted_v) >= 2:
+        top_cands = [ds for ds in dim_spans if ds["cy"] < min_h + 30.0 and min_v - 60 <= ds["cx"] <= max_v + 60]
+        bot_cands = [ds for ds in dim_spans if ds["cy"] > max_h - 30.0 and min_v - 60 <= ds["cx"] <= max_v + 60]
+        
+        track_y_list = [
+            (cands, tpos, top_v_grids, top_v_labels)
+            for cands, tpos in _find_validated_tracks(top_cands, top_v_grids, is_horizontal_track=True)
+        ] + [
+            (cands, tpos, bot_v_grids, bot_v_labels)
+            for cands, tpos in _find_validated_tracks(bot_cands, bot_v_grids, is_horizontal_track=True)
+        ]
+            
+        for side_cands, track_y, side_grids, side_labels in track_y_list:
+            for i in range(len(side_grids) - 1):
+                vx1 = side_grids[i]
+                vx2 = side_grids[i+1]
+                dist_pt = vx2 - vx1
+                if dist_pt < 2.0:
+                    continue
+                
+                calc_ft = round(dist_pt / ppf, 2)
+                final_ft = calc_ft
+                final_text = ft_to_arch_str(calc_ft)
+                
+                fl = side_labels.get(vx1, str(i+1))
+                tl = side_labels.get(vx2, str(i+2))
+                
+                matched_ocr = None
+                best_diff = min(2.0, max(0.5, calc_ft * 0.15))
+                for dt in side_cands:
+                    if vx1 - 15.0 <= dt["cx"] <= vx2 + 15.0:
+                        diff = abs(dt["val_ft"] - calc_ft)
+                        if diff < best_diff:
+                            best_diff = diff
+                            matched_ocr = dt
+                
+                results.append({
+                    "id": f"dim_v_{fl}_{tl}_{round(track_y)}",
+                    "axis": "V",
+                    "from_grid": str(fl),
+                    "to_grid": str(tl),
+                    "label": f"{fl}–{tl}",
+                    "length_ft": final_ft,
+                    "text": final_text,
+                    "x1": round(vx1 / page_w, 4),
+                    "y1": round(track_y / page_h, 4),
+                    "x2": round(vx2 / page_w, 4),
+                    "y2": round(track_y / page_h, 4),
+                    "source": "scale_verified" if matched_ocr else "scale_computed",
+                    "ocr_text": matched_ocr["text"] if matched_ocr else None,
+                    "scale_source": scale_source
+                })
+                
+            # Overall Total Width Dimension
+            total_v_dist = side_grids[-1] - side_grids[0]
+            total_v_ft = round(total_v_dist / ppf, 2)
+            first_v = side_labels.get(side_grids[0], "1")
+            last_v = side_labels.get(side_grids[-1], str(len(side_grids)))
+            tot_y = track_y - 25.0 if track_y < page_h * 0.5 else track_y + 25.0
+            
+            matched_tot = None
+            for dt in side_cands:
+                if abs(dt["val_ft"] - total_v_ft) <= 3.0:
+                    matched_tot = dt
+                    tot_y = dt["cy"]
+                    break
+                    
+            results.append({
+                "id": f"dim_v_total_{first_v}_{last_v}_{round(tot_y)}",
+                "axis": "V",
+                "from_grid": str(first_v),
+                "to_grid": str(last_v),
+                "label": f"{first_v}–{last_v} (TOTAL)",
+                "length_ft": total_v_ft,
+                "text": ft_to_arch_str(total_v_ft),
+                "x1": round(side_grids[0] / page_w, 4),
+                "y1": round(tot_y / page_h, 4),
+                "x2": round(side_grids[-1] / page_w, 4),
+                "y2": round(tot_y / page_h, 4),
+                "source": "scale_verified" if matched_tot else "scale_computed",
+                "ocr_text": matched_tot["text"] if matched_tot else None,
+                "scale_source": scale_source
+            })
+
+    # ── 2. Horizontal Grid Lines (Vertical Left & Right Tracks) ─────────────────
+    if len(sorted_h) >= 2:
+        left_cands = [ds for ds in dim_spans if ds["cx"] < min_v + 40.0 and min_h - 60 <= ds["cy"] <= max_h + 60]
+        right_cands = [ds for ds in dim_spans if ds["cx"] > max_v - 40.0 and min_h - 60 <= ds["cy"] <= max_h + 60]
+        
+        track_x_list = [
+            (cands, tpos, left_h_grids, left_h_labels)
+            for cands, tpos in _find_validated_tracks(left_cands, left_h_grids, is_horizontal_track=False)
+        ] + [
+            (cands, tpos, right_h_grids, right_h_labels)
+            for cands, tpos in _find_validated_tracks(right_cands, right_h_grids, is_horizontal_track=False)
+        ]
+            
+        for side_cands, track_x, side_grids, side_labels in track_x_list:
+            for j in range(len(side_grids) - 1):
+                hy1 = side_grids[j]
+                hy2 = side_grids[j+1]
+                dist_pt = hy2 - hy1
+                if dist_pt < 2.0:
+                    continue
+                
+                # 100% Pure scale computation — zero OCR text overriding
+                calc_ft = round(dist_pt / ppf, 2)
+                final_ft = calc_ft
+                final_text = ft_to_arch_str(calc_ft)
+                
+                fl = side_labels.get(hy1, chr(65 + j))
+                tl = side_labels.get(hy2, chr(65 + j + 1))
+                
+                matched_ocr = None
+                best_diff = min(2.0, max(0.5, calc_ft * 0.15))
+                for dt in side_cands:
+                    if hy1 - 15.0 <= dt["cy"] <= hy2 + 15.0:
+                        diff = abs(dt["val_ft"] - calc_ft)
+                        if diff < best_diff:
+                            best_diff = diff
+                            matched_ocr = dt
+                
+                results.append({
+                    "id": f"dim_h_{fl}_{tl}_{round(track_x)}",
+                    "axis": "H",
+                    "from_grid": str(fl),
+                    "to_grid": str(tl),
+                    "label": f"{fl}–{tl}",
+                    "length_ft": final_ft,
+                    "text": final_text,
+                    "x1": round(track_x / page_w, 4),
+                    "y1": round(hy1 / page_h, 4),
+                    "x2": round(track_x / page_w, 4),
+                    "y2": round(hy2 / page_h, 4),
+                    "source": "scale_verified" if matched_ocr else "scale_computed",
+                    "ocr_text": matched_ocr["text"] if matched_ocr else None,
+                    "scale_source": scale_source
+                })
+                
+            # Overall Total Height Dimension
+            total_h_dist = side_grids[-1] - side_grids[0]
+            total_h_ft = round(total_h_dist / ppf, 2)
+            first_h = side_labels.get(side_grids[0], "A")
+            last_h = side_labels.get(side_grids[-1], "D")
+            tot_x = track_x + 30.0 if track_x > page_w * 0.5 else track_x - 30.0
+            
+            matched_tot_h = None
+            for dt in side_cands:
+                if abs(dt["val_ft"] - total_h_ft) <= 3.0:
+                    matched_tot_h = dt
+                    tot_x = dt["cx"]
+                    break
+                    
+            results.append({
+                "id": f"dim_h_total_{first_h}_{last_h}_{round(tot_x)}",
+                "axis": "H",
+                "from_grid": str(first_h),
+                "to_grid": str(last_h),
+                "label": f"{first_h}–{last_h} (TOTAL)",
+                "length_ft": total_h_ft,
+                "text": ft_to_arch_str(total_h_ft),
+                "x1": round(tot_x / page_w, 4),
+                "y1": round(side_grids[0] / page_h, 4),
+                "x2": round(tot_x / page_w, 4),
+                "y2": round(side_grids[-1] / page_h, 4),
+                "source": "scale_verified" if matched_tot_h else "scale_computed",
+                "ocr_text": matched_tot_h["text"] if matched_tot_h else None,
+                "scale_source": scale_source
+            })
+
+    return results
+
+
 # ── Member classification ─────────────────────────────────────────────────────
 def classify_member(profile: str,
                     cx: float = 0, cy: float = 0,
@@ -3420,7 +3816,9 @@ def classify_member(profile: str,
     Keeping TIER 3 (depth rule) separate ensures short W-sections are caught
     even on drawings where symbol detection or grid detection yields nothing.
     """
-    p = profile.upper().strip()
+    if not profile or profile == "?":
+        return "beam"
+    p = str(profile or "").upper().strip()
 
     # ── SJI Steel Joist sections (K, LH, DLH, JG, KSP, CS) ────────────────────
     if (re.match(r'^\d{1,2}K\d+$', p) or
@@ -3605,6 +4003,23 @@ def detect_schedule_zones(page, plan_bounds, text_dict=None):
         pass
 
     excluded = []
+    # ── Key Plan thumbnail exclusion ──────────────────────────────────────────
+    # Exclude Key Plan index map (e.g. area diagrams, garage footprint) in sheet corners
+    for block in _td.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                t = span.get("text", "").strip().upper()
+                if "KEY PLAN" in t or "KEYPLAN" in t:
+                    bx0, by0, bx1, by1 = span["bbox"]
+                    # Key Plan box typically extends 250 pt up/around the "KEY PLAN" label
+                    kp_zone = (
+                        max(0, bx0 - 220),
+                        max(0, by0 - 320),
+                        bx1 + 220,
+                        by1 + 80
+                    )
+                    excluded.append(kp_zone)
+                    print(f"[EXCLUDE] Key Plan exclusion zone detected: ({kp_zone[0]:.0f}, {kp_zone[1]:.0f}) -> ({kp_zone[2]:.0f}, {kp_zone[3]:.0f})")
     used = [False] * len(hits)
 
     for i, (ax, ay) in enumerate(hits):
@@ -4077,7 +4492,7 @@ def build_members(profiles, page_w, page_h,
         # Definitive column sections — PIPE is ALWAYS a column (a column
         # viewed in plan often sits on a grid/wall line, so the line match
         # must NOT demote it to a beam).
-        _pu = p["profile"].upper()
+        _pu = (p.get("profile") or "").upper()
         _definitive_col = bool(re.match(r'PIPE', _pu))
         _hssm = re.match(r'HSS([\d.]+)[Xx]([\d.]+)', _pu)
         _is_square_hss = False
@@ -4130,7 +4545,7 @@ def build_members(profiles, page_w, page_h,
         # (e.g. no matching vector line found), trust the section properties and
         # reclassify back to beam.
         if mtype == "column" and p_idx in symbol_matched_cols:
-            _wm = re.match(r'W(\d+)[Xx](\d+)', p["profile"].upper())
+            _wm = re.match(r'W(\d+)[Xx](\d+)', (p.get("profile") or "").upper())
             if _wm:
                 _sd, _sw = int(_wm.group(1)), int(_wm.group(2))
                 _clearly_beam = (
@@ -4156,7 +4571,7 @@ def build_members(profiles, page_w, page_h,
         # a 3x3 HSS is never a column no matter which path produced that
         # classification.
         if mtype == "column":
-            _pu2 = p["profile"].upper()
+            _pu2 = (p.get("profile") or "").upper()
             _is_angle = bool(re.match(r'^L\d', _pu2))
             _hsm2 = re.match(r'^HSS([\d.]+)[Xx]([\d.]+)', _pu2)
             _is_small_hss = False
@@ -4229,7 +4644,7 @@ def build_members(profiles, page_w, page_h,
                 # off-axis angle.  Reject only STEEP diagonals; keep gently-angled
                 # ones so the overlay follows the actual skewed beam instead of
                 # being flattened to horizontal/vertical by the grid fallback.
-                _is_w_section = re.match(r'W\d+[Xx]\d+', p["profile"].upper())
+                _is_w_section = bool(re.match(r'W\d+[Xx]\d+', (p.get("profile") or "").upper()))
                 if _is_w_section and beam_dir == "D":
                     _adx = line_hit["x2"] - line_hit["x1"]
                     _ady = line_hit["y2"] - line_hit["y1"]
@@ -4411,7 +4826,7 @@ def build_members(profiles, page_w, page_h,
         # always false matches to grid / border / dimension lines).  The depth is
         # the first number in the name (W16X.. / HSS16X4.. / C8X11 / MC12X31).
         if bx1 is not None and mtype == "beam" and length_ft > 0:
-            _depth_match = re.match(r'(?:W|HSS|MC|C)(\d{1,2})', p["profile"], re.IGNORECASE)
+            _depth_match = re.match(r'(?:W|HSS|MC|C)(\d{1,2})', str(p.get("profile") or ""), re.IGNORECASE)
             if _depth_match:
                 _nom_depth = int(_depth_match.group(1))
                 _max_span_ft = _nom_depth * 6     # realistic upper bound (L/d ~72)
@@ -4425,7 +4840,7 @@ def build_members(profiles, page_w, page_h,
         # Heavy section minimum span check: W24-W40 members must span at least 10 ft
         # This drops false matches to callout borders, detail bubbles, or stair leader lines.
         if bx1 is not None and mtype == "beam" and length_ft > 0:
-            _heavy_match = re.match(r'W(2[4-9]|3[0-9]|4[0-9])', p.get("profile", ""), re.IGNORECASE)
+            _heavy_match = re.match(r'W(2[4-9]|3[0-9]|4[0-9])', (p.get("profile") or ""), re.IGNORECASE)
             if _heavy_match and length_ft < 10.0:
                 print(f"[BUILD] Heavy section span too short for {p['profile']} (L={length_ft:.1f}ft < 10ft) — dropped false note leader")
                 bx1 = by1 = bx2 = by2 = None
@@ -4470,31 +4885,32 @@ def build_members(profiles, page_w, page_h,
         else:
             _linked_group_id = None
 
+        is_unlabeled = bool(p.get('unlabeled') or p.get('profile') == '?')
         members.append({
-            "profile":   p["profile"],
-            "type":      mtype,
-            "length_ft": length_ft,
-            "beam_dir":  beam_dir,   # "H" | "V" for beams; None for columns/braces
-            # Beam span endpoints (fractions of page) for the line overlay.
-            # bx1/by1 → bx2/by2 is the physical line drawn from column to column.
-            "bx1": bx1, "by1": by1,
-            "bx2": bx2, "by2": by2,
-            # render position — midpoint of span (or snapped to grid/symbol for cols)
-            "x":  round(render_cx / page_w, 4),
-            "y":  round(render_cy / page_h, 4),
-            # original label text position — used by region filter
-            "lx": round(p["cx"] / page_w, 4),
-            "ly": round(p["cy"] / page_h, 4),
-            # matched column-symbol position (only for symbol-matched columns)
-            "sx": sym[0] if sym else None,
-            "sy": sym[1] if sym else None,
-            "w":  0.025, "h": 0.012,
-            "color":     MEMBER_COLORS.get(mtype, "#6B7280"),
-            "confirmed": True,
-            "is_column": mtype == "column",
-            "geometry": ({"category": _sym_category, "linked_group_id": _linked_group_id, "linked_role": "column" if _linked_group_id else None}
-                         if _sym_category else None),
+            'profile':   None if is_unlabeled else p['profile'],
+            'type':      mtype,
+            'length_ft': length_ft,
+            'beam_dir':  beam_dir,
+            'bx1': bx1, 'by1': by1,
+            'bx2': bx2, 'by2': by2,
+            'x':  round(render_cx / page_w, 4),
+            'y':  round(render_cy / page_h, 4),
+            'lx': round(p['cx'] / page_w, 4),
+            'ly': round(p['cy'] / page_h, 4),
+            'sx': sym[0] if sym else None,
+            'sy': sym[1] if sym else None,
+            'w':  0.025, 'h': 0.012,
+            'color':     MEMBER_COLORS.get('unlabeled' if is_unlabeled else mtype, '#6B7280'),
+            'confirmed': not is_unlabeled,
+            'is_column': mtype == 'column',
+            'unlabeled': is_unlabeled,
+            'geometry': {
+                **({'category': _sym_category, 'linked_group_id': _linked_group_id, 'linked_role': 'column' if _linked_group_id else None} if _sym_category else {}),
+                'unlabeled': is_unlabeled,
+            },
         })
+    # ── Post-processing: drop unlabeled beam stubs & grid lines ──────────────
+    members = [m for m in members if not (m.get("type") == "beam" and (not m.get("profile") or m.get("profile") == "?"))]
 
     # ── Post-processing: remove duplicates and short stubs ───────────────────
     #
@@ -4550,7 +4966,7 @@ def build_members(profiles, page_w, page_h,
         def _weight_digit(prof):
             # Extract the weight number (after X) for tie-breaking: W24X68 → 68
             import re as _re
-            wt = _re.search(r'[Xx](\d+)', prof)
+            wt = _re.search(r'[Xx](\d+)', str(prof or ""))
             return int(wt.group(1)) if wt else 0
         winner = max(candidates, key=_weight_digit)
         # Keep the first member in the group that has the winning profile
@@ -4881,7 +5297,7 @@ def build_summary(members):
         if t in ("beam", "brace", "vertical_brace", "horizontal_brace"):
             L = m.get("length_ft", 0) or 0.0
             if L > 0:
-                w = profile_weight_per_ft(m.get("profile", ""))
+                w = profile_weight_per_ft((m.get("profile") or ""))
                 if w:
                     total_lb   += w * L
                     weighed_ft += L
@@ -5949,7 +6365,11 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
             parts.append(f"confidence {ctx_score:.2f}")
             return "; ".join(parts)
 
-        if not ctx_passed and not has_label_match:
+        _is_col_cat = s.get("category") in (
+            "steel_column", "hss_column", "pipe_column", "built_up_column",
+            "concrete_column", "footing_isolated", "pedestal"
+        )
+        if not ctx_passed and not has_label_match and not _is_col_cat and off_grid:
             rejected += 1
             _LAST_COLUMN_VALIDATION_LOG.append({
                 "cx": cx, "cy": cy, "category": s.get("category"),
@@ -6115,23 +6535,28 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
         })
 
     # ── Emit Suggested Ghost Columns ──────────────────────────────────────────
-    # Framing plans only: a real column is where beams frame in from PERPENDICULAR directions.
-    # Never run on foundation plans (foundation plans have no framing beams; columns come from real footing marks).
+    # Framing plans: columns sit at grid intersections where beams/girders frame into or cross
     if v_grid and h_grid and not is_foundation_plan:
+        _FRAME_DIST = max(36.0, pts_per_foot * 4.0)
         for gx in v_grid:
             for gy in h_grid:
                 close_ends = [(ex, ey) for ex, ey in beam_ends
-                              if math.hypot(gx - ex, gy - ey) < FRAME_PT]
-                unique_ends = []
-                for (ex, ey) in close_ends:
-                    if not any(math.hypot(ex - ux, ey - uy) < END_EQ_PT
-                               for ux, uy in unique_ends):
-                        unique_ends.append((ex, ey))
+                              if math.hypot(gx - ex, gy - ey) < _FRAME_DIST]
+                # Also check if any beam center passes through this grid intersection
+                crossing_beams = []
+                for m in members:
+                    if m.get("type") == "beam" and m.get("bx1") is not None:
+                        bx1, by1 = m["bx1"] * page_w, m["by1"] * page_h
+                        bx2, by2 = m["bx2"] * page_w, m["by2"] * page_h
+                        if min(bx1, bx2) - 15 <= gx <= max(bx1, bx2) + 15 and min(by1, by2) - 15 <= gy <= max(by1, by2) + 15:
+                            dx, dy = bx2 - bx1, by2 - by1
+                            if dx*dx + dy*dy > 0:
+                                t = max(0, min(1, ((gx - bx1)*dx + (gy - by1)*dy) / (dx*dx + dy*dy)))
+                                proj_x, proj_y = bx1 + t*dx, by1 + t*dy
+                                if math.hypot(gx - proj_x, gy - proj_y) < 14.0:
+                                    crossing_beams.append(m)
 
-                _dirs = {beam_end_dirs.get(pt) for pt in unique_ends} - {None}
-                _orthogonal = ({"H", "V"} <= _dirs) if _dirs else True
-
-                if len(unique_ends) >= 2 and _orthogonal:
+                if len(close_ends) >= 1 or len(crossing_beams) >= 1:
                     has_col = False
                     for m in members:
                         if m.get("type") == "column":
@@ -6152,22 +6577,23 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                             "lx": round(gx / page_w, 4), "ly": round(gy / page_h, 4),
                             "sx": round(gx / page_w, 4), "sy": round(gy / page_h, 4),
                             "rotation": 90,
-                            "source": "suggested",
-                            "status": "need_review",
+                            "source": "grid_intersection",
+                            "status": "active",
+                            "confirmed": True,
+                            "is_column": True,
+                            "w": 0.018, "h": 0.018,
+                            "color": MEMBER_COLORS["column"],
                             "geometry": {
                                 "x": round(gx / page_w, 4),
                                 "y": round(gy / page_h, 4),
                                 "raw_x": round(gx / page_w, 4),
-                                "raw_y": round(gx / page_h, 4),
+                                "raw_y": round(gy / page_h, 4),
                                 "snap_offset_ft": 0.0,
                                 "grid_ref": grid_ref,
                                 "symbol": "I",
-                                "depth_in": 10.0,
-                                "error_flags": ["missing"],
-                            },
-                            "w": 0.018, "h": 0.018,
-                            "color": MEMBER_COLORS["column"], "confirmed": False,
-                            "is_column": True, "size_unknown": True,
+                                "depth_in": 12.0,
+                                "error_flags": [],
+                            }
                         })
 
     print(f"[COLUMNS] emitted {len(added)} symbol columns "
@@ -6399,17 +6825,20 @@ def extract_col_text_columns(page, page_w, page_h, members,
 # ── Foundation-Anchored Column Propagation ────────────────────────────────────
 _FOUNDATION_COLUMNS_CACHE: dict[str, list[dict]] = {}
 
+def clear_foundation_columns_cache():
+    """Explicitly clear the in-memory foundation columns cache."""
+    _FOUNDATION_COLUMNS_CACHE.clear()
+
 def get_foundation_columns_for_file(filename: str) -> list[dict]:
-    """Retrieve foundation plan column definitions cached or saved for this file/project."""
+    """Retrieve foundation plan column definitions strictly for THIS file/drawing."""
     norm_fn = os.path.basename(filename or "").strip().lower()
-    if norm_fn and norm_fn in _FOUNDATION_COLUMNS_CACHE:
+    if not norm_fn:
+        return []
+    
+    if norm_fn in _FOUNDATION_COLUMNS_CACHE:
         return _FOUNDATION_COLUMNS_CACHE[norm_fn]
     
-    if _FOUNDATION_COLUMNS_CACHE:
-        latest_key = list(_FOUNDATION_COLUMNS_CACHE.keys())[-1]
-        return _FOUNDATION_COLUMNS_CACHE[latest_key]
-    
-    # Read directly from local_db.json
+    # Read directly from local_db.json strictly matching THIS file
     try:
         import json
         local_db_path = os.path.join(BASE_DIR, "local_db.json")
@@ -6418,13 +6847,18 @@ def get_foundation_columns_for_file(filename: str) -> list[dict]:
                 data = json.load(f)
             
             drawings = data.get("drawings", [])
-            target_drawings = [d for d in drawings if norm_fn and (norm_fn in (d.get("storage_key") or "").lower() or (d.get("storage_key") or "").lower() in norm_fn)] if norm_fn else drawings
-            target_d_ids = {d["id"] for d in target_drawings} if target_drawings else {d["id"] for d in drawings}
+            target_drawings = [
+                d for d in drawings 
+                if (norm_fn in (d.get("storage_key") or "").lower() or (d.get("storage_key") or "").lower() in norm_fn or norm_fn in (d.get("filename") or "").lower())
+            ]
+            if not target_drawings:
+                return []
             
+            target_d_ids = {d["id"] for d in target_drawings}
             pages = [p for p in data.get("pages", []) if p.get("drawing_id") in target_d_ids]
-            f_pages = [p for p in pages if "foundation" in (p.get("name") or "").lower() or p.get("idx") == 4]
-            if not f_pages and pages:
-                f_pages = [pages[0]]
+            f_pages = [p for p in pages if "foundation" in (p.get("name") or "").lower()]
+            if not f_pages:
+                return []
             
             f_page_ids = {p["id"] for p in f_pages}
             f_cols = []
@@ -6439,8 +6873,7 @@ def get_foundation_columns_for_file(filename: str) -> list[dict]:
                         "profile": m.get("section") or m.get("profile"),
                     })
             if f_cols:
-                if norm_fn:
-                    _FOUNDATION_COLUMNS_CACHE[norm_fn] = f_cols
+                _FOUNDATION_COLUMNS_CACHE[norm_fn] = f_cols
                 return f_cols
     except Exception as exc:
         print(f"[FOUNDATION PROPAGATION] Error reading local_db: {exc}")
@@ -6967,8 +7400,8 @@ def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
     # overshoots its support the gap beyond the support is empty, so the nearest
     # crossing found inward IS the true support even for big overshoots.  EXTENDING
     # outward is riskier (could grab a far line), so keep it short.
-    IN_WIN   = 3.5  * ppf     # trim overshoot up to ~3.5 ft inward to a support without truncating continuous girders
-    OUT_WIN  = 4.0  * ppf     # extend a short end only up to ~4 ft to a support
+    IN_WIN   = 8.0  * ppf     # trim overshoot up to ~8 ft inward to a support without truncating continuous girders
+    OUT_WIN  = 3.0  * ppf     # extend a short end only up to ~3 ft to a support
     MIN_SPAN = 3.0  * ppf     # never trim a beam shorter than a real minimum span
     PERP_DOT = 0.55           # |cos| < 0.55  → >56°  → perpendicular-ish
     cols_x   = sorted(col_x or [])
@@ -7028,15 +7461,9 @@ def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
         new1 = min(near1, key=lambda t: abs(t - L))   if near1 else L
 
         # ── Drawn-steel clamp ────────────────────────────────────────────────
-        # The overlay must not extend more than half a support-depth beyond the
-        # ACTUAL drawn steel line it traces.  build_members extends each end to the
-        # nearest COLUMN (≤ ~3.7 ft), but ~70 % of beams frame into a GIRDER that
-        # sits closer — so that extension overshoots PAST the girder to a column
-        # beyond it.  Clamping to the drawn line + PAD pulls the end back onto the
-        # girder it actually touches.  Collinear drawn segments (CAD breaks the
-        # centreline at each girder crossing) are chained into one extent.
-        _is_heavy_sec = bool(re.match(r'^(?:W3[0-9]|W4[0-9]|W27X[1-9])', m.get("profile", "")))
-        PAD = (15.0 * ppf) if _is_heavy_sec else (1.5 * ppf)
+        # The overlay must not extend beyond the ACTUAL drawn steel line it traces.
+        # PAD = 0.5 ft (6 inches) for physical column/beam seat connection tolerance.
+        PAD = 0.5 * ppf
         px, py = -uy, ux
         d_ts = []
         for (sx1, sy1, sx2, sy2, _l) in (all_struct_lns or []):
@@ -7063,6 +7490,17 @@ def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
 
         nx1, ny1 = x1 + ux * new0, y1 + uy * new0
         nx2, ny2 = x1 + ux * new1, y1 + uy * new1
+
+        # Clamping to building grid boundary to prevent perimeter overshoot
+        if cols_x and is_h:
+            min_gx, max_gx = min(cols_x) - 4.0, max(cols_x) + 4.0
+            nx1 = max(min_gx, min(max_gx, nx1))
+            nx2 = max(min_gx, min(max_gx, nx2))
+        elif cols_y and (not is_h):
+            min_gy, max_gy = min(cols_y) - 4.0, max(cols_y) + 4.0
+            ny1 = max(min_gy, min(max_gy, ny1))
+            ny2 = max(min_gy, min(max_gy, ny2))
+
         m["bx1"] = round(nx1 / page_w, 4); m["by1"] = round(ny1 / page_h, 4)
         m["bx2"] = round(nx2 / page_w, 4); m["by2"] = round(ny2 / page_h, 4)
         m["x"]   = round((nx1 + nx2) / 2 / page_w, 4)
@@ -7433,6 +7871,13 @@ async def analyse_pdf(req: AnalysisRequest):
             _is_foundation_plan = "FOUNDATION PLAN" in _page_text_upper or "FOUNDATION FRAMING" in _page_text_upper
             column_symbols = detect_column_symbols(page, scale_ratio=req.scale_ratio or 96, is_foundation_plan=_is_foundation_plan,
                                                    plan_bounds=plan_bounds)
+        # 1b. Schedule & Key Plan exclusion zones
+        excluded_zones = detect_schedule_zones(page, plan_bounds, text_dict=text_dict)
+        if column_symbols and excluded_zones:
+            column_symbols = [
+                s for s in column_symbols
+                if not any(zx0 <= s["cx"] <= zx1 and zy0 <= s["cy"] <= zy1 for zx0, zy0, zx1, zy1 in excluded_zones)
+            ]
 
         # 3. Grid lines — SECONDARY signal. v_labels/h_labels map each
         # position to its REAL bubble text (e.g. "1", "2.3", "A") read
@@ -7479,17 +7924,22 @@ async def analyse_pdf(req: AnalysisRequest):
             return out
 
         if column_symbols:
-            if not v_grid:
-                _sym_xs = [s["cx"] for s in column_symbols]
+            # Only derive grid lines from column symbols inside the main framing plan (exclude right-side details)
+            _framing_syms = [
+                s for s in column_symbols
+                if s["cx"] <= page_w * 0.70 and (not plan_bounds or (plan_bounds[0] <= s["cx"] <= plan_bounds[2] and plan_bounds[1] <= s["cy"] <= plan_bounds[3]))
+            ]
+            if not v_grid and _framing_syms:
+                _sym_xs = [s["cx"] for s in _framing_syms]
                 v_grid = _cluster_positions(_sym_xs, tol=30.0)
                 if v_grid:
-                    print(f"[ANALYSE] v_grid derived from {len(column_symbols)} symbols: "
+                    print(f"[ANALYSE] v_grid derived from {len(_framing_syms)} framing symbols: "
                           f"{[round(x) for x in v_grid]}")
-            if not h_grid:
-                _sym_ys = [s["cy"] for s in column_symbols]
+            if not h_grid and _framing_syms:
+                _sym_ys = [s["cy"] for s in _framing_syms]
                 h_grid = _cluster_positions(_sym_ys, tol=30.0)
                 if h_grid:
-                    print(f"[ANALYSE] h_grid derived from {len(column_symbols)} symbols: "
+                    print(f"[ANALYSE] h_grid derived from {len(_framing_syms)} framing symbols: "
                           f"{[round(y) for y in h_grid]}")
 
         # 4. Extract profile labels within the plan
@@ -7576,33 +8026,27 @@ async def analyse_pdf(req: AnalysisRequest):
                     v_grid=v_grid,
                     h_grid=h_grid)
 
-        # ── Unlabeled beam detection ──────────────────────────────────────────
-        # Only runs when the drawing has ZERO profile labels (e.g. a framing plan
-        # where the engineer drew all beam lines but added no text tags).
-        # When labeled profiles exist we skip this entirely — labeled detection is
-        # already complete and we don't want to double-count.
-        #
-        # Safety filters applied to every candidate line:
-        #   F1  Orthogonal only (H or V) — unlabeled diagonal lines are
-        #       indistinguishable from braces, so we skip them.
-        #   F2  Length in structural range: MIN_LEN–MAX_LEN (already applied in
-        #       detect_beam_lines, so all_struct_lns satisfies this).
-        #   F3  Does NOT span >85 % of the plan width (H) or plan height (V) —
-        #       full-width lines are grid / dimension lines, not beams.
-        #   F4  Deduplicate: skip if another synthetic is already within 40 pt.
-        #   F5  Cap at 200 synthetics to prevent memory issues on dense drawings.
-        if not is_raster and len(profiles) == 0 and _all_struct_lns:
+        # ── Unclaimed / Unlabeled beam detection ──────────────────────────────
+        # Detects real drawn structural beams on the blueprint that have no nearby text label
+        # (e.g. infill beams, typical filler beams, stair/elevator opening headers).
+        # We consider lines in _all_struct_lns that were NOT claimed by any labeled profile.
+        if not is_raster and _all_struct_lns and getattr(req, 'detect_unlabeled', False):
             _pb = plan_bounds
-            _plan_w = _pb[2] - _pb[0]
-            _plan_h = _pb[3] - _pb[1]
+            _plan_w = _pb[2] - _pb[0] if _pb else 1000.0
+            _plan_h = _pb[3] - _pb[1] if _pb else 1000.0
             _MAX_H_FRAC = 0.85   # F3: H-line must be shorter than 85 % of plan width
             _MAX_V_FRAC = 0.85   # F3: V-line must be shorter than 85 % of plan height
-            _DEDUP_R    = 40     # F4: midpoint deduplication radius
-            _SYN_CAP    = 200    # F5: hard cap
+            _DEDUP_R    = 35     # F4: midpoint deduplication radius
+            _SYN_CAP    = 300    # F5: capacity cap
+
+            # Collect midpoints of lines already claimed by labeled profiles
+            _claimed_mids: list[tuple] = []
+            for _p_idx, _hit in beam_line_map.items():
+                _claimed_mids.append(((_hit["x1"] + _hit["x2"]) / 2, (_hit["y1"] + _hit["y2"]) / 2))
 
             _syn_profiles  = []
             _syn_line_map  = {}
-            _seen_mids: list[tuple] = []
+            _seen_mids     = list(_claimed_mids)
 
             for (lx1, ly1, lx2, ly2, ln) in _all_struct_lns:
                 if len(_syn_profiles) >= _SYN_CAP:
@@ -7610,34 +8054,70 @@ async def analyse_pdf(req: AnalysisRequest):
                 adx = abs(lx2 - lx1)
                 ady = abs(ly2 - ly1)
 
-                # F1 — orthogonal only
+                # F1 — orthogonal or clear diagonal
                 if adx > ady * 2:
                     bdir = "H"
                 elif ady > adx * 2:
                     bdir = "V"
+                elif adx > 25 and ady > 25:
+                    bdir = "D"
                 else:
-                    continue   # diagonal — skip
-
-                # F3 — reject full-plan-width / full-plan-height lines
-                if bdir == "H" and adx > _plan_w * _MAX_H_FRAC:
                     continue
-                if bdir == "V" and ady > _plan_h * _MAX_V_FRAC:
+
+                # F3 — reject full-plan-width / full-plan-height lines (grid lines)
+                if bdir == "H" and adx > _plan_w * 0.50:
+                    continue
+                if bdir == "V" and ady > _plan_h * 0.50:
+                    continue
+
+                # Multi-bay span rejection: an infill beam without text never spans across multiple bays
+                if v_grid and len(v_grid) >= 2 and bdir == "H":
+                    _max_v_bay = max(v_grid[i+1] - v_grid[i] for i in range(len(v_grid)-1))
+                    if adx > _max_v_bay * 1.30:
+                        continue
+                if h_grid and len(h_grid) >= 2 and bdir == "V":
+                    _max_h_bay = max(h_grid[i+1] - h_grid[i] for i in range(len(h_grid)-1))
+                    if ady > _max_h_bay * 1.30:
+                        continue
+
+                # Discard short ticks / dimension marks / leader arrows (under 3.5 ft real span)
+                _min_real_beam_pt = max(30.0, pts_per_foot * 3.5) if pts_per_foot > 0 else 30.0
+                if ln < _min_real_beam_pt:
                     continue
 
                 mx = (lx1 + lx2) / 2
                 my = (ly1 + ly2) / 2
 
-                # F4 — deduplicate
+                # Exclude lines falling inside Key Plan or schedule zones
+                if any(zx0 <= mx <= zx1 and zy0 <= my <= zy1 for zx0, zy0, zx1, zy1 in (excluded_zones or [])):
+                    continue
+
+                # Discard ANY unlabeled line that lies directly on or near a structural grid line
+                if v_grid and bdir == "V" and any(abs(mx - gx) < 14.0 for gx in v_grid):
+                    continue
+                if h_grid and bdir == "H" and any(abs(my - gy) < 14.0 for gy in h_grid):
+                    continue
+
+                # Exclude lines outside the primary structural grid framing envelope (dimension strings, extension lines)
+                if v_grid and h_grid:
+                    min_gx, max_gx = min(v_grid) - 2.0, max(v_grid) + 2.0
+                    min_gy, max_gy = min(h_grid) - 2.0, max(h_grid) + 2.0
+                    if not (min_gx <= min(lx1, lx2) and max(lx1, lx2) <= max_gx and
+                            min_gy <= min(ly1, ly2) and max(ly1, ly2) <= max_gy):
+                        continue
+
+                # F4 — deduplicate against already-claimed beam lines and previously added synthetics
                 if any(math.hypot(smx - mx, smy - my) < _DEDUP_R
                        for smx, smy in _seen_mids):
                     continue
 
-                syn_idx = len(_syn_profiles)
+                syn_idx = len(profiles) + len(_syn_profiles)
                 _syn_profiles.append({
                     "profile":  "?",
                     "cx": mx, "cy": my,
                     "dir_hint": bdir,
                     "bbox_w": 20.0, "bbox_h": 8.0,
+                    "unlabeled": True,
                 })
                 _syn_line_map[syn_idx] = {
                     "x1": lx1, "y1": ly1,
@@ -7647,10 +8127,10 @@ async def analyse_pdf(req: AnalysisRequest):
                 _seen_mids.append((mx, my))
 
             if _syn_profiles:
-                print(f"[ANALYSE] {len(_syn_profiles)} unlabeled beam lines detected "
-                      f"(zero labeled profiles on this page)")
-                profiles    = _syn_profiles
-                beam_line_map = _syn_line_map
+                print(f"[ANALYSE] Extracted {len(_syn_profiles)} unlabeled structural beam lines "
+                      f"(alongside {len(profiles)} labeled profiles)")
+                profiles.extend(_syn_profiles)
+                beam_line_map.update(_syn_line_map)
 
         # 7. FALLBACK direction detection
         #    • Vector: use adjacent drawn lines via detect_beam_directions().
@@ -7977,8 +8457,30 @@ async def analyse_pdf(req: AnalysisRequest):
             "h": [{"position": round(y / page_h, 4), "label": h_labels.get(y)} for y in (h_grid or [])],
         }
 
+        try:
+            from app.engineering.grid_geometry_pass import (
+                run_deterministic_geometry_pass,
+                to_frontend_dimension_lines,
+            )
+            _override_ppf = pts_per_foot if (req.scale_ratio and req.scale_ratio > 0) else None
+            _geom_results = run_deterministic_geometry_pass(
+                tmp_path, page_number=req.page_index, override_pts_per_foot=_override_ppf
+            )
+            grid_dimensions = to_frontend_dimension_lines(_geom_results)
+            print(f"[ANALYSE] grid_dimensions via run_deterministic_geometry_pass: {len(grid_dimensions)} lines")
+        except Exception as _geom_exc:
+            import traceback
+            print(f"[ANALYSE] run_deterministic_geometry_pass failed for page={req.page_index}: {_geom_exc} — falling back to legacy extract_grid_dimensions")
+            traceback.print_exc()
+            grid_dimensions = extract_grid_dimensions(
+                page, page_w, page_h, plan_bounds,
+                v_grid, h_grid, v_labels, h_labels, pts_per_foot,
+                text_dict=text_dict
+            )
+
         return {
             "members":         members,
+            "grid_dimensions": grid_dimensions,
             "summary":         summary,
             "method":          method,
             "elapsed":         elapsed,

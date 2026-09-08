@@ -19,8 +19,8 @@ export function useWorkspace(projectId: string) {
     queryKey: ['drawings', projectId],
     queryFn: () => drawingsApi.list(projectId),
     enabled: !!projectId,
-    staleTime: 1000 * 60 * 10,
-    gcTime: 1000 * 60 * 30,
+    staleTime: 1000 * 60,
+    gcTime: 1000 * 60 * 10,
   })
 
   const drawingIds = drawings.map((d: any) => d.id).sort().join(',')
@@ -37,8 +37,8 @@ export function useWorkspace(projectId: string) {
       return perDrawing.flat()
     },
     enabled: drawings.length > 0,
-    staleTime: 1000 * 60 * 10,
-    gcTime: 1000 * 60 * 30,
+    staleTime: 1000 * 60,
+    gcTime: 1000 * 60 * 10,
   })
 
   // Kept for any callers that still want "the first drawing" (e.g. as a

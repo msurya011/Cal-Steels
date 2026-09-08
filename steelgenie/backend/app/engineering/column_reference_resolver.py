@@ -372,10 +372,25 @@ def resolve_foundation_plan_columns(
         bp_tokens = []
         col_mark_tokens = []
 
+        mw_w = fp_page.mediabox.width if fp_page.rotation in (90, 270) else fp_page.rect.width
+        mw_h = fp_page.mediabox.height if fp_page.rotation in (90, 270) else fp_page.rect.height
+
         for w in words:
             txt = w[4].strip()
-            wx = (w[0] + w[2]) / (2 * pw)
-            wy = (w[1] + w[3]) / (2 * ph)
+            raw_cx = (w[0] + w[2]) / 2
+            raw_cy = (w[1] + w[3]) / 2
+            if fp_page.rotation == 90:
+                wx = raw_cy / mw_h
+                wy = 1.0 - (raw_cx / mw_w)
+            elif fp_page.rotation == 180:
+                wx = 1.0 - (raw_cx / mw_w)
+                wy = 1.0 - (raw_cy / mw_h)
+            elif fp_page.rotation == 270:
+                wx = 1.0 - (raw_cy / mw_h)
+                wy = raw_cx / mw_w
+            else:
+                wx = raw_cx / mw_w
+                wy = raw_cy / mw_h
 
             p_m = _AISC_PROFILE_PATTERN.search(txt)
             if p_m:
@@ -473,7 +488,7 @@ def resolve_foundation_plan_columns(
 
             # Priority 3: Direct profile label if explicitly next to symbol and no schedule profile exists
             nearest_p = None
-            min_pd = 0.035
+            min_pd = 0.055
             for p, px, py in profile_tokens:
                 d = min(math.hypot(cx - px, cy - py),
                         math.hypot(raw_cx - px, raw_cy - py))
@@ -515,17 +530,11 @@ def resolve_foundation_plan_columns(
                 geo["resolution_status"] = "resolved"
                 resolved_rows.append(row)
             else:
-                # If a column candidate has NO profile, NO schedule entry, NO base plate,
-                # and NO confirmed column symbol, DROP IT as a false positive grid intersection!
-                _conf = geo.get("classifier_confidence") or row.get("confidence") or 0.0
-                _cat = geo.get("category")
-                if _conf >= 0.70 or _cat in ("steel_column", "hss_column"):
-                    row["section"] = None
-                    geo["resolved_profile"] = None
-                    geo["resolution_status"] = "unresolved"
-                    resolved_rows.append(row)
-                else:
-                    logger.info("Dropping false column candidate at (%.3f, %.3f) — no profile, BP, or symbol representation", cx, cy)
+                # Retain all physical column candidates as unresolved columns
+                row["section"] = None
+                geo["resolved_profile"] = None
+                geo["resolution_status"] = "unresolved"
+                resolved_rows.append(row)
 
         # 5. Strict Spatial Deduplication: Never allow duplicate markers on the same column
         # Merge any columns that are within 3.5% of page width of each other OR share the exact same grid intersection
@@ -551,9 +560,9 @@ def resolve_foundation_plan_columns(
                 
                 # Check match by exact grid ref or close proximity
                 same_grid = bool(r_grid and e_grid and r_grid == e_grid)
-                close_dist = math.hypot(rx - ex, ry - ey) < 0.035
+                close_dist = math.hypot(rx - ex, ry - ey) < 0.012
                 
-                if same_grid or close_dist:
+                if (same_grid and close_dist) or (close_dist and math.hypot(rx - ex, ry - ey) < 0.008):
                     dup_idx = idx
                     break
             

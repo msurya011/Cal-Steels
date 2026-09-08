@@ -190,11 +190,16 @@ export function LayerFilterPopover({ members, onClose, projectId }: LayerFilterP
         <span style={{ fontSize: '11px', fontWeight: 700, color: '#64748B', textTransform: 'uppercase', display: 'block', marginBottom: '8px' }}>
           Editor
         </span>
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', marginBottom: '10px' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '10px' }}>
           <CenteredCheckbox
             label="Grids"
             checked={layers.aids.grid !== false}
             onChange={() => toggleAid('grid')}
+          />
+          <CenteredCheckbox
+            label="Grid Dims"
+            checked={layers.aids.gridDimensions !== false}
+            onChange={() => toggleAid('gridDimensions')}
           />
           <CenteredCheckbox
             label="Column Projections"

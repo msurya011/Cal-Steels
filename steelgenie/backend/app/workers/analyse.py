@@ -475,6 +475,7 @@ async def run_analyse(
         logger.exception("Post-extraction registration failed for page=%s (non-fatal)", page_id)
 
     summary = result.get("summary", {})
+    grid_dimensions = result.get("grid_dimensions", [])
     await _update_job(
         job_id, "done", 100,
         message=f"Extracted {len(member_rows)} members in {elapsed:.1f}s",
@@ -482,6 +483,7 @@ async def run_analyse(
             "member_count": len(member_rows),
             "elapsed": round(elapsed, 2),
             "summary": summary,
+            "grid_dimensions": grid_dimensions,
         },
         finished=True,
     )
