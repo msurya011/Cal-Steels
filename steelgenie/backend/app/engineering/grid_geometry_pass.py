@@ -87,7 +87,18 @@ _INCH_ONLY_RE = re.compile(r"""
 
 def parse_dimension_string(text: str) -> Optional[float]:
     """Parse dimension strings like 24'-0", 30'-6 1/2", 8" into decimal feet."""
-    t = text.strip().replace(" ", "")
+    # Collapse whitespace to a single space rather than removing it outright.
+    # A fraction like "8 1/2" (inches, then a space, then the fraction) needs
+    # that ONE space to survive -- both _DIM_RE and _INCH_ONLY_RE require
+    # `\s+` between the whole-inches part and the numerator specifically so
+    # "81/2" (no space) can never be misread as the fraction "8 1/2". Deleting
+    # every space instead of collapsing them silently turned every
+    # fractional-inch dimension ("19'-8 1/2"", "14'-6 3/8"") into something
+    # neither regex could match, so it was dropped as unparseable on every
+    # sheet, not just this one -- a whole-number dimension a few points away
+    # would then get matched in its place instead, producing a confidently
+    # wrong "sheet disagrees" flag on a bay that was actually correct.
+    t = re.sub(r"\s+", " ", text.strip())
     m = _DIM_RE.match(t)
     if m:
         feet = float(m.group("feet"))
@@ -118,12 +129,33 @@ def is_valid_dim_text(text: str) -> bool:
 
 
 def ft_to_arch(v: float) -> str:
+    """Format decimal feet as architectural feet-inches, WITH fractional
+    inches down to the nearest 1/16" -- the finest increment dimension
+    strings on structural sheets are ever drawn to.
+
+    Previously this rounded straight to the nearest whole inch and threw
+    the remainder away entirely, so a bay measured at (say) 11.6042 ft
+    (11'-7 1/4") always displayed as a flat "11'-7"". That made an
+    accurately-measured bay look like it disagreed with the sheet's own,
+    more precise printed dimension, purely because of how we were
+    *formatting* the number -- not because the measurement was wrong.
+    """
     feet = int(v)
-    inches = round((v - feet) * 12)
-    if inches == 12:
-        feet += 1
-        inches = 0
-    return f"{feet}'-{inches}\""
+    remainder_in = (v - feet) * 12.0
+    sixteenths = round(remainder_in * 16)
+    inches = sixteenths // 16
+    frac_sixteenths = sixteenths % 16
+    if inches >= 12:
+        feet += inches // 12
+        inches = inches % 12
+    if frac_sixteenths == 0:
+        return f"{feet}'-{inches}\""
+    # Reduce the fraction (e.g. 4/16 -> 1/4, 8/16 -> 1/2).
+    num, den = frac_sixteenths, 16
+    while num % 2 == 0:
+        num //= 2
+        den //= 2
+    return f"{feet}'-{inches} {num}/{den}\""
 
 
 def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
@@ -504,26 +536,53 @@ def _absorb_interior_grids(chain: List[Dict[str, Any]], confirmed: List[Dict[str
         rank = _label_rank(c["text"])
         if not (lo_rank < rank < hi_rank):
             continue
-        len_frac, _ = line_evidence(c, pos_key)
-        if len_frac is None or len_frac < min_len_frac:
-            continue
+        len_frac, line_margin = line_evidence(c, pos_key)
         coord, source = grid_coord(c, pos_key)
         if not (lo_coord + dup_tol < coord < hi_coord - dup_tol):
             continue
         if any(abs(coord - x) <= dup_tol for x in coords):
             continue
-        if not _dimension_corroborates(coord):
+
+        strong_line = len_frac is not None and len_frac >= min_len_frac
+        corroborated = _dimension_corroborates(coord)
+
+        # Three tiers of evidence, weakest last. A sub-grid on a stepped or
+        # L-shaped building is routinely dimensioned on its own interior
+        # rail with no full-length chain line to match (a short local run,
+        # not a page-spanning line), or with no printed dimension near the
+        # bubble at all (its length is only ever shown on a companion
+        # detail sheet). Requiring BOTH, as this pass first did, meant a
+        # real, plainly-bubbled grid the drawing draws was silently merged
+        # into its neighbours' bay instead of reported -- missing a grid
+        # that is actually there is worse than surfacing one for review.
+        # `secondary_only` (decimal labels only) plus the rank/position
+        # betweenness checks above are what keep this from readmitting the
+        # false positives (compass roses, detail callouts, sheet
+        # references) the strict version was built to reject -- none of
+        # those pass as decimal sub-grid labels ranked strictly between two
+        # already-confirmed neighbours in the first place.
+        if strong_line and corroborated:
+            confidence = "line_and_dimension"
+        elif strong_line:
+            confidence = "line_only"
+        elif corroborated:
+            confidence = "dimension_only"
+        elif c["is_secondary"]:
+            confidence = "bubble_only_uncorroborated"
+        else:
             continue
+
         added.append({
             "label": c["text"],
             "is_secondary": c["is_secondary"],
             "coord": round(coord, 2),
             "coord_source": source,
+            "confidence": confidence,
             "bubble_coord": round(c[pos_key], 2),
             "bubble_offset_pts": (None if source == "bubble_inferred"
                                   else round(abs(coord - c[pos_key]), 2)),
             "line_len_frac": len_frac,
-            "line_margin": line_evidence(c, pos_key)[1],
+            "line_margin": line_margin,
             "from_interior_rail": True,
             "rail_coord": round(c["cy" if pos_key == "cx" else "cx"], 2),
         })
@@ -620,9 +679,59 @@ def _build_axis_tracks(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph
     """
     items = [c for c in confirmed if c["axis"] == axis]
 
+    # near_edge below is the gate that decides which confirmed bubbles are
+    # even eligible to seed or join a track -- everything else in this
+    # function only ever removes candidates that pass it. Measuring it
+    # against the raw PAGE box is wrong on any sheet with a wide title
+    # block, notes column, or blank margin: the real plan can occupy well
+    # under half the page, so a genuine grid row sitting near the PLAN's
+    # own edge can still fall in the page's untouched middle 52% and never
+    # be considered at all (this is what silently dropped an entire primary
+    # numbers row, and a primary letters row, on real sheets -- not a
+    # missing sub-grid, a missing PRIMARY grid line, because the row was
+    # real but the page-relative threshold never looked there).
+    # Grounding the box in every confirmed bubble on the page (both axes,
+    # not just this one) instead of the raw page rect fixes that: it is
+    # built from real, already-verified grid geometry, not a guess, and a
+    # sheet where confirmed bubbles happen to already hug the page edges
+    # reduces to the old page-relative behaviour, so this only ever widens
+    # what near_edge accepts, never narrows it.
+    def _robust_range(values: List[float], full_span: float) -> Tuple[float, float]:
+        """5th/95th percentile instead of min/max -- one stray confirmed
+        point far from the real plan (a callout number, a note reference)
+        should not be able to single-handedly drag the content box out and
+        undo the whole point of using it instead of the raw page."""
+        if len(values) < 4:
+            return 0.0, full_span
+        s = sorted(values)
+        n = len(s)
+        lo = s[max(0, int(n * 0.05))]
+        hi = s[min(n - 1, int(n * 0.95))]
+        if hi - lo <= full_span * 0.1:
+            return 0.0, full_span
+        return lo, hi
+
+    all_cx = [c["cx"] for c in confirmed]
+    all_cy = [c["cy"] for c in confirmed]
+    content_x_lo, content_x_hi = _robust_range(all_cx, pw)
+    content_y_lo, content_y_hi = _robust_range(all_cy, ph)
+    # Small padding so a bubble sitting exactly on the content boundary
+    # (the common case -- that is where grid bubbles are drawn) still
+    # counts as "near the edge" rather than landing exactly on the line.
+    cx_pad = max((content_x_hi - content_x_lo) * 0.03, 10.0)
+    cy_pad = max((content_y_hi - content_y_lo) * 0.03, 10.0)
+    content_x_lo -= cx_pad
+    content_x_hi += cx_pad
+    content_y_lo -= cy_pad
+    content_y_hi += cy_pad
+    content_w = max(content_x_hi - content_x_lo, 1.0)
+    content_h = max(content_y_hi - content_y_lo, 1.0)
+
     def near_edge(c):
-        return (c["cx"] < pw * edge or c["cx"] > pw * (1 - edge) or
-                c["cy"] < ph * edge or c["cy"] > ph * (1 - edge))
+        return (c["cx"] < content_x_lo + content_w * edge or
+                c["cx"] > content_x_hi - content_w * edge or
+                c["cy"] < content_y_lo + content_h * edge or
+                c["cy"] > content_y_hi - content_h * edge)
 
     perim = [c for c in items if near_edge(c)]
     remaining = [c for c in perim if not c["is_secondary"]]
@@ -732,7 +841,12 @@ def _collect_dim_spans(page: "fitz.Page", text_dict: dict) -> List[Dict[str, Any
     dim_spans = []
     for b in text_dict.get("blocks", []):
         for l in b.get("lines", []):
-            for sp in l.get("spans", []):
+            spans = l.get("spans", [])
+            line_hit_span_ids: set = set()
+
+            # Pass 1: whole dimension present in a single span (the common,
+            # already-working case) -- unchanged behaviour.
+            for sp in spans:
                 t = sp.get("text", "").strip()
                 if not t or not is_valid_dim_text(t):
                     continue
@@ -747,6 +861,33 @@ def _collect_dim_spans(page: "fitz.Page", text_dict: dict) -> List[Dict[str, Any
                     "text": t, "val_ft": val,
                     "cx": cx, "cy": cy,
                 })
+                line_hit_span_ids.add(id(sp))
+
+            # Pass 2: a stacked fraction (e.g. "1/4"") is very often its OWN
+            # text span, split off from the "25'-2" head that precedes it --
+            # neither piece alone is a complete, parseable dimension, so pass
+            # 1 drops the whole value as unparseable. Rejoin every span on
+            # this line (in reading order) and try parsing THAT instead, but
+            # only for spans pass 1 didn't already use for a complete match
+            # of its own -- this never changes a dimension that already
+            # parsed correctly on its own.
+            unmatched = [sp for sp in spans if id(sp) not in line_hit_span_ids]
+            if len(unmatched) >= 2:
+                joined = " ".join(sp.get("text", "").strip() for sp in unmatched).strip()
+                if joined and is_valid_dim_text(joined):
+                    val = parse_dimension_string(joined)
+                    if val is not None and 0.5 <= val <= 350.0:
+                        bboxes = [fitz.Rect(sp.get("bbox", [0, 0, 0, 0])) for sp in unmatched]
+                        union = bboxes[0]
+                        for r in bboxes[1:]:
+                            union |= r
+                        if rot_mat is not None:
+                            union = union * rot_mat
+                        cx, cy = (union.x0 + union.x1) / 2.0, (union.y0 + union.y1) / 2.0
+                        dim_spans.append({
+                            "text": joined, "val_ft": val,
+                            "cx": cx, "cy": cy,
+                        })
     return dim_spans
 
 
@@ -857,17 +998,82 @@ def run_deterministic_geometry_pass(
         v_axis_type = "letter"
         h_axis_type = "number"
 
+    # tracks[0] is treated as THE canonical chain everywhere downstream --
+    # it seeds cross-track validation, it is what bays get built from, and
+    # it is what interior-rail absorption checks rank/position against. But
+    # _build_axis_tracks discovers tracks ordered by distance to the PAGE
+    # edge, not by completeness: on a sheet with grid bubbles printed near
+    # both margins (common when a building has bubbles on two sides), the
+    # sparser of two real tracks can sit fractionally closer to the edge and
+    # win that ordering, even though the other track has more than twice as
+    # many grids. Re-ranking here so the most complete track leads means the
+    # richer chain is what everything else gets checked against, while the
+    # edge-distance preference still breaks ties between equally complete
+    # tracks exactly as before (Python's sort is stable).
+    v_tracks = sorted(v_tracks, key=lambda t: -len(t[0]))
+    h_tracks = sorted(h_tracks, key=lambda t: -len(t[0]))
+
     def _drop_cross_track_mismatches(tracks: List[Tuple[List[Dict[str, Any]], Dict[str, Any]]]
                                       ) -> List[Tuple[List[Dict[str, Any]], Dict[str, Any]]]:
+        """
+        tracks[0] -- the richest, most-confirmed chain for this axis -- is
+        already treated as ground truth here: a same-labeled point on any
+        other track that lands far from it (>20pt) is dropped as a mismatch.
+        But a point that lands CLOSE (within that same 20pt) is the same
+        physical grid line, just re-measured on a second, sparser dimension
+        track -- and a sparse track (as few as 3-4 confirmed points) gives
+        reject_outlier_line_coords too little context to tell a genuine
+        bubble dodge from measurement noise, so it can end up keeping that
+        track's own raw, dodged bubble centre (coord_source
+        "bubble_kept_weak_line"/"bubble_inferred_outlier") instead of the
+        corrected line position -- a real grid dimensioned twice on the same
+        sheet then shows two different lengths for what is the same span.
+        tracks[0]'s coordinate for that label is corroborated by a richer,
+        more reliable chain, so once a point is confirmed to be the SAME
+        grid (within the 20pt identity check that already gated keep-vs-drop
+        here), snap its coordinate to tracks[0]'s rather than leaving a
+        weaker, second-hand position in place. A point that already agrees
+        closely is unaffected -- this only ever corrects a point that both
+        tracks agree is the same grid but disagree on where it sits.
+        """
         if len(tracks) < 2:
             return tracks
         primary_by_label = {p["label"]: p["coord"] for p in tracks[0][0]}
         cleaned = [tracks[0]]
         for chain, meta in tracks[1:]:
-            kept = [
-                p for p in chain
-                if p["label"] not in primary_by_label or abs(p["coord"] - primary_by_label[p["label"]]) <= 20.0
-            ]
+            # Only a point whose OWN local evidence is already shaky is a
+            # candidate for correction. "bubble_confirmed_by_line" and
+            # "vector_line" mean THIS track independently confirmed this
+            # grid against its own real vector line -- that is exactly as
+            # strong as tracks[0]'s evidence, and two independently solid
+            # measurements can legitimately disagree on a stepped/L-shaped
+            # building where the same label is drawn on genuinely different
+            # local rails (see _absorb_interior_grids's own docstring on
+            # this). Overriding a solid point there is not correcting a
+            # measurement, it's discarding a second, equally real one --
+            # confirmed by testing: doing so turned two previously-correct,
+            # OCR-agreeing bays on a stepped sheet into wrong ones. Only
+            # "bubble_kept_weak_line" / "bubble_inferred_outlier" are
+            # low-confidence-by-construction (reject_outlier_line_coords
+            # itself decided it couldn't trust either the line or the raw
+            # bubble very far) -- those, and only those, may be replaced by
+            # a richer chain's independently solid coordinate for the same
+            # label.
+            WEAK_SOURCES = ("bubble_kept_weak_line", "bubble_inferred_outlier")
+            kept = []
+            for p in chain:
+                ref_coord = primary_by_label.get(p["label"])
+                if ref_coord is None:
+                    kept.append(p)
+                    continue
+                if abs(p["coord"] - ref_coord) > 20.0:
+                    continue
+                if p["coord"] != ref_coord and p.get("coord_source") in WEAK_SOURCES:
+                    p = dict(p)
+                    p["bubble_offset_pts"] = round(abs(p["coord"] - ref_coord), 2)
+                    p["coord"] = ref_coord
+                    p["coord_source"] = "cross_track_corroborated"
+                kept.append(p)
             meta = dict(meta)
             meta["primary_count"] = sum(1 for p in kept if not p["is_secondary"])
             meta["secondary_count"] = sum(1 for p in kept if p["is_secondary"])
@@ -1050,6 +1256,50 @@ def run_deterministic_geometry_pass(
                     None if bubble_span_px is None or pts_per_foot <= 0
                     else round((bubble_span_px - span_px) / pts_per_foot * 12.0, 2)),
             })
+
+        # A bay that disagrees with the nearest printed dimension is not
+        # necessarily wrong: that printed text can be a CUMULATIVE run --
+        # e.g. a decimal sub-grid (F.95) splits a bay into F-F.95 and
+        # F.95-G, but the sheet may only print the OVERALL F-to-G length at
+        # that dimension line, with the interior sub-grid's own bubble
+        # drawn but never separately dimensioned. The per-bay OCR matching
+        # above still finds that overall text nearby (it's the closest
+        # printed dimension there IS) and compares it against just the
+        # F-F.95 sub-span, which will almost never match -- flagging a bay
+        # whose measurement is actually correct as a mismatch, purely
+        # because it was checked against a total that was never describing
+        # it alone. Real steel estimators do the reverse of what naive
+        # nearest-text matching does here: back out a sub-bay's length from
+        # the overall dimension minus its known neighbours, rather than
+        # expect the overall figure to equal one sub-piece.
+        #
+        # Detect this directly: for every flagged bay, check whether ITS
+        # OWN measured length plus an immediately adjacent bay's measured
+        # length (the two sub-bays a total would be split into) sums to
+        # very nearly its OCR match's value. If so, that OCR text was a
+        # cumulative dimension for the pair, not a contradiction of this
+        # bay alone -- clear the flag and drop the now-misleading OCR
+        # comparison rather than report a false disagreement.
+        for i, bay in enumerate(bays):
+            if not bay["flagged"] or not bay["ocr_text"]:
+                continue
+            ocr_ft = parse_dimension_string(bay["ocr_text"])
+            if ocr_ft is None:
+                continue
+            own_ft = bay["length_inches"] / 12.0
+            for j in (i - 1, i + 1):
+                if not (0 <= j < len(bays)):
+                    continue
+                neighbor_ft = bays[j]["length_inches"] / 12.0
+                combined = own_ft + neighbor_ft
+                tol = max(0.3, combined * 0.03)
+                if abs(combined - ocr_ft) <= tol:
+                    bay["flagged"] = False
+                    bay["agrees_with_ocr"] = None
+                    bay["ocr_text"] = None
+                    bay["cumulative_dimension_excluded"] = True
+                    break
+
         return bays
 
     def _extend_chain_with_local_confirmed(chain: List[Dict[str, Any]], axis_type: str,
@@ -1129,15 +1379,24 @@ def run_deterministic_geometry_pass(
         agreement is then just per-bay QA (as it is everywhere else in this
         module), not a precondition for existing, so this gate is skipped.
         """
-        if has_local_bubble_evidence:
-            return True
-        matched = [b for b in bays if b.get("agrees_with_ocr") is not None]
-        agreeing = [b for b in matched if b["agrees_with_ocr"] is True]
-        if len(matched) < 2:
-            return False
-        if len(agreeing) < max(2, len(bays) // 3):
-            return False
-        return (len(agreeing) / len(matched)) >= 0.7
+        # A synthetic "opposite margin" track is a COPY of the chain already
+        # confirmed on the other side (see _extend_chain_with_local_confirmed)
+        # -- nothing about it comes from anything actually drawn at this
+        # position on the sheet. Accepting it purely because a handful of
+        # printed length strings elsewhere on the page happen to numerically
+        # agree with the copied bay lengths was found to draw a full
+        # dimension line -- with its own grid bubbles and length labels --
+        # on a margin that has no real second dimension line, and in some
+        # cases no grid presence at all beyond a stray interior sub-grid.
+        # Agreeing dimension text is not evidence a LINE exists there; it
+        # only proves the sheet's numbers are internally consistent, which
+        # they always are. A synthetic track is now accepted ONLY when
+        # _extend_chain_with_local_confirmed found at least one bubble that
+        # is independently, genuinely confirmed (real vector circle + label)
+        # at THIS track's own position -- i.e. there is actual grid presence
+        # on this margin, not just agreeing arithmetic borrowed from the
+        # other side.
+        return has_local_bubble_evidence
 
     horizontal_bays = _make_bays(v_chain, "V", v_band_cy)  # numbers -> vertical grid lines -> horizontal bay spacing
     vertical_bays = _make_bays(h_chain, "H", h_band_cx)    # letters -> horizontal grid lines -> vertical bay spacing
@@ -1423,6 +1682,34 @@ def run_deterministic_geometry_pass(
     }
 
 
+def _display_dimension_text(bay: Dict[str, Any]) -> str:
+    """
+    Pick what to show as this bay's length label.
+
+    `dimension_text` is always our own geometry (pixel distance / scale),
+    rounded to the nearest 1/16" -- but pixel-based measurement always
+    carries a little sub-pixel noise, so nearly every bay picks up some
+    small, spurious fraction (a 1/16" or 1/8" here or there) even when the
+    sheet's own drafted dimension is a clean round number. Showing that
+    raw geometric fraction on EVERY bay made the overlay look like real
+    dimensions had a fraction when they didn't -- the sheet plainly reads
+    "10'-10"", ours read "10'-10 1/8"".
+
+    Once a bay's measurement has been confirmed to agree with the sheet's
+    own printed dimension (`agrees_with_ocr` -- see the tolerance check in
+    `_make_bays`), the printed text IS the authoritative, human-drafted
+    value: show that verbatim instead of our own noisier re-derivation.
+    Geometry is still what's used for the *comparison* and for every case
+    where there's nothing printed to compare against (or where the two
+    genuinely disagree, which is exactly what should keep showing our
+    measured value so the mismatch is visible) -- this only changes what
+    gets DISPLAYED once agreement is already established.
+    """
+    if bay.get("agrees_with_ocr") and bay.get("ocr_text"):
+        return bay["ocr_text"]
+    return bay["dimension_text"]
+
+
 def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Flatten every confirmed dimension track (both axes, every side found) into
@@ -1451,7 +1738,7 @@ def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]
                 "to_grid": bay["to_grid"],
                 "label": f"{bay['from_grid']}–{bay['to_grid']}",
                 "length_ft": round(bay["length_inches"] / 12.0, 2),
-                "text": bay["dimension_text"],
+                "text": _display_dimension_text(bay),
                 "x1": round(g1["coord"] / pw, 4),
                 "y1": round(y / ph, 4),
                 "x2": round(g2["coord"] / pw, 4),
@@ -1475,7 +1762,7 @@ def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]
                 "to_grid": bay["to_grid"],
                 "label": f"{bay['from_grid']}–{bay['to_grid']}",
                 "length_ft": round(bay["length_inches"] / 12.0, 2),
-                "text": bay["dimension_text"],
+                "text": _display_dimension_text(bay),
                 "x1": round(x / pw, 4),
                 "y1": round(g1["coord"] / ph, 4),
                 "x2": round(x / pw, 4),

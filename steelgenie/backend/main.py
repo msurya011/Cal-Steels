@@ -3149,6 +3149,14 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
     # REAL bubble label for each final position, not just its coordinate.
     letter_pts: list[tuple[str, float, float]] = []
     number_pts: list[tuple[str, float, float]] = []
+    # Decimal sub-grid candidates (e.g. "D.1", "3.1") that matched the label
+    # regex and every other gate EXCEPT near_edge, kept aside so a later
+    # additive pass can recover the ones printed on an interior rail rather
+    # than the sheet's outer margin -- see _absorb_interior_subgrids below
+    # for why that recovery is needed and why it's safe to only ever add,
+    # never replace, a position here.
+    letter_interior_candidates: list[tuple[str, float, float]] = []
+    number_interior_candidates: list[tuple[str, float, float]] = []
 
     _td = text_dict if text_dict is not None else page.get_text("dict")
     for block in _td["blocks"]:
@@ -3167,6 +3175,28 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
                 if not (bx0 - 60 <= cx <= bx1 + 60 and
                         by0 - 60 <= cy <= by1 + 60):
                     continue
+                # Decimal sub-grid labels are captured as interior-recovery
+                # candidates UNCONDITIONALLY, before the near_edge test --
+                # not only when near_edge fails. A sub-grid on its own
+                # interior rail is very often just as far from the raw
+                # page's edge test as a perimeter bubble happens to be (the
+                # near_edge test alone doesn't reliably separate them), but
+                # it still gets dropped a stage later by the dominant-band /
+                # monotonic / dominant-sequence filters below because it
+                # sits far from the main row's band -- capturing it here,
+                # before any of those filters run, is what lets the
+                # absorption pass after them recover it regardless of which
+                # stage actually excluded it.
+                if "." in t:
+                    if _GRID_LETTER.match(t):
+                        letter_interior_candidates.append((t, cx, cy))
+                    elif _GRID_NUMBER.match(t):
+                        try:
+                            if 0.5 <= float(t) <= 200:
+                                number_interior_candidates.append((t, cx, cy))
+                        except ValueError:
+                            pass
+
                 # Must be near the perimeter — grid bubbles are always at the edge
                 near_edge = (
                     cx < bx0 + plan_w * EDGE or cx > bx1 - plan_w * EDGE or
@@ -3425,6 +3455,56 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
 
     v_grid, v_labels = dedup_labeled(v_pts, 1)
     h_grid, h_labels = dedup_labeled(h_pts, 2)
+
+    def _absorb_interior_subgrids(grid, labels, candidates, axis_idx, tol=18):
+        """
+        Recover decimal sub-grid bubbles (e.g. "D.1", "D.9") excluded above
+        purely because they're printed on an INTERIOR rail rather than the
+        sheet's outer margin -- on a stepped or L-shaped building, the
+        sub-grids serving the step are routinely dimensioned on their own
+        interior line instead of at the plan edge, exactly the case
+        app/engineering/grid_geometry_pass.py's own _absorb_interior_grids
+        already recovers for the dimension-line overlay. THIS array
+        (v_grid/h_grid) feeds a separate, older pass used for column-to-grid
+        labeling ("Col @ X-Y"), and until now had no equivalent recovery --
+        so a real column sitting in that interior area had no correct grid
+        line to snap to and produced a mismatched-looking reference instead.
+
+        Purely additive: a candidate is only admitted when its own base
+        letter/number is ALREADY a confirmed grid on this axis (so it can't
+        introduce a family that failed every other check above) and its
+        position falls strictly between two already-confirmed neighbouring
+        grid coordinates, never on top of one and never past either end --
+        both of which are true for a real sub-grid and essentially never
+        true for noise (a stray callout, a schedule reference) that merely
+        happens to share the decimal-label shape.
+        """
+        if not grid or not candidates:
+            return grid, labels
+        existing = set(labels.values())
+        sorted_grid = sorted(grid)
+        for text, cx, cy in candidates:
+            if text in existing:
+                continue
+            base = text.split(".")[0]
+            if base not in existing:
+                continue  # its own family was never confirmed -- not safe to trust
+            pos = cx if axis_idx == 1 else cy
+            lo = max((g for g in sorted_grid if g < pos - tol), default=None)
+            hi = min((g for g in sorted_grid if g > pos + tol), default=None)
+            if lo is None or hi is None:
+                continue  # must sit strictly between two confirmed grids, not past either end
+            if any(abs(pos - g) <= tol for g in sorted_grid):
+                continue  # effectively on top of an existing grid -- not a new one
+            grid.append(pos)
+            labels[pos] = text
+            existing.add(text)
+        grid.sort()
+        return grid, labels
+
+    v_grid, v_labels = _absorb_interior_subgrids(v_grid, v_labels, letter_interior_candidates + number_interior_candidates, 1)
+    h_grid, h_labels = _absorb_interior_subgrids(h_grid, h_labels, letter_interior_candidates + number_interior_candidates, 2)
+
     print(f"[GRID] V({len(v_grid)}): {[(round(x), v_labels[x]) for x in v_grid]}")
     print(f"[GRID] H({len(h_grid)}): {[(round(y), h_labels[y]) for y in h_grid]}")
     return v_grid, h_grid, v_labels, h_labels
@@ -3944,6 +4024,57 @@ def classify_member(profile: str,
 
 
 # ── Schedule / legend table exclusion ────────────────────────────────────────
+def detect_notes_text_zones(page, text_dict=None, min_lines=6, min_avg_words=4.0):
+    """
+    Detect areas of dense multi-line prose -- general notes columns, legend
+    paragraphs, disclaimer blocks -- so column-symbol detection can ignore
+    anything sitting inside them, on ANY drawing, not just this one.
+
+    Root cause this fixes: a real column callout is an isolated one-to-four
+    word label right next to its plan symbol. A general-notes paragraph
+    ("10. ALL EXTERIOR WALLS TO BE CONTINUOUSLY SHEATHED...") is many lines
+    of ordinary sentences stacked in a column of text, often boxed or
+    highlighted, and can itself contain short mark-shaped fragments (a
+    section size quoted inside a note, a schedule reference like "COL
+    [4-9]") that happen to match the same "letter-prefix + digits" pattern
+    detect_column_symbols' mark-proximity check looks for. Nothing
+    upstream currently distinguishes "isolated plan callout" from "sentence
+    inside a paragraph" -- this does, using a general structural signature
+    (line count + words-per-line) rather than any wording specific to one
+    sheet, so it generalizes to every future drawing's notes/legend text.
+
+    A block qualifies as a notes/prose zone when it has at least
+    `min_lines` lines AND averages at least `min_avg_words` words per line
+    -- true of ordinary sentences, false of a stacked column of short
+    labels (which is what detect_schedule_zones already handles
+    separately) and false of an isolated 1-4 word callout.
+    """
+    _td = text_dict if text_dict is not None else page.get_text("dict")
+    zones = []
+    for block in _td.get("blocks", []):
+        lines = block.get("lines", [])
+        if len(lines) < min_lines:
+            continue
+        word_counts = []
+        for line in lines:
+            words = sum(len(sp.get("text", "").split()) for sp in line.get("spans", []))
+            word_counts.append(words)
+        if not word_counts:
+            continue
+        avg_words = sum(word_counts) / len(word_counts)
+        if avg_words < min_avg_words:
+            continue
+        bbox = block.get("bbox")
+        if not bbox:
+            continue
+        pad = 12.0
+        zones.append((bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad))
+        print(f"[NOTES-ZONE] Dense prose block excluded: "
+              f"({bbox[0]:.0f},{bbox[1]:.0f})->({bbox[2]:.0f},{bbox[3]:.0f}) "
+              f"lines={len(lines)} avg_words/line={avg_words:.1f}")
+    return zones
+
+
 def detect_schedule_zones(page, plan_bounds, text_dict=None):
     """
     Detect zones that are purely schedule/legend tables (not part of the
@@ -7871,8 +8002,13 @@ async def analyse_pdf(req: AnalysisRequest):
             _is_foundation_plan = "FOUNDATION PLAN" in _page_text_upper or "FOUNDATION FRAMING" in _page_text_upper
             column_symbols = detect_column_symbols(page, scale_ratio=req.scale_ratio or 96, is_foundation_plan=_is_foundation_plan,
                                                    plan_bounds=plan_bounds)
-        # 1b. Schedule & Key Plan exclusion zones
+        # 1b. Schedule & Key Plan exclusion zones, plus general-notes /
+        # legend prose blocks (see detect_notes_text_zones -- same
+        # cx/cy-inside-zone filter, so a column mark whose only "evidence"
+        # is a mark-shaped fragment inside a paragraph of notes text is
+        # dropped exactly like one inside a schedule table already is).
         excluded_zones = detect_schedule_zones(page, plan_bounds, text_dict=text_dict)
+        excluded_zones = excluded_zones + detect_notes_text_zones(page, text_dict=text_dict)
         if column_symbols and excluded_zones:
             column_symbols = [
                 s for s in column_symbols

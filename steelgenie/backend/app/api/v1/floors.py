@@ -160,9 +160,6 @@ async def get_page_grids(page_id: UUID, user: AuthUser):
     return db.table("grids").select("*").eq("page_id", str(page_id)).execute().data or []
 
 
-_GRID_DIMENSIONS_CACHE: dict[tuple[str, float], list] = {}
-
-
 def _compute_grid_dimensions(pdf_path: str, page_idx: int, scale_num: float | None) -> list:
     from app.engineering.grid_geometry_pass import (
         run_deterministic_geometry_pass,
@@ -188,10 +185,6 @@ async def get_page_grid_dimensions(page_id: UUID, user: AuthUser):
     if not scale_num or scale_num <= 0:
         return []
 
-    cache_key = (str(page_id), float(scale_num))
-    if cache_key in _GRID_DIMENSIONS_CACHE:
-        return _GRID_DIMENSIONS_CACHE[cache_key]
-
     drawing = db.table("drawings").select("*").eq("id", page["drawing_id"]).maybe_single().execute().data
     if not drawing:
         return []
@@ -210,7 +203,6 @@ async def get_page_grid_dimensions(page_id: UUID, user: AuthUser):
         dims = await loop.run_in_executor(
             None, _compute_grid_dimensions, pdf_path, page["idx"], scale_num
         )
-        _GRID_DIMENSIONS_CACHE[cache_key] = dims
         return dims
     except Exception as exc:
         logger.warning("Error calculating grid dimensions for page %s: %s", page_id, exc)
