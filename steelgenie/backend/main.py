@@ -4024,7 +4024,8 @@ def classify_member(profile: str,
 
 
 # ── Schedule / legend table exclusion ────────────────────────────────────────
-def detect_notes_text_zones(page, text_dict=None, min_lines=6, min_avg_words=4.0):
+def detect_notes_text_zones(page, text_dict=None, min_lines=6, min_avg_words=4.0,
+                             cluster_gap=22.0):
     """
     Detect areas of dense multi-line prose -- general notes columns, legend
     paragraphs, disclaimer blocks -- so column-symbol detection can ignore
@@ -4043,20 +4044,86 @@ def detect_notes_text_zones(page, text_dict=None, min_lines=6, min_avg_words=4.0
     (line count + words-per-line) rather than any wording specific to one
     sheet, so it generalizes to every future drawing's notes/legend text.
 
-    A block qualifies as a notes/prose zone when it has at least
-    `min_lines` lines AND averages at least `min_avg_words` words per line
-    -- true of ordinary sentences, false of a stacked column of short
-    labels (which is what detect_schedule_zones already handles
-    separately) and false of an isolated 1-4 word callout.
+    Root cause of a SECOND, subtler false-negative (found 2026-09-09 on a
+    sheet whose general-notes column is drawn ROTATED, reading bottom-to-
+    top along the sheet edge -- a very common structural-drawing
+    convention): PyMuPDF's own "dict" block segmentation does not treat a
+    rotated, word-wrapped paragraph as one block the way it does an
+    upright one. It emits ONE TINY BLOCK PER PHYSICAL TEXT LINE (the note
+    number "8." is its own block, each wrapped line of the note body is
+    its own block, etc.), so no single block from a rotated notes column
+    ever reaches `min_lines` on its own -- the whole column silently
+    passes the old per-block test and column-symbol detection then runs
+    unfiltered inside it, producing a phantom column/beam mark wherever a
+    stray vector glyph (a bullet, an underline, a boxed note number)
+    happens to sit. This is not specific to one sheet's wording or
+    rotation angle; any renderer/layout that fragments a dense paragraph
+    into many small blocks defeats the same per-block line count.
+
+    Fix: cluster blocks by simple bounding-box proximity (union-find on
+    bbox overlap after expanding each bbox by `cluster_gap`) BEFORE
+    applying the line-count/word-density test, so blocks that are really
+    one visual paragraph -- whether split by ordinary word-wrap or by a
+    rotated renderer's per-line block boundaries -- are evaluated
+    together. `cluster_gap` (22pt) comfortably bridges the tight column-
+    to-column and label-to-body spacing inside a real notes strip
+    (observed 13-26pt on the sheet that exposed this) without bridging to
+    an unrelated, normally-spaced plan symbol or dimension string
+    elsewhere on the page.
+
+    A cluster qualifies as a notes/prose zone when its merged lines total
+    at least `min_lines` AND average at least `min_avg_words` words per
+    line -- true of ordinary sentences (whole or fragmented), false of a
+    stacked column of short labels (which is what detect_schedule_zones
+    already handles separately) and false of an isolated 1-4 word callout.
     """
     _td = text_dict if text_dict is not None else page.get_text("dict")
-    zones = []
+    raw_blocks = []
     for block in _td.get("blocks", []):
         lines = block.get("lines", [])
-        if len(lines) < min_lines:
+        bbox = block.get("bbox")
+        if not lines or not bbox:
+            continue
+        raw_blocks.append((bbox, lines))
+
+    n = len(raw_blocks)
+    parent = list(range(n))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def _overlaps(a, b):
+        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+    for i in range(n):
+        bi = raw_blocks[i][0]
+        ei = (bi[0] - cluster_gap, bi[1] - cluster_gap,
+              bi[2] + cluster_gap, bi[3] + cluster_gap)
+        for j in range(i + 1, n):
+            if _overlaps(ei, raw_blocks[j][0]):
+                _union(i, j)
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(_find(i), []).append(i)
+
+    zones = []
+    for idxs in clusters.values():
+        cluster_lines = []
+        for i in idxs:
+            cluster_lines.extend(raw_blocks[i][1])
+        if len(cluster_lines) < min_lines:
             continue
         word_counts = []
-        for line in lines:
+        for line in cluster_lines:
             words = sum(len(sp.get("text", "").split()) for sp in line.get("spans", []))
             word_counts.append(words)
         if not word_counts:
@@ -4064,14 +4131,16 @@ def detect_notes_text_zones(page, text_dict=None, min_lines=6, min_avg_words=4.0
         avg_words = sum(word_counts) / len(word_counts)
         if avg_words < min_avg_words:
             continue
-        bbox = block.get("bbox")
-        if not bbox:
-            continue
+        xs0 = [raw_blocks[i][0][0] for i in idxs]
+        ys0 = [raw_blocks[i][0][1] for i in idxs]
+        xs1 = [raw_blocks[i][0][2] for i in idxs]
+        ys1 = [raw_blocks[i][0][3] for i in idxs]
+        bx0, by0, bx1, by1 = min(xs0), min(ys0), max(xs1), max(ys1)
         pad = 12.0
-        zones.append((bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad))
-        print(f"[NOTES-ZONE] Dense prose block excluded: "
-              f"({bbox[0]:.0f},{bbox[1]:.0f})->({bbox[2]:.0f},{bbox[3]:.0f}) "
-              f"lines={len(lines)} avg_words/line={avg_words:.1f}")
+        zones.append((bx0 - pad, by0 - pad, bx1 + pad, by1 + pad))
+        print(f"[NOTES-ZONE] Dense prose region excluded: "
+              f"({bx0:.0f},{by0:.0f})->({bx1:.0f},{by1:.0f}) "
+              f"blocks={len(idxs)} lines={len(cluster_lines)} avg_words/line={avg_words:.1f}")
     return zones
 
 

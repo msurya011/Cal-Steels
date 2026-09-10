@@ -15,6 +15,8 @@ export interface GridDimension {
   source?: string
   ocr_text?: string | null
   scale_source?: 'explicit' | 'guessed'
+  flagged?: boolean
+  side?: string
 }
 
 interface DimensionLineProps {
@@ -35,27 +37,26 @@ export function DimensionLine({ dimension, opacity = 0.95 }: DimensionLineProps)
 
   const isHorizontal = dimension.axis === 'V' // Top/bottom horizontal line
   const isTotal = Boolean(dimension.id.includes('total') || dimension.label?.toUpperCase().includes('TOTAL'))
-  const isSubGrid = Boolean(
-    !isTotal && (
-      (dimension.from_grid && dimension.from_grid.includes('.')) ||
-      (dimension.to_grid && dimension.to_grid.includes('.'))
-    )
-  )
 
-  // ── 3 Distinct Color Schemes per User Requirement ──────────────────────────
-  // 1. Total Overall Building Lines -> Vibrant Amber / Gold (#F59E0B)
-  // 2. Sub-Grid Lines (A.5, B.3, 1.9, 8.4) -> Electric Cyan (#06B6D4)
-  // 3. Primary Grid Lines (A, B, C, 1, 2, 3) -> Vibrant Hot Pink (#EC4899)
-  let DIM_COLOR = '#EC4899' // Primary Grids (Pink)
-  let HOVER_COLOR = '#F472B6'
+  // ── Match / Mismatch Color Coding (replaces the old primary/sub-grid/total
+  // pink-cyan-amber scheme per user requirement) ─────────────────────────────
+  // The backend already tells us, per bay, whether the scaled/measured
+  // length agrees with the estimator's own printed dimension on the sheet
+  // (`flagged` is true only when we have a printed value AND it disagrees --
+  // see grid_geometry_pass.py's `agrees_with_ocr`/`flagged` fields). So the
+  // color is a direct, two-way signal for the user to spot problems at a
+  // glance: RED means "our measurement doesn't match what the estimator
+  // wrote on the sheet -- go look at this", GREEN means everything else
+  // (matches the sheet, or nothing to compare against so nothing is flagged).
+  const isMismatch = Boolean(dimension.flagged)
 
-  if (isTotal) {
-    DIM_COLOR = '#F59E0B' // Total Building Lines (Amber/Gold)
-    HOVER_COLOR = '#FBBF24'
-  } else if (isSubGrid) {
-    DIM_COLOR = '#06B6D4' // Sub-Grids (Electric Cyan)
-    HOVER_COLOR = '#38BDF8'
-  }
+  const MATCH_COLOR = '#22C55E'      // Green -- agrees with estimator value
+  const MATCH_HOVER = '#4ADE80'
+  const MISMATCH_COLOR = '#EF4444'   // Red -- disagrees with estimator value
+  const MISMATCH_HOVER = '#F87171'
+
+  const DIM_COLOR = isMismatch ? MISMATCH_COLOR : MATCH_COLOR
+  const HOVER_COLOR = isMismatch ? MISMATCH_HOVER : MATCH_HOVER
 
   const strokeColor = isHovered ? HOVER_COLOR : DIM_COLOR
   const strokeWidth = isHovered ? 3.5 : (isTotal ? 3.0 : 2.5)
@@ -64,7 +65,8 @@ export function DimensionLine({ dimension, opacity = 0.95 }: DimensionLineProps)
   const spanPct = isHorizontal ? Math.abs(x2 - x1) : Math.abs(y2 - y1)
   const isTightBay = spanPct < 1.8
 
-  const gridTypeLabel = isTotal ? 'Total Overall Line' : (isSubGrid ? 'Sub-Grid Line' : 'Primary Grid Line')
+  const gridTypeLabel = isTotal ? 'Total Overall Line' : 'Grid Line'
+  const matchLabel = isMismatch ? 'MISMATCH vs. estimator value' : 'Matches estimator value'
 
   return (
     <g
@@ -79,7 +81,7 @@ export function DimensionLine({ dimension, opacity = 0.95 }: DimensionLineProps)
     >
       {/* Title tooltip on hover for QA verification inspection */}
       <title>
-        {`[${gridTypeLabel}] Grid ${dimension.label || `${dimension.from_grid}–${dimension.to_grid}`}: ${dimension.text} (${dimension.length_ft} ft)` +
+        {`[${gridTypeLabel}] Grid ${dimension.label || `${dimension.from_grid}–${dimension.to_grid}`}: ${dimension.text} (${dimension.length_ft} ft) -- ${matchLabel}` +
          (dimension.ocr_text ? ` [OCR on sheet: "${dimension.ocr_text}"]` : '') +
          (dimension.scale_source === 'guessed' ? ' (Scale: Unverified default)' : '')}
       </title>

@@ -1361,6 +1361,47 @@ def run_deterministic_geometry_pass(
         merged.sort(key=lambda p: p["coord"])
         return merged
 
+    def _has_real_dimension_line(orientation: str, band_coord: float,
+                                  lo: float, hi: float,
+                                  tol: float = 85.0,
+                                  min_cover_frac: float = 0.6) -> bool:
+        """
+        Independent, non-textual evidence that a real line is physically
+        drawn at this band position, long enough to be the dimension line
+        for this whole run -- not proof from agreeing numbers (which can be
+        coincidence -- see _track_confidently_confirmed), but proof from
+        the page's own vector geometry, the same evidence
+        _find_confirmed_bubbles/build_line_index already use everywhere
+        else in this module.
+
+        This is exactly the real-world case where a drafter dimensions the
+        SAME grid line on a second side of the sheet without re-drawing its
+        bubble -- perfectly normal, common practice (the grid was already
+        labeled once; repeating the label on every dimensioned side would
+        be redundant). The dimension line itself, and its witness/extension
+        strokes, are still real ink on the page even though no bubble
+        circle sits on this side -- so `has_local_bubble_evidence` alone
+        was blind to it. A short, unrelated interior line (a wall, a
+        callout leader) that merely happens to sit near this band will not
+        span anywhere close to the full run; a genuine dimension line for
+        the whole side will. `min_cover_frac` is deliberately generous
+        (0.6) rather than requiring the full span, since a dimension line
+        can be interrupted by a title block or a jog without stopping
+        being the real line for this run.
+        """
+        if line_index is None:
+            return False
+        lines = line_index.vertical if orientation == "vertical" else line_index.horizontal
+        needed = (hi - lo) * min_cover_frac
+        if needed <= 0:
+            return False
+        for l in lines:
+            if abs(l["coord"] - band_coord) > tol:
+                continue
+            if (l["hi"] - l["lo"]) >= needed:
+                return True
+        return False
+
     def _track_confidently_confirmed(bays: List[Dict[str, Any]], has_local_bubble_evidence: bool = False) -> bool:
         """
         Gate for accepting a dimension track that has NO confirmed bubbles of
@@ -1461,7 +1502,9 @@ def run_deterministic_geometry_pass(
                         ext_chain = _extend_chain_with_local_confirmed(
                             v_chain, v_axis_type, "cy", avg_cy, "cx")
                         bays = _make_bays(ext_chain, "V", avg_cy)
-                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(v_chain)):
+                        has_evidence = (len(ext_chain) > len(v_chain)
+                                        or _has_real_dimension_line("horizontal", avg_cy, min_v_x, max_v_x))
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=has_evidence):
                             horizontal_dimension_tracks.append({
                                 "side": "bottom",
                                 "band_coord": round(avg_cy, 2),
@@ -1488,7 +1531,9 @@ def run_deterministic_geometry_pass(
                         ext_chain = _extend_chain_with_local_confirmed(
                             v_chain, v_axis_type, "cy", avg_cy, "cx")
                         bays = _make_bays(ext_chain, "V", avg_cy)
-                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(v_chain)):
+                        has_evidence = (len(ext_chain) > len(v_chain)
+                                        or _has_real_dimension_line("horizontal", avg_cy, min_v_x, max_v_x))
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=has_evidence):
                             horizontal_dimension_tracks.append({
                                 "side": "top",
                                 "band_coord": round(avg_cy, 2),
@@ -1542,7 +1587,9 @@ def run_deterministic_geometry_pass(
                         ext_chain = _extend_chain_with_local_confirmed(
                             h_chain, h_axis_type, "cx", avg_cx, "cy")
                         bays = _make_bays(ext_chain, "H", avg_cx)
-                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(h_chain)):
+                        has_evidence = (len(ext_chain) > len(h_chain)
+                                        or _has_real_dimension_line("vertical", avg_cx, min_h_y, max_h_y))
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=has_evidence):
                             vertical_dimension_tracks.append({
                                 "side": "left",
                                 "band_coord": round(avg_cx, 2),
@@ -1569,7 +1616,9 @@ def run_deterministic_geometry_pass(
                         ext_chain = _extend_chain_with_local_confirmed(
                             h_chain, h_axis_type, "cx", avg_cx, "cy")
                         bays = _make_bays(ext_chain, "H", avg_cx)
-                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=len(ext_chain) > len(h_chain)):
+                        has_evidence = (len(ext_chain) > len(h_chain)
+                                        or _has_real_dimension_line("vertical", avg_cx, min_h_y, max_h_y))
+                        if _track_confidently_confirmed(bays, has_local_bubble_evidence=has_evidence):
                             vertical_dimension_tracks.append({
                                 "side": "right",
                                 "band_coord": round(avg_cx, 2),
