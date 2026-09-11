@@ -327,7 +327,7 @@ def _pick_best_grid_band(pts: List[Dict[str, Any]], axis: str, band_key: str, po
 
     candidates = []
     for b in buckets.values():
-        run = _largest_contiguous_run(b, pos_key, axis=axis)
+        run = _largest_contiguous_run(b, pos_key)
         if len(run) >= 2 and _is_valid_grid_band(run, axis):
             center = sum(p[band_key] for p in run) / len(run)
             dist_to_edge = min(center, page_dim - center)
@@ -336,7 +336,7 @@ def _pick_best_grid_band(pts: List[Dict[str, Any]], axis: str, band_key: str, po
     if not candidates:
         raw_candidates = []
         for b in buckets.values():
-            run = _largest_contiguous_run(b, pos_key, axis=axis)
+            run = _largest_contiguous_run(b, pos_key)
             if len(run) >= 2:
                 center = sum(p[band_key] for p in run) / len(run)
                 dist_to_edge = min(center, page_dim - center)
@@ -363,48 +363,7 @@ VIEW_SPLIT_GAP_FACTOR = 4.0
 VIEW_SPLIT_MIN_GAP_PTS = 150.0
 
 
-def _labels_bridge_split(left_text: str, right_text: str, axis: str) -> bool:
-    """
-    True when the labels on either side of a candidate view-split gap read
-    as a straight continuation of the same numbered/lettered grid sequence
-    (e.g. "15" -> "16", or "21" -> "23" where "22" simply doesn't exist on
-    this sheet) rather than two unrelated views each restarting their own
-    numbering.
-
-    Root cause this fixes: a real structural sheet can legitimately have
-    one bay far wider than its neighbours -- a mechanical well, an atrium,
-    a stepped roofline dropping the dimension string to a new height for a
-    few bays -- and that single wide bay's gap can exceed the geometric
-    view-split threshold below even though it sits inside ONE continuous,
-    correctly-numbered grid row (found 2026-09-10: grids 1-15 and 16-24 on
-    one sheet's row got cut apart here purely because bay 15-16 happened to
-    be ~4.6x the row's median bay, discarding every grid from 16 on as if
-    it belonged to a different view). A genuine view boundary does not
-    behave this way -- a second, unrelated plan view restarts its bubble
-    numbering (back to 1, or A), it does not pick up exactly where the
-    first view's sequence left off. So label continuity is the
-    discriminator a gap-size-only test cannot provide: only veto the split
-    when the two labels are themselves a small, strictly-increasing step
-    apart (allowing for the odd sheet that skips a number/letter it never
-    used), never when the size gap is real but the labels don't line up.
-    """
-    if axis == "number":
-        ma = re.match(r"^(\d+)(?:\.(\d+))?$", left_text)
-        mb = re.match(r"^(\d+)(?:\.(\d+))?$", right_text)
-        if not ma or not mb:
-            return False
-        return 0 < (int(mb.group(1)) - int(ma.group(1))) <= 3
-    elif axis == "letter":
-        ma = re.match(r"^([A-Z])", left_text)
-        mb = re.match(r"^([A-Z])", right_text)
-        if not ma or not mb:
-            return False
-        return 0 < (ord(mb.group(1)) - ord(ma.group(1))) <= 3
-    return False
-
-
-def _split_runs(band: List[Dict[str, Any]], pos_key: str,
-                 axis: Optional[str] = None) -> List[List[Dict[str, Any]]]:
+def _split_runs(band: List[Dict[str, Any]], pos_key: str) -> List[List[Dict[str, Any]]]:
     """
     Break a band wherever the spacing jumps, and return every resulting run.
 
@@ -413,11 +372,6 @@ def _split_runs(band: List[Dict[str, Any]], pos_key: str,
     its own grid bubbles, at the same height on the sheet, so they land in one
     band and get chained together. The join between them is not a bay: it is
     empty paper, and any dimension computed across it is meaningless.
-
-    `axis`, when given, lets a candidate split be vetoed by
-    _labels_bridge_split: an oversized gap whose two flanking labels are
-    still a straight continuation of the same sequence (see that function's
-    docstring) is a real wide bay, not a view boundary, and is kept whole.
     """
     pts = sorted(band, key=lambda p: p[pos_key])
     if len(pts) < 3:
@@ -431,8 +385,7 @@ def _split_runs(band: List[Dict[str, Any]], pos_key: str,
 
     runs, current = [], [pts[0]]
     for i, g in enumerate(gaps):
-        if g > threshold and not (axis and _labels_bridge_split(
-                pts[i]["text"], pts[i + 1]["text"], axis)):
+        if g > threshold:
             runs.append(current)
             current = [pts[i + 1]]
         else:
@@ -441,8 +394,7 @@ def _split_runs(band: List[Dict[str, Any]], pos_key: str,
     return runs
 
 
-def _largest_contiguous_run(band: List[Dict[str, Any]], pos_key: str,
-                             axis: Optional[str] = None) -> List[Dict[str, Any]]:
+def _largest_contiguous_run(band: List[Dict[str, Any]], pos_key: str) -> List[Dict[str, Any]]:
     """
     Keep the biggest coherent run in this band and drop the rest.
 
@@ -464,7 +416,7 @@ def _largest_contiguous_run(band: List[Dict[str, Any]], pos_key: str,
             seen.append(g)
         return run
 
-    runs = _split_runs(band, pos_key, axis=axis)
+    runs = _split_runs(band, pos_key)
     if len(runs) == 1:
         return runs[0]
     best = max(runs, key=len)
@@ -1128,8 +1080,17 @@ def run_deterministic_geometry_pass(
             cleaned.append((kept, meta))
         return cleaned
 
+    import sys as _sys
+    print("=== BEFORE cross-track drop (v_tracks / numbers axis) ===", file=_sys.stderr)
+    for i, (chain, meta) in enumerate(v_tracks):
+        labels = [(p["label"], round(p["coord"],1), p.get("coord_source")) for p in chain]
+        print(f"  v_track[{i}] side={meta.get('side')} band={meta.get('band_coord')} labels={labels}", file=_sys.stderr)
     v_tracks = _drop_cross_track_mismatches(v_tracks)
     h_tracks = _drop_cross_track_mismatches(h_tracks)
+    print("=== AFTER cross-track drop (v_tracks / numbers axis) ===", file=_sys.stderr)
+    for i, (chain, meta) in enumerate(v_tracks):
+        labels = [(p["label"], round(p["coord"],1)) for p in chain]
+        print(f"  v_track[{i}] side={meta.get('side')} band={meta.get('band_coord')} labels={labels}", file=_sys.stderr)
     # A track that lost every point to cross-track validation isn't a real
     # track at all -- it was fully bogus, not just partially noisy. Drop it
     # rather than reporting an empty, misleading "confirmed track."

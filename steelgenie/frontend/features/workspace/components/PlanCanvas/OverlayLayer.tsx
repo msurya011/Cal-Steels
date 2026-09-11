@@ -167,6 +167,7 @@ export function OverlayLayer({
           inset: 0,
           width: '100%',
           height: '100%',
+          overflow: 'hidden',
           pointerEvents: 'none',
           zIndex: 10,
         }}
@@ -275,10 +276,11 @@ export function OverlayLayer({
             const strokeColor = isHovered ? '#22C55E' : (isSelected ? '#22C55E' : JOIST_COLOR)
             const strokeWidth = (isHovered ? 3.5 : 2.2) + strokeWidthModifier
 
-            const x1 = geo.bx1! * 100
-            const y1 = geo.by1! * 100
-            const x2 = geo.bx2! * 100
-            const y2 = geo.by2! * 100
+            const clamp01 = (v: number) => Math.max(0, Math.min(1, v))
+            const x1 = clamp01(geo.bx1!) * 100
+            const y1 = clamp01(geo.by1!) * 100
+            const x2 = clamp01(geo.bx2!) * 100
+            const y2 = clamp01(geo.by2!) * 100
 
             return (
               <g
@@ -325,10 +327,11 @@ export function OverlayLayer({
             const strokeWidth = strokeWidthBase + strokeWidthModifier
             const showText = layers.aids.labels !== false
 
-            const x1 = geo.bx1! * 100
-            const y1 = geo.by1! * 100
-            const x2 = geo.bx2! * 100
-            const y2 = geo.by2! * 100
+            const clamp01 = (v: number) => Math.max(0, Math.min(1, v))
+            const x1 = clamp01(geo.bx1!) * 100
+            const y1 = clamp01(geo.by1!) * 100
+            const x2 = clamp01(geo.bx2!) * 100
+            const y2 = clamp01(geo.by2!) * 100
 
             return (
               <BeamLine
@@ -358,12 +361,13 @@ export function OverlayLayer({
           }
 
           // 4. Brace rendering
-          const bx = geo.x * 100
-          const by = geo.y * 100
-          const bgx1 = geo.bx1 !== undefined && geo.bx1 !== null ? geo.bx1 * 100 : null
-          const bgy1 = geo.by1 !== undefined && geo.by1 !== null ? geo.by1 * 100 : null
-          const bgx2 = geo.bx2 !== undefined && geo.bx2 !== null ? geo.bx2 * 100 : null
-          const bgy2 = geo.by2 !== undefined && geo.by2 !== null ? geo.by2 * 100 : null
+          const _c01 = (v: number) => Math.max(0, Math.min(1, v))
+          const bx = _c01(geo.x) * 100
+          const by = _c01(geo.y) * 100
+          const bgx1 = geo.bx1 !== undefined && geo.bx1 !== null ? _c01(geo.bx1) * 100 : null
+          const bgy1 = geo.by1 !== undefined && geo.by1 !== null ? _c01(geo.by1) * 100 : null
+          const bgx2 = geo.bx2 !== undefined && geo.bx2 !== null ? _c01(geo.bx2) * 100 : null
+          const bgy2 = geo.by2 !== undefined && geo.by2 !== null ? _c01(geo.by2) * 100 : null
           const hasBraceLine = bgx1 !== null && bgy1 !== null && bgx2 !== null && bgy2 !== null
 
           const markerColor = isLowConf && layers.colorMode === 'kind' ? '#F59E0B' : color

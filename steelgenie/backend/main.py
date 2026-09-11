@@ -880,8 +880,49 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
         _prelim.append((_sc, _pi))
     _order = [pi for _sc, pi in sorted(_prelim, key=lambda z: -z[0])]
 
+    # ── Composite / built-up callouts ("W16x36" over "C12x20.7") ────────────
+    # Two profile labels stacked almost directly on top of each other (same
+    # text column, consecutive line spacing) are two LINES OF ONE CALLOUT for
+    # a single physical beam (a wide-flange capped with a channel or plate),
+    # not two separate beams. Under the normal one-line-per-label exclusivity
+    # rule below, whichever label of the pair is processed second finds its
+    # shared line already claimed and gets forced onto an unrelated line
+    # elsewhere on the sheet -- producing a wrong-length / offset "beam" that
+    # has nothing to do with the real member (the composite-callout overshoot
+    # bug). Detect these stacked pairs up front so the second label simply
+    # reuses the first's matched line instead of searching independently.
+    # Require the pair to actually LOOK like a built-up callout (a primary
+    # W/HSS shape paired with a channel/angle/plate cap) rather than just
+    # "two labels that happen to sit close together" -- two independent,
+    # genuinely separate beams can legitimately have their own labels a few
+    # points apart in a dense area, and treating those as one would just move
+    # the bug rather than fix it. This keeps the sharing rule narrow to the
+    # one situation it's meant for.
+    _CAP_RE = re.compile(r'^(?:C|L|MC|PL)\d')
+    _PRIMARY_RE = re.compile(r'^(?:W|HSS)\d')
+    _STACK_DX = 8.0    # same text column (allow narrow width drift)
+    _STACK_DY = 16.0   # consecutive stacked text-line spacing (one line height)
+    _stack_partner: dict = {}
+    for _i in _keys:
+        _pi = profiles[_i]
+        _pi_prof = _pi.get("profile") or ""
+        for _j in _keys:
+            if _j <= _i:
+                continue
+            _pj = profiles[_j]
+            _pj_prof = _pj.get("profile") or ""
+            _is_cap_pair = ((_PRIMARY_RE.match(_pi_prof) and _CAP_RE.match(_pj_prof)) or
+                            (_PRIMARY_RE.match(_pj_prof) and _CAP_RE.match(_pi_prof)))
+            if (_is_cap_pair and
+                    abs(_pi["cx"] - _pj["cx"]) <= _STACK_DX and
+                    abs(_pi["cy"] - _pj["cy"]) <= _STACK_DY):
+                _stack_partner.setdefault(_i, _j)
+                _stack_partner.setdefault(_j, _i)
+
     _claimed_lines: set = set()
     for p_idx in _order:
+        if p_idx in result:
+            continue   # already filled in by its stacked-callout partner
         p = profiles[p_idx]
         pcx, pcy = p["cx"], p["cy"]
         best, _bscore, _bmid = _match_profile(p, _claimed_lines)
@@ -1220,6 +1261,12 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
                 "dir":       bdir,
                 "length_pt": ln,
             }
+            # Share this same beam with a stacked-callout partner (e.g. the
+            # "C12x20.7" line of a "W16x36 / C12x20.7" pair) instead of
+            # letting it search separately and get pushed onto a wrong line.
+            _partner = _stack_partner.get(p_idx)
+            if _partner is not None and _partner not in result:
+                result[_partner] = dict(result[p_idx])
 
     matched = len(result)
     print(f"[BEAM_LINES] {matched}/{len(profiles)} profiles matched "
