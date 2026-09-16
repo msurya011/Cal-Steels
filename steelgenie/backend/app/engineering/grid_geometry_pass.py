@@ -175,6 +175,9 @@ def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
             line_str = "".join(sp.get("text", "") for sp in l.get("spans", []))
             m = scale_re.search(line_str)
             if m:
+                upper = line_str.upper()
+                if any(bad in upper for bad in ("ELEVATION", "DATUM", "FINISH", "BENCHMARK")):
+                    continue
                 frac_str = m.group(1) or m.group(4)
                 if "/" in frac_str:
                     num, den = frac_str.split("/")
@@ -182,6 +185,8 @@ def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
                 else:
                     inch_val = float(frac_str)
                 pts_per_foot = inch_val * 72.0
+                if pts_per_foot <= 0:
+                    continue
                 return pts_per_foot, line_str.strip(), True
 
     return 9.0, "1/8\" = 1'-0\" (DEFAULT -- NOT FOUND ON SHEET)", False
@@ -256,6 +261,7 @@ def _find_confirmed_bubbles(page: "fitz.Page", text_dict: dict,
                         confirmed.append({
                             "text": t, "axis": kind[0], "is_secondary": kind[1],
                             "cx": cx, "cy": cy,
+                            "r": max(r.width, r.height) / 2.0,
                         })
                         break
 
@@ -852,6 +858,8 @@ def _build_axis_tracks(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph
                 "bubble_coord": round(c[pos_key], 2),
                 "bubble_offset_pts": (None if source == "bubble_inferred"
                                       else round(abs(coord - c[pos_key]), 2)),
+                "is_leader_verified": c.get("line_cx_is_leader" if pos_key == "cx" else "line_cy_is_leader", False),
+                "line_segments": c.get("line_cx_segments" if pos_key == "cx" else "line_cy_segments", 0),
             })
         meta["line_outliers_rejected"] = reject_outlier_line_coords(chain_entries)
         meta["line_confirmed_count"] = sum(
@@ -1228,7 +1236,11 @@ def run_deterministic_geometry_pass(
             # bubble row/column itself (the innermost, per-bay track), not
             # a farther-out cumulative/overall track that happens to also
             # fall within the x/y window.
-            candidates = [d for d in dim_spans if abs(d[pos_key] - mid) <= span_px * 0.35]
+            # For tight bays (small span_px), drafters place the dimension text
+            # slightly outside the bay with an arrow/leader line. Allow a minimum
+            # search radius so tight bay dimensions are not missed.
+            search_radius = max(span_px * 0.35, min(60.0, span_px * 0.5 + 35.0))
+            candidates = [d for d in dim_spans if abs(d[pos_key] - mid) <= search_radius]
             # A bay bounded by a grid recovered from an INTERIOR rail is
             # dimensioned on that interior rail, not on the sheet-edge track
             # this chain belongs to. Matching it against the outer band picks
@@ -1399,6 +1411,8 @@ def run_deterministic_geometry_pass(
                                       else round(abs(coord - c[pos_key]), 2)),
                 "line_len_frac": line_len_frac,
                 "line_margin": line_match_margin,
+                "is_leader_verified": c.get("line_cx_is_leader" if pos_key == "cx" else "line_cy_is_leader", False),
+                "line_segments": c.get("line_cx_segments" if pos_key == "cx" else "line_cy_segments", 0),
             })
         # Grids pulled in here skipped the gate that runs inside
         # _build_axis_tracks, so apply it now -- otherwise a bubble added on

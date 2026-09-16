@@ -60,8 +60,8 @@ export function ColumnSymbol({
   // the visual marker uses that when available and only falls back to the
   // snapped point for older data that predates this fix.
   const hasRaw = geo.raw_x !== undefined && geo.raw_x !== null && geo.raw_y !== undefined && geo.raw_y !== null
-  const cx = (hasRaw ? geo.raw_x : geo.x) * 100
-  const cy = (hasRaw ? geo.raw_y : geo.y) * 100
+  const cx = (hasRaw ? geo.raw_x : (geo.x ?? m.x ?? 0)) * 100
+  const cy = (hasRaw ? geo.raw_y : (geo.y ?? m.y ?? 0)) * 100
 
   // Drag logic
   const groupRef = useRef<SVGGElement>(null)

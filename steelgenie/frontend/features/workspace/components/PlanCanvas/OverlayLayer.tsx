@@ -361,9 +361,9 @@ export function OverlayLayer({
           }
 
           // 4. Brace rendering
-          const _c01 = (v: number) => Math.max(0, Math.min(1, v))
-          const bx = _c01(geo.x) * 100
-          const by = _c01(geo.y) * 100
+          const _c01 = (v: number | undefined | null) => Math.max(0, Math.min(1, v ?? 0))
+          const bx = _c01(geo.x ?? m.x) * 100
+          const by = _c01(geo.y ?? m.y) * 100
           const bgx1 = geo.bx1 !== undefined && geo.bx1 !== null ? _c01(geo.bx1) * 100 : null
           const bgy1 = geo.by1 !== undefined && geo.by1 !== null ? _c01(geo.by1) * 100 : null
           const bgx2 = geo.bx2 !== undefined && geo.bx2 !== null ? _c01(geo.bx2) * 100 : null

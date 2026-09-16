@@ -56,6 +56,7 @@ geometry yields an empty index and every caller falls back to prior behaviour.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz
@@ -81,9 +82,9 @@ CLUSTER_TOL_PTS = 1.2
 MAX_STROKE_WIDTH = 2.6
 
 # A grid line must run at least this fraction of the sheet's extent in its own
-# direction. Sub-grids terminate early, hence the low bar; the bubble-proximity
-# test below is what actually does the discriminating.
-MIN_EXTENT_FRAC = 0.16
+# direction. Sub-grids terminate early (spanning 1-2 bays, ~100-250pt); hence
+# the threshold allows local sub-grid lines while filtering stray ticks.
+MIN_EXTENT_FRAC = 0.035
 
 # How far a bubble may sit from its line, perpendicular to the line. At 9 pts
 # per foot this is a little under 3 feet -- generous enough for a dodged
@@ -141,8 +142,8 @@ AGREE_BAND_FLOOR_PTS = 2.0
 # Tuned against the A/B: on clean vector sheets these gates fire on nothing,
 # so the pass confirms and never degrades. They exist for the sheet where a
 # bubble really was pushed clear of its line.
-MIN_CORRECT_LEN_FRAC = 0.50
-MIN_CORRECT_MARGIN_PTS = 6.0
+MIN_CORRECT_LEN_FRAC = 0.18
+MIN_CORRECT_MARGIN_PTS = 2.0
 
 # Safety net for a bubble that matched the wrong line. Applied after a track's
 # chain exists, when the axis's own typical bay spacing is finally known: a
@@ -156,14 +157,15 @@ OUTLIER_FRAC_OF_MEDIAN_BAY = 0.25
 class LineIndex:
     """Axis-aligned candidate chain lines recovered from a page's vector paths."""
 
-    __slots__ = ("vertical", "horizontal", "page_w", "page_h", "stats")
+    __slots__ = ("vertical", "horizontal", "page_w", "page_h", "stats", "all_thin_segments")
 
-    def __init__(self, vertical, horizontal, page_w, page_h, stats):
+    def __init__(self, vertical, horizontal, page_w, page_h, stats, all_thin_segments=None):
         self.vertical: List[Dict[str, Any]] = vertical
         self.horizontal: List[Dict[str, Any]] = horizontal
         self.page_w = page_w
         self.page_h = page_h
         self.stats: Dict[str, Any] = stats
+        self.all_thin_segments: List[Tuple[fitz.Point, fitz.Point]] = all_thin_segments or []
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (f"<LineIndex vertical={len(self.vertical)} "
@@ -192,17 +194,21 @@ def _dashes_are_real(dashes: Any) -> bool:
         return False
 
 
-def _iter_segments(page: "fitz.Page", rot_mat) -> List[Dict[str, Any]]:
+def _iter_segments(page: "fitz.Page", rot_mat) -> Tuple[List[Dict[str, Any]], List[Tuple[fitz.Point, fitz.Point]]]:
     """
-    Collect every thin, axis-aligned straight segment on the page, tagged with
-    whether its stroke was dashed. Curves, fills and heavy strokes are skipped.
+    Collect every thin straight segment on the page.
+    Returns:
+      (axis_aligned_segments, all_thin_segments)
+    all_thin_segments includes non-axis-aligned segments (such as CAD diagonal
+    dogleg/leader jogs connecting dodged bubbles to true grid lines).
     """
-    segments: List[Dict[str, Any]] = []
+    axis_aligned: List[Dict[str, Any]] = []
+    all_thin: List[Tuple[fitz.Point, fitz.Point]] = []
 
     try:
         drawings = page.get_drawings()
     except Exception:
-        return segments
+        return axis_aligned, all_thin
 
     for d in drawings:
         # Stroked paths only. A filled shape is a bubble, a hatch or a solid.
@@ -227,11 +233,13 @@ def _iter_segments(page: "fitz.Page", rot_mat) -> List[Dict[str, Any]]:
                 p1 = p1 * rot_mat
                 p2 = p2 * rot_mat
 
+            all_thin.append((p1, p2))
+
             dx = abs(p2.x - p1.x)
             dy = abs(p2.y - p1.y)
 
             if dx <= AXIS_TOL_PTS and dy >= MIN_SEGMENT_PTS:
-                segments.append({
+                axis_aligned.append({
                     "orient": "vertical",
                     "coord": (p1.x + p2.x) / 2.0,
                     "lo": min(p1.y, p2.y),
@@ -240,7 +248,7 @@ def _iter_segments(page: "fitz.Page", rot_mat) -> List[Dict[str, Any]]:
                     "width": width,
                 })
             elif dy <= AXIS_TOL_PTS and dx >= MIN_SEGMENT_PTS:
-                segments.append({
+                axis_aligned.append({
                     "orient": "horizontal",
                     "coord": (p1.y + p2.y) / 2.0,
                     "lo": min(p1.x, p2.x),
@@ -249,7 +257,7 @@ def _iter_segments(page: "fitz.Page", rot_mat) -> List[Dict[str, Any]]:
                     "width": width,
                 })
 
-    return segments
+    return axis_aligned, all_thin
 
 
 def _cluster(segments: List[Dict[str, Any]], span_limit: float) -> List[Dict[str, Any]]:
@@ -259,27 +267,48 @@ def _cluster(segments: List[Dict[str, Any]], span_limit: float) -> List[Dict[str
     A chain line arrives as dozens of separate dash segments, so the cluster's
     EXTENT (first lo to last hi) is what matters, not the summed ink -- a
     long dashed line has roughly half the ink of a solid one of the same reach.
-    Gaps inside the extent are expected and are not split on: a grid line
-    passing behind a column bubble or a block of text is interrupted in the
-    vector stream but is one line.
+    Gaps inside the extent are expected and are not split on unless the gap is
+    excessive (>150pt), which prevents distant unrelated geometry (like a wall
+    or beam) from merging with a tiny isolated nib near a bubble.
     """
     if not segments:
         return []
 
     segments = sorted(segments, key=lambda s: s["coord"])
-    candidates: List[Dict[str, Any]] = []
+    buckets: List[List[Dict[str, Any]]] = []
 
     bucket = [segments[0]]
     for seg in segments[1:]:
         if seg["coord"] - bucket[-1]["coord"] <= CLUSTER_TOL_PTS:
             bucket.append(seg)
         else:
-            candidates.append(_fold(bucket))
+            buckets.append(bucket)
             bucket = [seg]
-    candidates.append(_fold(bucket))
+    buckets.append(bucket)
 
+    candidates: List[Dict[str, Any]] = []
     min_extent = span_limit * MIN_EXTENT_FRAC
-    return [c for c in candidates if (c["hi"] - c["lo"]) >= min_extent]
+    MAX_ALONG_LINE_GAP_PTS = 150.0
+
+    for b in buckets:
+        b_sorted = sorted(b, key=lambda s: s["lo"])
+        runs: List[List[Dict[str, Any]]] = []
+        cur_run = [b_sorted[0]]
+        for s in b_sorted[1:]:
+            gap = s["lo"] - max(x["hi"] for x in cur_run)
+            if gap <= MAX_ALONG_LINE_GAP_PTS:
+                cur_run.append(s)
+            else:
+                runs.append(cur_run)
+                cur_run = [s]
+        runs.append(cur_run)
+
+        for run in runs:
+            c = _fold(run)
+            if (c["hi"] - c["lo"]) >= min_extent:
+                candidates.append(c)
+
+    return candidates
 
 
 def _fold(bucket: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -312,7 +341,7 @@ def build_line_index(page: "fitz.Page", page_w: float, page_h: float,
     same page.rotation_matrix passed to _find_confirmed_bubbles, so line
     coordinates land in the same space as bubble coordinates.
     """
-    segments = _iter_segments(page, rot_mat)
+    segments, all_thin = _iter_segments(page, rot_mat)
 
     vertical = _cluster([s for s in segments if s["orient"] == "vertical"], page_h)
     horizontal = _cluster([s for s in segments if s["orient"] == "horizontal"], page_w)
@@ -324,32 +353,113 @@ def build_line_index(page: "fitz.Page", page_w: float, page_h: float,
         "dashed_vertical": sum(1 for c in vertical if c["dashed"]),
         "dashed_horizontal": sum(1 for c in horizontal if c["dashed"]),
     }
-    return LineIndex(vertical, horizontal, page_w, page_h, stats)
+    return LineIndex(vertical, horizontal, page_w, page_h, stats, all_thin)
 
 
 # ---------------------------------------------------------------------------
 # Bubble -> line matching
 # ---------------------------------------------------------------------------
 
+def trace_bubble_leader_target(
+    cx: float,
+    cy: float,
+    orient: str,
+    candidates: List[Dict[str, Any]],
+    all_thin_segments: List[Tuple[fitz.Point, fitz.Point]],
+    bubble_radius: float = 12.0,
+) -> Optional[Tuple[Dict[str, Any], float]]:
+    """
+    Traces CAD leader / dogleg paths starting at/near the bubble circumference
+    to determine which candidate grid line the bubble physically connects to.
+
+    When sub-grids are dodged sideways to prevent bubble overlap, drafters draw
+    a leader stem from the bubble circle and a diagonal dogleg jog connecting
+    directly into the true grid line. Tracing these connected vector segments
+    recovers the exact grid line with zero ambiguity.
+
+    Returns (candidate_line, offset_delta) if a connected leader path terminates
+    at a candidate line, else None.
+    """
+    if not all_thin_segments or not candidates:
+        return None
+
+    bubble_radius = bubble_radius or 16.0
+    # Search window near circumference: bubble radius is typically 12-22 pt,
+    # and leader segments start at the circle boundary.
+    max_start_dist = max(bubble_radius + 6.0, 25.0)
+
+    queue = []
+    visited = set()
+    for idx, (p1, p2) in enumerate(all_thin_segments):
+        d1 = math.hypot(p1.x - cx, p1.y - cy)
+        d2 = math.hypot(p2.x - cx, p2.y - cy)
+        if min(d1, d2) <= max_start_dist:
+            start_pt = p1 if d1 < d2 else p2
+            end_pt = p2 if d1 < d2 else p1
+            queue.append((end_pt, [start_pt, end_pt], idx))
+            visited.add(idx)
+
+    if not queue:
+        return None
+
+    # Breadth-first search up to 6 hops
+    hit_candidates = []
+    for hop in range(6):
+        next_queue = []
+        for curr_pt, path, last_idx in queue:
+            # Check if curr_pt aligns with any candidate line
+            for c in candidates:
+                if orient == "vertical":
+                    if abs(curr_pt.x - c["coord"]) <= 2.0 and (c["lo"] - 12.0 <= curr_pt.y <= c["hi"] + 12.0):
+                        hit_candidates.append((c, hop, len(path)))
+                else:
+                    if abs(curr_pt.y - c["coord"]) <= 2.0 and (c["lo"] - 12.0 <= curr_pt.x <= c["hi"] + 12.0):
+                        hit_candidates.append((c, hop, len(path)))
+
+            for idx, (p1, p2) in enumerate(all_thin_segments):
+                if idx in visited:
+                    continue
+                d1 = math.hypot(p1.x - curr_pt.x, p1.y - curr_pt.y)
+                d2 = math.hypot(p2.x - curr_pt.x, p2.y - curr_pt.y)
+                if d1 <= 3.5:
+                    next_queue.append((p2, path + [p2], idx))
+                    visited.add(idx)
+                elif d2 <= 3.5:
+                    next_queue.append((p1, path + [p1], idx))
+                    visited.add(idx)
+
+        queue = next_queue
+        if hit_candidates or not queue:
+            break
+
+    if not hit_candidates:
+        return None
+
+    # Best hit: lowest hops, then longest candidate line / most segments
+    hit_candidates.sort(key=lambda item: (item[1], -item[0].get("segments", 0), -item[0].get("ink", 0)))
+    best_candidate = hit_candidates[0][0]
+    delta = abs(best_candidate["coord"] - (cx if orient == "vertical" else cy))
+    return best_candidate, delta
+
+
 def _best_line(candidates: List[Dict[str, Any]], across: float, along: float
-               ) -> Optional[Tuple[Dict[str, Any], float]]:
+               ) -> Optional[Tuple[Dict[str, Any], float, float]]:
     """
     Pick the line this bubble terminates.
 
     `across` is the bubble's coordinate perpendicular to the line (the bubble's
-    cx for a vertical line); `along` is its coordinate parallel to the line
-    (cy for a vertical line), used to check the line actually reaches the
-    bubble instead of being a different grid that merely passes nearby.
+    x for a vertical line, y for a horizontal line); `along` is its coordinate
+    parallel to the line.
 
-    Returns (line, delta, margin) -- delta is the magnitude of the offset
-    between bubble and line, margin is how much the runner-up candidate lost
-    by (inf when there was no runner-up). A small margin means the match was
-    a coin flip and must not be trusted to override the bubble. Returns None
-    when nothing qualifies.
+    Returns (line_dict, delta_pts, runner_up_margin_pts) or None.
+    delta_pts is the absolute offset between bubble centre and line coordinate.
+    runner_up_margin_pts is how much better the chosen line scored than the
+    second-best candidate: infinite when only one candidate was within
+    tolerance, small when two candidates scored almost equally.
     """
-    best = None
-    best_cost = None
-    second_cost = None
+    best: Optional[Tuple[Dict[str, Any], float]] = None
+    best_cost: Optional[float] = None
+    best_coord: Optional[float] = None
 
     for c in candidates:
         delta = abs(c["coord"] - across)
@@ -379,16 +489,51 @@ def _best_line(candidates: List[Dict[str, Any]], across: float, along: float
         cost -= min(c["hi"] - c["lo"], 400.0) * 0.004
 
         if best_cost is None or cost < best_cost:
-            second_cost = best_cost
             best_cost = cost
             best = (c, delta)
-        elif second_cost is None or cost < second_cost:
-            second_cost = cost
+            best_coord = c["coord"]
 
     if best is None:
         return None
+
+    # Compute runner-up cost only against DIFFERENT physical lines (ignore
+    # parallel strokes / double lines within 3.5pt of the winning line).
+    SAME_LINE_TOL_PTS = 3.5
+    runner_up_cost = None
+    best_is_major = (best[0].get("segments", 0) >= 6 or (best[0]["hi"] - best[0]["lo"]) >= 350.0 or best[0].get("dashed", False))
+    for c in candidates:
+        if abs(c["coord"] - best_coord) <= SAME_LINE_TOL_PTS:
+            continue
+        # A minor interior framing fragment (e.g. 1-2 segments, short length)
+        # cannot compete as a runner-up against a major multi-segment building chain line.
+        if best_is_major and c.get("segments", 0) < 3 and (c["hi"] - c["lo"]) < 300.0 and not c.get("dashed"):
+            continue
+        delta = abs(c["coord"] - across)
+        if delta > BUBBLE_TO_LINE_TOL_PTS:
+            continue
+
+        if along < c["lo"]:
+            end_gap = c["lo"] - along
+        elif along > c["hi"]:
+            end_gap = along - c["hi"]
+        else:
+            end_gap = 0.0
+
+        if end_gap > LINE_END_TO_BUBBLE_TOL_PTS:
+            continue
+
+        cost = delta + end_gap * 0.25
+        if c["dashed"]:
+            cost -= DASH_BONUS_PTS
+        if c.get("segments", 0) >= SEGMENT_CHAIN_MIN:
+            cost -= SEGMENT_CHAIN_BONUS_PTS
+        cost -= min(c["hi"] - c["lo"], 400.0) * 0.004
+
+        if runner_up_cost is None or cost < runner_up_cost:
+            runner_up_cost = cost
+
     line, delta = best
-    margin = float("inf") if second_cost is None else (second_cost - best_cost)
+    margin = float("inf") if runner_up_cost is None else (runner_up_cost - best_cost)
     return line, delta, margin
 
 
@@ -407,44 +552,87 @@ def attach_line_coords(confirmed: List[Dict[str, Any]], line_index: LineIndex) -
 
     for c in confirmed:
         cx, cy = c["cx"], c["cy"]
+        r = c.get("r") or 16.0
 
-        hit_v = _best_line(line_index.vertical, across=cx, along=cy)
-        if hit_v is not None:
-            line, delta, margin = hit_v
+        # Try leader tracing first for vertical chain lines
+        leader_v = trace_bubble_leader_target(
+            cx, cy, "vertical", line_index.vertical, line_index.all_thin_segments, r
+        )
+        if leader_v is not None:
+            line, delta = leader_v
             c["line_cx"] = round(line["coord"], 3)
             c["line_cx_source"] = "vector_line"
             c["line_cx_delta"] = round(delta, 2)
             c["line_cx_dashed"] = line["dashed"]
             c["line_cx_len_frac"] = round((line["hi"] - line["lo"]) / max(line_index.page_h, 1.0), 3)
-            c["line_cx_margin"] = None if margin == float("inf") else round(margin, 2)
+            c["line_cx_margin"] = float("inf")
+            c["line_cx_is_leader"] = True
+            c["line_cx_segments"] = line.get("segments", 1)
             matched_x += 1
             deltas.append(delta)
         else:
-            c["line_cx"] = None
-            c["line_cx_source"] = "bubble_inferred"
-            c["line_cx_delta"] = None
-            c["line_cx_dashed"] = None
-            c["line_cx_len_frac"] = None
-            c["line_cx_margin"] = None
+            hit_v = _best_line(line_index.vertical, across=cx, along=cy)
+            if hit_v is not None:
+                line, delta, margin = hit_v
+                c["line_cx"] = round(line["coord"], 3)
+                c["line_cx_source"] = "vector_line"
+                c["line_cx_delta"] = round(delta, 2)
+                c["line_cx_dashed"] = line["dashed"]
+                c["line_cx_len_frac"] = round((line["hi"] - line["lo"]) / max(line_index.page_h, 1.0), 3)
+                c["line_cx_margin"] = None if margin == float("inf") else round(margin, 2)
+                c["line_cx_is_leader"] = False
+                c["line_cx_segments"] = line.get("segments", 1)
+                matched_x += 1
+                deltas.append(delta)
+            else:
+                c["line_cx"] = None
+                c["line_cx_source"] = "bubble_inferred"
+                c["line_cx_delta"] = None
+                c["line_cx_dashed"] = None
+                c["line_cx_len_frac"] = None
+                c["line_cx_margin"] = None
+                c["line_cx_is_leader"] = False
+                c["line_cx_segments"] = 0
 
-        hit_h = _best_line(line_index.horizontal, across=cy, along=cx)
-        if hit_h is not None:
-            line, delta, margin = hit_h
+        # Try leader tracing first for horizontal chain lines
+        leader_h = trace_bubble_leader_target(
+            cx, cy, "horizontal", line_index.horizontal, line_index.all_thin_segments, r
+        )
+        if leader_h is not None:
+            line, delta = leader_h
             c["line_cy"] = round(line["coord"], 3)
             c["line_cy_source"] = "vector_line"
             c["line_cy_delta"] = round(delta, 2)
             c["line_cy_dashed"] = line["dashed"]
             c["line_cy_len_frac"] = round((line["hi"] - line["lo"]) / max(line_index.page_w, 1.0), 3)
-            c["line_cy_margin"] = None if margin == float("inf") else round(margin, 2)
+            c["line_cy_margin"] = float("inf")
+            c["line_cy_is_leader"] = True
+            c["line_cy_segments"] = line.get("segments", 1)
             matched_y += 1
             deltas.append(delta)
         else:
-            c["line_cy"] = None
-            c["line_cy_source"] = "bubble_inferred"
-            c["line_cy_delta"] = None
-            c["line_cy_dashed"] = None
-            c["line_cy_len_frac"] = None
-            c["line_cy_margin"] = None
+            hit_h = _best_line(line_index.horizontal, across=cy, along=cx)
+            if hit_h is not None:
+                line, delta, margin = hit_h
+                c["line_cy"] = round(line["coord"], 3)
+                c["line_cy_source"] = "vector_line"
+                c["line_cy_delta"] = round(delta, 2)
+                c["line_cy_dashed"] = line["dashed"]
+                c["line_cy_len_frac"] = round((line["hi"] - line["lo"]) / max(line_index.page_w, 1.0), 3)
+                c["line_cy_margin"] = None if margin == float("inf") else round(margin, 2)
+                c["line_cy_is_leader"] = False
+                c["line_cy_segments"] = line.get("segments", 1)
+                matched_y += 1
+                deltas.append(delta)
+            else:
+                c["line_cy"] = None
+                c["line_cy_source"] = "bubble_inferred"
+                c["line_cy_delta"] = None
+                c["line_cy_dashed"] = None
+                c["line_cy_len_frac"] = None
+                c["line_cy_margin"] = None
+                c["line_cy_is_leader"] = False
+                c["line_cy_segments"] = 0
 
     total = len(confirmed) or 1
     deltas_sorted = sorted(deltas)
@@ -501,13 +689,24 @@ def reject_outlier_line_coords(chain_entries: List[Dict[str, Any]]) -> int:
                    geometry. Keep the bubble, marked so a reader can tell this
                    apart from "no line was found at all".
 
+    IMPORTANT for sub-grids (secondary labels like B.6, C.1, 7.1 etc.):
+    Sub-grids are inserted into the tightest bays — that is precisely WHY
+    the drafter dodges them the most. Using the whole-track median bay as
+    the outlier ceiling incorrectly rejects legitimate line corrections on
+    sub-grids. For a secondary entry, we use the smaller of:
+      (a) the whole-track median bay  (the global reference)
+      (b) the minimum of the two bays immediately adjacent to this entry
+    This makes the outlier ceiling proportional to the SUB-GRID's own bay
+    rather than the global median, which for a primary-heavy track can be
+    3-5x larger than a real sub-bay.
+
     Call this once a track's chain exists, because only then is the axis's own
     typical bay spacing known. Matching happens per-bubble against the whole
     page, so a stray label that passed the circle-plus-text bubble test can
     latch onto an unrelated long line; on a real sheet those strays are
     dropped by the track builder anyway, but a mis-match on a bubble that IS
     in the chain would silently corrupt two bays. A grid that moved by more
-    than a quarter of the median bay did not get dodged -- it got mismatched.
+    than a quarter of the reference bay did not get dodged -- it got mismatched.
 
     Mutates entries in place. Reverted entries are marked
     coord_source="bubble_inferred_outlier" so a reader can tell the difference
@@ -525,7 +724,7 @@ def reject_outlier_line_coords(chain_entries: List[Dict[str, Any]]) -> int:
     if not spans:
         return 0
     median_span = sorted(spans)[len(spans) // 2]
-    outlier_limit = median_span * OUTLIER_FRAC_OF_MEDIAN_BAY
+    global_outlier_limit = median_span * OUTLIER_FRAC_OF_MEDIAN_BAY
     agree_band = max(AGREE_BAND_FLOOR_PTS,
                      median_span * AGREE_BAND_FRAC_OF_MEDIAN_BAY)
 
@@ -536,22 +735,63 @@ def reject_outlier_line_coords(chain_entries: List[Dict[str, Any]]) -> int:
         off = e.get("bubble_offset_pts")
         if off is None:
             continue
+        is_secondary = e.get("is_secondary", False)
+
         if off <= agree_band:
-            e["coord"] = e["bubble_coord"]
+            if not is_secondary:
+                e["coord"] = e["bubble_coord"]
             e["coord_source"] = "bubble_confirmed_by_line"
             continue
-        if off > outlier_limit:
+
+        # If the grid line is explicitly connected to the bubble via a traced CAD leader / dogleg,
+        # it is ground truth: never revert it to the offset bubble coordinate.
+        if e.get("is_leader_verified"):
+            continue
+
+        # ── Outlier rejection gate ────────────────────────────────────────────
+        # PRIMARY grids: reject if the line moved the coord by > 25% of the
+        # track's median bay (this is a mismatch against unrelated geometry).
+        #
+        # SECONDARY grids (B.6, C.1, 7.1 ...): DO NOT apply the global median-bay
+        # ceiling. Sub-grids are inserted into the TIGHTEST bays and their
+        # bubbles are dodged the MOST — that is the entire point of this code.
+        # The median bay of the track is dominated by primary spans that are
+        # 3-5x larger than a real sub-bay, making the 25% ceiling absurdly tight
+        # for secondaries. For example: median primary bay = 200 pt, outlier
+        # limit = 50 pt, but the drafter routinely dodges sub-grid bubbles by
+        # 40-80 pt. Applying the primary threshold falsely reverts these and
+        # produces wrong dimensions — exactly the bug seen on screen.
+        # Secondaries are controlled exclusively by the line-quality gate below.
+        if not is_secondary and off > global_outlier_limit:
             e["coord"] = e["bubble_coord"]
             e["coord_source"] = "bubble_inferred_outlier"
             e["rejected_line_offset_pts"] = off
             e["bubble_offset_pts"] = None
             reverted += 1
             continue
-        # Outside the dead band: override the bubble only on strong evidence.
+
+        # ── Line-quality gate ─────────────────────────────────────────────────
+        # Override the bubble only when the matched line is long enough and
+        # unambiguous enough to be trusted.
         len_frac = e.get("line_len_frac")
         margin = e.get("line_margin")
-        strong = (len_frac is not None and len_frac >= MIN_CORRECT_LEN_FRAC
-                  and (margin is None or margin >= MIN_CORRECT_MARGIN_PTS))
+        seg_count = e.get("line_segments", 0)
+
+        if is_secondary:
+            # Sub-grid chain lines genuinely run only part of the plan extent by
+            # definition (they terminate at the parent grid or local bays, ~100-250pt).
+            # Accept if length fraction >= 0.035 and either margin >= 2.0 pt, length fraction >= 0.20,
+            # or line has multiple chain segments (>= 4).
+            strong = (len_frac is not None and len_frac >= 0.035
+                      and (margin is None or margin >= 2.0 or len_frac >= 0.20 or seg_count >= 4))
+        else:
+            # Primary grids can also be dodged sideways when placed adjacent to a
+            # sub-grid. Accept if line is long enough (>= MIN_CORRECT_LEN_FRAC),
+            # or has multiple chain segments (>= 4), and is unambiguous (margin >= 2.0 or None).
+            strong = (len_frac is not None
+                      and (len_frac >= MIN_CORRECT_LEN_FRAC or seg_count >= 4)
+                      and (margin is None or margin >= MIN_CORRECT_MARGIN_PTS))
+
         if not strong:
             e["coord"] = e["bubble_coord"]
             e["coord_source"] = "bubble_kept_weak_line"

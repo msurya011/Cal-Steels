@@ -93,6 +93,14 @@ _GRID_LABEL_RE = re.compile(r'^(?:[A-Z]{1,2}(?:\.\d+)?|\d{1,2}(?:\.\d+)?)$', re.
 # Column/Footing mark pattern: C1, CC1, CC2, F1, P1, PC1, CP1, PU1, POST1, BP1
 _MARK_RE = re.compile(r'^(?:[A-Z]{1,3}\d{1,4}[A-Z]?)$', re.IGNORECASE)
 
+# AISC / Structural steel profile callouts (HSS, W, WT, HP, PIPE, C, MC, L)
+_PROFILE_RE = re.compile(
+    r'^(?:(?:W|WT|HP|C|MC|L)\s*\d+(?:\.\d+)?\s*X\s*\d+(?:\.\d+)?(?:\s*X\s*[\d./]+)?|'
+    r'HSS\s*\d+(?:\.\d+)?\s*X\s*\d+(?:\.\d+)?(?:\s*X\s*[\d./]+)?|'
+    r'PIPE\s*\d+(?:\.\d+)?(?:\s*STD|\s*X-?S)?)$',
+    re.IGNORECASE
+)
+
 # Explicit concrete column / concrete pier marks (e.g. CC1, CC2, CP1, PIER1)
 _CONCRETE_MARK_RE = re.compile(r'^(?:CC\d{1,3}[A-Z]?|CP\d{1,3}|PIER\d{1,3}|PED\d{1,3})$', re.IGNORECASE)
 
@@ -242,7 +250,7 @@ def _classify_one(
     has_ih_pattern = s.get("has_ih_pattern", False)
     accept_rules = set(s.get("accept_rules", []))
 
-    has_mark = any(_MARK_RE.match(t) for t in nearby_upper)
+    has_mark = any(_MARK_RE.match(t) or _PROFILE_RE.match(t) for t in nearby_upper)
     has_detail_ref = any(_DETAIL_REF_RE.match(t) for t in nearby_upper)
     # 2026-07-20: has_mark above uses the WIDE search_radius (up to 80-360pt
     # on a typical sheet -- see the caller). That's the right radius for
@@ -261,7 +269,7 @@ def _classify_one(
     # widths away belongs to a DIFFERENT symbol, not this one. Every
     # confidence-boosting "+ real mark nearby" branch below now requires
     # this tight-radius match, not the wide one.
-    has_mark_tight = any(_MARK_RE.match(t) for t in (nearby_tight_upper or nearby_upper))
+    has_mark_tight = any(_MARK_RE.match(t) or _PROFILE_RE.match(t) for t in (nearby_tight_upper or nearby_upper))
     # 2026-07-17: the GENERAL, content-independent signal for a detail/
     # section-reference bubble -- a circle/hex/diamond bisected by a
     # horizontal divider line is the universal AIA/NCS drafting convention
@@ -394,6 +402,8 @@ def _classify_one(
     if (_outline_rules and 0.4 < aspect < 2.5 and has_mark_tight):
         if any(_CONCRETE_MARK_RE.match(t) for t in _tight):
             return CONCRETE_COLUMN, 0.85, "concrete column/pier mark (CC/CP) - concrete scope"
+        if any(_PROFILE_RE.match(t) for t in _tight):
+            return STEEL_COLUMN, 0.85, "square-ish outline with steel column profile nearby"
         return PEDESTAL if not is_foundation_plan else FOOTING_ISOLATED, 0.75, "square-ish pedestal/footing outline + real structural mark nearby"
 
     if (is_foundation_plan and _outline_rules and 0.4 < aspect < 2.5):

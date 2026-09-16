@@ -978,23 +978,25 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
                     # happens to match a real beam line, so it gets dropped.
                     pass
                 else:
-                    # Gate on REAL column symbols only — NOT grid lines.  A grid line
-                    # crossing does not mean a column exists at THIS beam's position
-                    # (a vertical infill beam crosses many row grid lines but frames
-                    # girder-to-girder with no column between).  Truncate only where
-                    # an actual detected column sits ON the beam axis between the
-                    # matched piece and the chained end — that is a real beam-to-beam
-                    # junction (two members meeting at a column), not one beam.
-                    _PERP = 22.0   # column centre must lie within this of the axis
+                    # Gate on column symbols, grid intersections, and crossing perpendicular girders.
+                    # A beam-to-beam junction or column sitting on the beam axis marks the end of a single
+                    # member span — chaining must truncate at the support so it does not bridge into the next bay.
+                    _PERP = 22.0   # column/support centre must lie within this of the axis
                     if _is_h_chain:
                         _yl = (_c2 + _c4) / 2.0
                         _ol, _orr = min(_om_x1, _om_x2), max(_om_x1, _om_x2)
                         _nl, _nr  = min(_c1, _c3),       max(_c1, _c3)
                         _colx = [s["cx"] for s in (column_symbols or [])
                                  if abs(s["cy"] - _yl) < _PERP]
+                        if v_grid:
+                            _colx += [gx for gx in v_grid if not h_grid or any(abs(gy - _yl) < _PERP for gy in h_grid)]
+                        for (px1, py1, px2, py2, pln) in all_lines:
+                            if abs(py2 - py1) > abs(px2 - px1) * 2 and min(py1, py2) - 10 <= _yl <= max(py1, py2) + 10:
+                                _colx.append((px1 + px2) / 2.0)
+                        _colx = sorted(set(_colx))
                         _lc = [c for c in _colx if _nl < c < _ol - 2]
                         if _lc:
-                            _nl = max(_lc)         # stop at column nearest matched piece
+                            _nl = max(_lc)         # stop at column/support nearest matched piece
                         _rc = [c for c in _colx if _orr + 2 < c < _nr]
                         if _rc:
                             _nr = min(_rc)
@@ -1012,6 +1014,12 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
                         _nt, _nb = min(_c2, _c4),       max(_c2, _c4)
                         _coly = [s["cy"] for s in (column_symbols or [])
                                  if abs(s["cx"] - _xl) < _PERP]
+                        if h_grid:
+                            _coly += [gy for gy in h_grid if not v_grid or any(abs(gx - _xl) < _PERP for gx in v_grid)]
+                        for (px1, py1, px2, py2, pln) in all_lines:
+                            if abs(px2 - px1) > abs(py2 - py1) * 2 and min(px1, px2) - 10 <= _xl <= max(px1, px2) + 10:
+                                _coly.append((py1 + py2) / 2.0)
+                        _coly = sorted(set(_coly))
                         _tc = [c for c in _coly if _nt < c < _ot - 2]
                         if _tc:
                             _nt = max(_tc)
@@ -2840,7 +2848,7 @@ def filter_foundation_symbols_by_marks(symbols: list, page, v_grid: list, h_grid
     # base-plate mark, e.g. "C4, BP1"; perimeter columns happened to also
     # sit near cleanly-formatted pier marks like "P24" that passed, which is
     # why only the perimeter appeared to be marked at all).
-    _MARK_RE = re.compile(r'^(?:[FPC]\d{1,3}(?:\.\d+)?[A-Z]?)$')
+    _MARK_RE = re.compile(r'^(?:(?:[FPC]|BP|CC|CP|COL|POST)\d{1,4}(?:\.\d+)?[A-Z]?|HSS\d+.*|W\d+X\d+.*|PIPE\d+.*)$', re.IGNORECASE)
     _mark_positions: list[tuple[float, float]] = []
     try:
         for w in page.get_text("words"):
@@ -5108,6 +5116,9 @@ def build_members(profiles, page_w, page_h,
             if (_sym_idx is not None and column_symbols) else None
         )
 
+        _mcx = round(render_cx / page_w, 4)
+        _mcy = round(render_cy / page_h, 4)
+
         if mtype == "column" and _sym_category == "footing_isolated":
             import uuid as _uuid_mod
             _linked_group_id = str(_uuid_mod.uuid4())
@@ -5117,8 +5128,8 @@ def build_members(profiles, page_w, page_h,
                 "length_ft": 0.0,
                 "beam_dir":  None,
                 "bx1": None, "by1": None, "bx2": None, "by2": None,
-                "x":  round(render_cx / page_w, 4),
-                "y":  round(render_cy / page_h, 4),
+                "x":  _mcx,
+                "y":  _mcy,
                 "lx": round(p["cx"] / page_w, 4),
                 "ly": round(p["cy"] / page_h, 4),
                 "sx": sym[0] if sym else None,
@@ -5127,7 +5138,12 @@ def build_members(profiles, page_w, page_h,
                 "color":     MEMBER_COLORS.get("footing", "#6B7280"),
                 "confirmed": True,
                 "is_column": False,
-                "geometry": {"category": _sym_category, "linked_group_id": _linked_group_id, "linked_role": "footing"},
+                "geometry": {
+                    "category": _sym_category,
+                    "linked_group_id": _linked_group_id,
+                    "linked_role": "footing",
+                    "x": _mcx, "y": _mcy, "raw_x": _mcx, "raw_y": _mcy,
+                },
             })
         else:
             _linked_group_id = None
@@ -5140,8 +5156,8 @@ def build_members(profiles, page_w, page_h,
             'beam_dir':  beam_dir,
             'bx1': bx1, 'by1': by1,
             'bx2': bx2, 'by2': by2,
-            'x':  round(render_cx / page_w, 4),
-            'y':  round(render_cy / page_h, 4),
+            'x':  _mcx,
+            'y':  _mcy,
             'lx': round(p['cx'] / page_w, 4),
             'ly': round(p['cy'] / page_h, 4),
             'sx': sym[0] if sym else None,
@@ -5154,6 +5170,7 @@ def build_members(profiles, page_w, page_h,
             'geometry': {
                 **({'category': _sym_category, 'linked_group_id': _linked_group_id, 'linked_role': 'column' if _linked_group_id else None} if _sym_category else {}),
                 'unlabeled': is_unlabeled,
+                **({'x': _mcx, 'y': _mcy, 'raw_x': _mcx, 'raw_y': _mcy} if mtype in ('column', 'footing') else {}),
             },
         })
     # ── Post-processing: drop unlabeled beam stubs & grid lines ──────────────
@@ -7709,8 +7726,9 @@ def snap_beam_ends_to_supports(members, all_struct_lns, col_x, col_y,
 
         # ── Drawn-steel clamp ────────────────────────────────────────────────
         # The overlay must not extend beyond the ACTUAL drawn steel line it traces.
-        # PAD = 0.5 ft (6 inches) for physical column/beam seat connection tolerance.
-        PAD = 0.5 * ppf
+        # PAD = 1.8 ft (~22 inches) bridges the half-column depth and girder flange connection gap
+        # to ensure the beam reaches true center-to-center structural supports.
+        PAD = 1.8 * ppf
         px, py = -uy, ux
         d_ts = []
         for (sx1, sy1, sx2, sy2, _l) in (all_struct_lns or []):
@@ -8567,28 +8585,41 @@ async def analyse_pdf(req: AnalysisRequest):
         # locate footings/piers/columns -- the "beams" the generic detector
         # pulls off it are really the wall/grid/dimension lines, which the
         # user does not want. So on a foundation plan we DISCARD every beam/
-        # joist/brace/suggested member the pipeline built, and REPLACE the
-        # column/footing set with the grid-intersection detector, which places
-        # each marker dead-center on the real footing (the grid intersection,
-        # where the sheet itself says every column is centered). Framing plans
-        # are completely untouched by this block.
+        # joist/brace/suggested member the pipeline built, and RETAIN all real
+        # column and footing members (with their matched profiles and off-grid
+        # positions like elevator posts), merging in any missing grid-intersection
+        # footings. Framing plans are completely untouched by this block.
         if _is_foundation_plan and not is_raster:
+            base_cols_foots = [
+                m for m in members
+                if m.get("type") in ("footing", "column")
+                and m.get("source") != "suggested"
+            ]
             try:
                 _foots = detect_foundation_footings_grid(
                     page, plan_bounds, scale_ratio=req.scale_ratio or 96)
             except Exception as _fe:
                 print(f"[FOUNDATION] grid detector error (non-fatal): {_fe}")
                 _foots = []
+
+            existing_locs = []
+            for m in base_cols_foots:
+                _geo = m.get("geometry") or {}
+                _mx = _geo.get("raw_x") if _geo.get("raw_x") is not None else m.get("x")
+                _my = _geo.get("raw_y") if _geo.get("raw_y") is not None else m.get("y")
+                if _mx is not None and _my is not None:
+                    existing_locs.append((_mx * page_w, _my * page_h))
+
             if _foots:
                 import uuid as _uuid_mod
-                _new_members = []
                 for _f in _foots:
                     _px, _py = _f["cx"], _f["cy"]
+                    if any(math.hypot(_px - ex, _py - ey) < 35.0 for ex, ey in existing_locs):
+                        continue
                     _xf = round(_px / page_w, 4)
                     _yf = round(_py / page_h, 4)
                     _grp = str(_uuid_mod.uuid4())
-                    # Emit ONLY ONE single clean Column record per footing site
-                    _new_members.append({
+                    base_cols_foots.append({
                         "profile": None, "type": "column", "length_ft": 0.0,
                         "beam_dir": None,
                         "bx1": _xf, "by1": _yf, "bx2": _xf, "by2": _yf,
@@ -8608,19 +8639,10 @@ async def analyse_pdf(req: AnalysisRequest):
                         "color": MEMBER_COLORS["column"],
                         "confirmed": True, "is_column": True, "size_unknown": True,
                     })
-                members = _new_members
-                print(f"[FOUNDATION] replaced members with {len(_foots)} "
-                      f"footing+column pairs (dropped all beams/joists/braces)")
-            else:
-                # Detector found nothing usable (no clean grid) -- rather than
-                # emit the noisy generic output on a foundation plan, keep only
-                # whatever real footing/column members the old path produced and
-                # still drop the beams/joists/braces the user rejected.
-                members = [m for m in members
-                           if m.get("type") in ("footing", "column")
-                           and m.get("source") != "suggested"]
-                print("[FOUNDATION] grid detector empty; kept "
-                      f"{len(members)} footing/column members, dropped rest")
+                    existing_locs.append((_px, _py))
+
+            members = base_cols_foots
+            print(f"[FOUNDATION] retained {len(members)} footing/column members (dropped all beams/joists/braces)")
 
         # ── ROTATION OUTPUT TRANSFORM ─────────────────────────────────────────
         # All member coordinates above are fractions of the UNROTATED page
@@ -8663,8 +8685,12 @@ async def analyse_pdf(req: AnalysisRequest):
                 if isinstance(_geo, dict):
                     if _geo.get("raw_x") is not None and _geo.get("raw_y") is not None:
                         _geo["raw_x"], _geo["raw_y"] = _rot_frac(_geo.get("raw_x"), _geo.get("raw_y"))
+                    elif _m.get("x") is not None and _m.get("y") is not None:
+                        _geo["raw_x"], _geo["raw_y"] = _m.get("x"), _m.get("y")
                     if _geo.get("x") is not None and _geo.get("y") is not None:
                         _geo["x"], _geo["y"] = _rot_frac(_geo.get("x"), _geo.get("y"))
+                    elif _m.get("x") is not None and _m.get("y") is not None:
+                        _geo["x"], _geo["y"] = _m.get("x"), _m.get("y")
             print(f"[ANALYSE] Applied {page.rotation}° rotation transform "
                   f"to {len(members)} members (unrotated {_puw:.0f}x{_puh:.0f} "
                   f"-> display {_rw:.0f}x{_rh:.0f})")
