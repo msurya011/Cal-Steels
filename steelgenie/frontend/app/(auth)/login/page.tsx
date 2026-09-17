@@ -14,27 +14,53 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [resending, setResending] = useState(false)
+  const [resendSuccess, setResendSuccess] = useState(false)
+
+  function handleDevLogin() {
+    const mockSession = {
+      access_token: 'mock-dev-jwt-token',
+      user: {
+        id: '00000000-0000-0000-0000-000000000000',
+        email: 'admin@calsteel.local'
+      }
+    }
+    localStorage.setItem('dev_auth_session', JSON.stringify(mockSession))
+    setSuccess('Developer offline mode authenticated!')
+    setError(null)
+    setTimeout(() => {
+      router.push('/projects')
+    }, 400)
+  }
+
+  async function handleResendEmail() {
+    if (!email) return
+    setResending(true)
+    try {
+      const { error: resendErr } = await supabase.auth.resend({
+        type: 'signup',
+        email,
+      })
+      if (resendErr) throw resendErr
+      setResendSuccess(true)
+      setError(null)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to resend confirmation email')
+    } finally {
+      setResending(false)
+    }
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
     setError(null)
     setSuccess(null)
+    setResendSuccess(false)
     setLoading(true)
 
     // Developer Offline Bypass Login ID
     if (email === 'admin@calsteel.local' && password === 'adminpassword123') {
-      const mockSession = {
-        access_token: 'mock-dev-jwt-token',
-        user: {
-          id: '00000000-0000-0000-0000-000000000000',
-          email: 'admin@calsteel.local'
-        }
-      }
-      localStorage.setItem('dev_auth_session', JSON.stringify(mockSession))
-      setSuccess('Developer offline mode authenticated!')
-      setTimeout(() => {
-        router.push('/projects')
-      }, 500)
+      handleDevLogin()
       setLoading(false)
       return
     }
@@ -43,17 +69,46 @@ export default function LoginPage() {
       if (tab === 'login') {
         const { error: err } = await supabase.auth.signInWithPassword({ email, password })
         if (err) throw err
+        setSuccess('Signed in! Redirecting…')
         router.push('/projects')
       } else {
-        const { error: err } = await supabase.auth.signUp({ email, password })
+        const { data, error: err } = await supabase.auth.signUp({ email, password })
         if (err) throw err
-        setSuccess('Account created! Signing you in…')
-        const { error: err2 } = await supabase.auth.signInWithPassword({ email, password })
+
+        // If Supabase provides a session immediately (email confirmation disabled)
+        if (data?.session) {
+          setSuccess('Account created! Signing you in…')
+          router.push('/projects')
+          return
+        }
+
+        // Try signing in immediately in case auto-confirmation is enabled
+        const { data: signInData, error: err2 } = await supabase.auth.signInWithPassword({ email, password })
+        if (!err2 && signInData?.session) {
+          setSuccess('Account created! Signing you in…')
+          router.push('/projects')
+          return
+        }
+
+        // Email confirmation is required by Supabase
+        if (err2 && err2.message.toLowerCase().includes('email not confirmed')) {
+          setSuccess('Account created! A confirmation email has been sent to ' + email + '. Please verify your email, then sign in.')
+          setTab('login')
+          return
+        }
+
         if (err2) throw err2
-        router.push('/projects')
+        setSuccess('Account created! Please check your email to confirm your account.')
+        setTab('login')
       }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Something went wrong')
+      setSuccess(null)
+      const msg = err instanceof Error ? err.message : 'Something went wrong'
+      if (msg.toLowerCase().includes('email not confirmed')) {
+        setError('Email not confirmed yet. Please verify the confirmation email sent to ' + email + ', or request a new one below.')
+      } else {
+        setError(msg)
+      }
     } finally {
       setLoading(false)
     }
@@ -130,10 +185,30 @@ export default function LoginPage() {
           ))}
 
           {error && (
-            <div style={{ display:'flex', alignItems:'center', gap:'8px', padding:'10px 14px',
+            <div style={{ display:'flex', flexDirection:'column', gap:'8px', padding:'10px 14px',
                 backgroundColor:'rgba(239,68,68,0.08)', border:'1px solid rgba(239,68,68,0.2)',
                 borderRadius:'8px', color:'#F87171', fontSize:'13px' }}>
-              ⚠ {error}
+              <div style={{ display:'flex', alignItems:'center', gap:'8px' }}>
+                <span>⚠ {error}</span>
+              </div>
+              {error.toLowerCase().includes('email not confirmed') && email && (
+                <button
+                  type="button"
+                  onClick={handleResendEmail}
+                  disabled={resending}
+                  style={{ alignSelf:'flex-start', background:'none', border:'none', color:'#60A5FA',
+                    fontSize:'12px', fontWeight:600, cursor: resending ? 'not-allowed' : 'pointer',
+                    padding:0, textDecoration:'underline', fontFamily:'inherit' }}>
+                  {resending ? 'Sending verification email…' : 'Resend confirmation email'}
+                </button>
+              )}
+            </div>
+          )}
+          {resendSuccess && (
+            <div style={{ display:'flex', alignItems:'center', gap:'8px', padding:'10px 14px',
+                backgroundColor:'rgba(52,211,153,0.08)', border:'1px solid rgba(52,211,153,0.2)',
+                borderRadius:'8px', color:'#34D399', fontSize:'13px' }}>
+              ✓ Verification email sent! Please check your inbox.
             </div>
           )}
           {success && (
@@ -155,12 +230,24 @@ export default function LoginPage() {
 
         <p style={{ marginTop:'24px', textAlign:'center', fontSize:'13px', color:'#475569' }}>
           {tab==='login' ? "Don't have an account? " : 'Already have an account? '}
-          <button onClick={() => { setTab(tab==='login' ? 'signup' : 'login'); setError(null) }}
+          <button onClick={() => { setTab(tab==='login' ? 'signup' : 'login'); setError(null); setSuccess(null) }}
             style={{ background:'none', border:'none', color:'#60A5FA', fontSize:'13px',
               fontWeight:600, cursor:'pointer', padding:0, fontFamily:'inherit' }}>
             {tab==='login' ? 'Sign up free' : 'Sign in'}
           </button>
         </p>
+
+        {/* Developer Offline Bypass Quick Action */}
+        <div style={{ marginTop:'20px', paddingTop:'16px', borderTop:'1px solid rgba(255,255,255,0.08)', textAlign:'center' }}>
+          <button
+            type="button"
+            onClick={handleDevLogin}
+            style={{ background:'rgba(59,130,246,0.08)', border:'1px solid rgba(59,130,246,0.2)',
+              borderRadius:'7px', color:'#93C5FD', fontSize:'12px', fontWeight:500,
+              padding:'6px 12px', cursor:'pointer', fontFamily:'inherit', transition:'all 0.2s' }}>
+            ⚡ Continue as Developer (Offline Mode)
+          </button>
+        </div>
       </div>
     </div>
   )

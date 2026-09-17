@@ -3,6 +3,7 @@ import { useWorkspaceStore, getMemberRenderProps } from '../../../../lib/stores/
 import { ColumnSymbol } from './ColumnSymbol'
 import { BeamLine } from './BeamLine'
 import { DimensionLine } from './DimensionLine'
+import { WorkPointMarker } from './WorkPointMarker'
 
 interface Member {
   id: string
@@ -362,8 +363,8 @@ export function OverlayLayer({
 
           // 4. Brace rendering
           const _c01 = (v: number | undefined | null) => Math.max(0, Math.min(1, v ?? 0))
-          const bx = _c01(geo.x ?? m.x) * 100
-          const by = _c01(geo.y ?? m.y) * 100
+          const bx = _c01(geo.x ?? (m as any).x) * 100
+          const by = _c01(geo.y ?? (m as any).y) * 100
           const bgx1 = geo.bx1 !== undefined && geo.bx1 !== null ? _c01(geo.bx1) * 100 : null
           const bgy1 = geo.by1 !== undefined && geo.by1 !== null ? _c01(geo.by1) * 100 : null
           const bgx2 = geo.bx2 !== undefined && geo.bx2 !== null ? _c01(geo.bx2) * 100 : null
@@ -457,6 +458,12 @@ export function OverlayLayer({
         {layers.aids.gridDimensions !== false && store.gridDimensions && store.gridDimensions.map((dim: any) => (
           <DimensionLine key={dim.id} dimension={dim} />
         ))}
+
+        {/* 6. Work Point (WP) -- the plan's implied origin grid intersection.
+          Rendered if either grid dimensions or grid lines are enabled in aids. */}
+        {(layers.aids.gridDimensions !== false || layers.aids.grid !== false) && store.workPoint && (
+          <WorkPointMarker workPoint={store.workPoint} />
+        )}
       </svg>
     </>
   )

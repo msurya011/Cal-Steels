@@ -377,6 +377,13 @@ interface WorkspaceState {
   pageGridDimensions: Record<string, any[]>
   gridDimensions: any[]
   setGridDimensions: (pageIdOrDims: any, maybeDims?: any[]) => void
+  // Work Point (WP) marker -- the plan's implied origin grid intersection.
+  // Mirrors the gridDimensions/pageGridDimensions pattern exactly: one entry
+  // per page so switching pages doesn't show the previous page's WP for a
+  // frame, plus the "currently active" convenience field the overlay reads.
+  pageWorkPoint: Record<string, any | null>
+  workPoint: any | null
+  setWorkPoint: (pageIdOrWp: any, maybeWp?: any | null) => void
   resetTakeoffState: () => void
 
   // Member Segregation mutations
@@ -545,6 +552,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
         currentPageId: id,
         currentPageIndex: idx,
         gridDimensions: (id && s.pageGridDimensions && s.pageGridDimensions[id]) ? s.pageGridDimensions[id] : [],
+        workPoint: (id && s.pageWorkPoint && s.pageWorkPoint[id] !== undefined) ? s.pageWorkPoint[id] : null,
       }
     }),
   setScale: (label, ratio) =>
@@ -581,6 +589,33 @@ export const useWorkspaceStore = create<WorkspaceState>((set) => ({
           pageGridDimensions: s.currentPageId
             ? { ...s.pageGridDimensions, [s.currentPageId]: dims }
             : s.pageGridDimensions,
+        }
+      })
+    }
+  },
+  pageWorkPoint: {},
+  workPoint: null,
+  setWorkPoint: (pageIdOrWp: any, maybeWp?: any | null) => {
+    if (typeof pageIdOrWp === 'string') {
+      const pageId = pageIdOrWp
+      const wp = maybeWp ?? null
+      set((s) => {
+        const prev = s.pageWorkPoint?.[pageId]
+        if (prev === wp) return s
+        return {
+          pageWorkPoint: { ...s.pageWorkPoint, [pageId]: wp },
+          workPoint: s.currentPageId === pageId ? wp : s.workPoint,
+        }
+      })
+    } else {
+      const wp = pageIdOrWp ?? null
+      set((s) => {
+        if (s.workPoint === wp) return s
+        return {
+          workPoint: wp,
+          pageWorkPoint: s.currentPageId
+            ? { ...s.pageWorkPoint, [s.currentPageId]: wp }
+            : s.pageWorkPoint,
         }
       })
     }

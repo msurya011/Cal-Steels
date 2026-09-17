@@ -172,6 +172,18 @@ def _compute_grid_dimensions(pdf_path: str, page_idx: int, scale_num: float | No
     return to_frontend_dimension_lines(results)
 
 
+def _compute_work_point(pdf_path: str, page_idx: int, scale_num: float | None) -> dict | None:
+    from app.engineering.grid_geometry_pass import (
+        run_deterministic_geometry_pass,
+        to_frontend_work_point,
+    )
+    override_ppf = (864.0 / scale_num) if scale_num and scale_num > 0 else None
+    results = run_deterministic_geometry_pass(
+        pdf_path, page_number=page_idx, override_pts_per_foot=override_ppf
+    )
+    return to_frontend_work_point(results)
+
+
 @router.get("/pages/{page_id}/grid-dimensions")
 async def get_page_grid_dimensions(page_id: UUID, user: AuthUser):
     """Extract and return bay-to-bay grid dimensions with measured scale feet and OCR text."""
@@ -207,6 +219,81 @@ async def get_page_grid_dimensions(page_id: UUID, user: AuthUser):
     except Exception as exc:
         logger.warning("Error calculating grid dimensions for page %s: %s", page_id, exc)
         return []
+
+
+def _compute_work_point_from_db_grids(db_grids: list) -> dict | None:
+    """Compute work point directly from normalized grids stored in DB."""
+    if not db_grids:
+        return None
+    from app.engineering.grid_geometry_pass import to_frontend_work_point
+    v_grids = []
+    h_grids = []
+    for g in db_grids:
+        pos = g.get("position")
+        if pos is None:
+            continue
+        try:
+            pos_f = float(pos)
+        except (ValueError, TypeError):
+            continue
+        axis = str(g.get("axis", "")).lower()
+        lbl = str(g.get("label", "")).strip()
+        if axis == "x":
+            v_grids.append({"label": lbl, "x": pos_f})
+        elif axis == "y":
+            h_grids.append({"label": lbl, "y": pos_f})
+
+    if not v_grids or not h_grids:
+        return None
+
+    return to_frontend_work_point({
+        "vertical_grids": v_grids,
+        "horizontal_grids": h_grids,
+        "page_dimensions": {"width": 1.0, "height": 1.0},
+    })
+
+
+@router.get("/pages/{page_id}/work-point")
+async def get_page_work_point(page_id: UUID, user: AuthUser):
+    """Return the plan's implied Work Point (WP) -- the first grid in each
+    axis's own label sequence (e.g. grid 1 / grid A) -- as a single
+    normalized-coordinate marker for the overlay.
+    Attempts extraction from the PDF drawing first, and falls back to
+    persisted database grids if the PDF geometry pass is unavailable or returns None.
+    Scale calibration is optional (coordinates are normalized 0-1)."""
+    db = get_db()
+    page = db.table("pages").select("*").eq("id", str(page_id)).maybe_single().execute().data
+    if not page:
+        return None
+
+    scale_num = page.get("scale_num")
+    wp = None
+
+    drawing = db.table("drawings").select("*").eq("id", page["drawing_id"]).maybe_single().execute().data
+    if drawing:
+        storage_key = drawing.get("storage_key") or drawing.get("file_url")
+        if storage_key:
+            from app.services.storage import get_storage
+            storage = get_storage()
+            pdf_path = storage.local_path(storage_key)
+            if os.path.exists(pdf_path):
+                try:
+                    loop = asyncio.get_event_loop()
+                    wp = await loop.run_in_executor(
+                        None, _compute_work_point, pdf_path, page["idx"], scale_num
+                    )
+                except Exception as exc:
+                    logger.warning("Error calculating work point from PDF for page %s: %s", page_id, exc)
+
+    # Robust fallback: if PDF geometry pass yielded no work point, derive from persisted grids
+    if not wp:
+        try:
+            db_grids = db.table("grids").select("*").eq("page_id", str(page_id)).execute().data or []
+            wp = _compute_work_point_from_db_grids(db_grids)
+        except Exception as exc:
+            logger.warning("Error computing work point from DB grids for page %s: %s", page_id, exc)
+
+    return wp
 
 
 @router.post("/pages/{page_id}/gemini-takeoff")

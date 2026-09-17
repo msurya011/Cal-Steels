@@ -57,6 +57,7 @@ geometry yields an empty index and every caller falls back to prior behaviour.
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz
@@ -157,19 +158,21 @@ OUTLIER_FRAC_OF_MEDIAN_BAY = 0.25
 class LineIndex:
     """Axis-aligned candidate chain lines recovered from a page's vector paths."""
 
-    __slots__ = ("vertical", "horizontal", "page_w", "page_h", "stats", "all_thin_segments")
+    __slots__ = ("vertical", "horizontal", "page_w", "page_h", "stats", "all_thin_segments", "skewed")
 
-    def __init__(self, vertical, horizontal, page_w, page_h, stats, all_thin_segments=None):
+    def __init__(self, vertical, horizontal, page_w, page_h, stats, all_thin_segments=None, skewed=None):
         self.vertical: List[Dict[str, Any]] = vertical
         self.horizontal: List[Dict[str, Any]] = horizontal
         self.page_w = page_w
         self.page_h = page_h
         self.stats: Dict[str, Any] = stats
         self.all_thin_segments: List[Tuple[fitz.Point, fitz.Point]] = all_thin_segments or []
+        self.skewed: List[Dict[str, Any]] = skewed or []
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (f"<LineIndex vertical={len(self.vertical)} "
-                f"horizontal={len(self.horizontal)} {self.stats}>")
+                f"horizontal={len(self.horizontal)} "
+                f"skewed={len(self.skewed)} {self.stats}>")
 
 
 # ---------------------------------------------------------------------------
@@ -194,21 +197,23 @@ def _dashes_are_real(dashes: Any) -> bool:
         return False
 
 
-def _iter_segments(page: "fitz.Page", rot_mat) -> Tuple[List[Dict[str, Any]], List[Tuple[fitz.Point, fitz.Point]]]:
+def _iter_segments(page: "fitz.Page", rot_mat) -> Tuple[List[Dict[str, Any]], List[Tuple[fitz.Point, fitz.Point]], List[Dict[str, Any]]]:
     """
     Collect every thin straight segment on the page.
     Returns:
-      (axis_aligned_segments, all_thin_segments)
+      (axis_aligned_segments, all_thin_segments, raw_skewed_segments)
     all_thin_segments includes non-axis-aligned segments (such as CAD diagonal
     dogleg/leader jogs connecting dodged bubbles to true grid lines).
+    raw_skewed_segments includes thin segments at non-orthogonal angles.
     """
     axis_aligned: List[Dict[str, Any]] = []
     all_thin: List[Tuple[fitz.Point, fitz.Point]] = []
+    raw_skewed: List[Dict[str, Any]] = []
 
     try:
         drawings = page.get_drawings()
     except Exception:
-        return axis_aligned, all_thin
+        return axis_aligned, all_thin, raw_skewed
 
     for d in drawings:
         # Stroked paths only. A filled shape is a bubble, a hatch or a solid.
@@ -256,8 +261,18 @@ def _iter_segments(page: "fitz.Page", rot_mat) -> Tuple[List[Dict[str, Any]], Li
                     "dashed": dashed,
                     "width": width,
                 })
+            else:
+                length = math.hypot(dx, dy)
+                if length >= MIN_SEGMENT_PTS:
+                    raw_skewed.append({
+                        "p1": p1,
+                        "p2": p2,
+                        "length": length,
+                        "dashed": dashed,
+                        "width": width,
+                    })
 
-    return axis_aligned, all_thin
+    return axis_aligned, all_thin, raw_skewed
 
 
 def _cluster(segments: List[Dict[str, Any]], span_limit: float) -> List[Dict[str, Any]]:
@@ -319,7 +334,7 @@ def _fold(bucket: List[Dict[str, Any]]) -> Dict[str, Any]:
     total_len = ink or 1.0
     coord = sum(s["coord"] * (s["hi"] - s["lo"]) for s in bucket) / total_len
     dashed_ink = sum(s["hi"] - s["lo"] for s in bucket if s["dashed"])
-    return {
+    res = {
         "orient": bucket[0]["orient"],
         "coord": coord,
         "lo": min(s["lo"] for s in bucket),
@@ -328,32 +343,100 @@ def _fold(bucket: List[Dict[str, Any]]) -> Dict[str, Any]:
         "dashed": dashed_ink > (ink * 0.35),
         "segments": len(bucket),
     }
+    if "angle_deg" in bucket[0]:
+        res["angle_deg"] = bucket[0]["angle_deg"]
+    return res
+
+
+def _cluster_skewed(raw_skewed: List[Dict[str, Any]], span_limit: float) -> List[Dict[str, Any]]:
+    """Group non-orthogonal segments by dominant angles and cluster into chain lines."""
+    if not raw_skewed:
+        return []
+
+    angle_bins = defaultdict(lambda: {"count": 0, "ink": 0.0, "segs": []})
+    for s in raw_skewed:
+        p1, p2 = s["p1"], s["p2"]
+        dx = p2.x - p1.x
+        dy = p2.y - p1.y
+        length = s["length"]
+        angle = math.degrees(math.atan2(dy, dx)) % 180.0
+        # Exclude near-horizontal and near-vertical
+        if angle < 1.5 or angle > 178.5 or abs(angle - 90.0) < 1.5:
+            continue
+
+        b = round(angle)
+        angle_bins[b]["count"] += 1
+        angle_bins[b]["ink"] += length
+        angle_bins[b]["segs"].append((angle, length, s))
+
+    # Identify dominant angles with significant presence
+    sorted_bins = sorted(angle_bins.items(), key=lambda x: -x[1]["ink"])
+    used_bins = set()
+    dominant_angles = []
+
+    for b, data in sorted_bins:
+        if b in used_bins:
+            continue
+        if data["count"] >= 6 and data["ink"] >= 100.0:
+            cluster_segs = list(data["segs"])
+            used_bins.add(b)
+            for adj in (b - 1, b + 1):
+                if adj in angle_bins and adj not in used_bins:
+                    cluster_segs.extend(angle_bins[adj]["segs"])
+                    used_bins.add(adj)
+            weighted_angle = sum(x[0] * x[1] for x in cluster_segs) / sum(x[1] for x in cluster_segs)
+            dominant_angles.append((round(weighted_angle, 2), cluster_segs))
+
+    all_candidates = []
+    for dom_angle, dom_segs in dominant_angles:
+        rad = math.radians(dom_angle)
+        sin_a = math.sin(rad)
+        cos_a = math.cos(rad)
+
+        clust_segs = []
+        for _, _, s in dom_segs:
+            p1, p2 = s["p1"], s["p2"]
+            s1 = p1.x * cos_a + p1.y * sin_a
+            s2 = p2.x * cos_a + p2.y * sin_a
+            d1 = -p1.x * sin_a + p1.y * cos_a
+            d2 = -p2.x * sin_a + p2.y * cos_a
+            clust_segs.append({
+                "orient": "skewed",
+                "angle_deg": dom_angle,
+                "coord": (d1 + d2) / 2.0,
+                "lo": min(s1, s2),
+                "hi": max(s1, s2),
+                "dashed": s["dashed"],
+                "width": s["width"],
+            })
+
+        lines = _cluster(clust_segs, span_limit)
+        all_candidates.extend(lines)
+
+    return all_candidates
 
 
 def build_line_index(page: "fitz.Page", page_w: float, page_h: float,
                      rot_mat=None) -> LineIndex:
     """
-    Recover candidate chain lines for both axes.
-
-    page_w / page_h must already be in the sheet's DISPLAYED orientation --
-    i.e. swapped for a 90/270-rotated page, exactly as
-    run_deterministic_geometry_pass computes them -- and rot_mat must be the
-    same page.rotation_matrix passed to _find_confirmed_bubbles, so line
-    coordinates land in the same space as bubble coordinates.
+    Recover candidate chain lines for both axes and skewed angles.
     """
-    segments, all_thin = _iter_segments(page, rot_mat)
+    segments, all_thin, raw_skewed = _iter_segments(page, rot_mat)
 
     vertical = _cluster([s for s in segments if s["orient"] == "vertical"], page_h)
     horizontal = _cluster([s for s in segments if s["orient"] == "horizontal"], page_w)
+    skewed = _cluster_skewed(raw_skewed, max(page_w, page_h))
 
     stats = {
         "segments_total": len(segments),
         "vertical_candidates": len(vertical),
         "horizontal_candidates": len(horizontal),
+        "skewed_candidates": len(skewed),
         "dashed_vertical": sum(1 for c in vertical if c["dashed"]),
         "dashed_horizontal": sum(1 for c in horizontal if c["dashed"]),
+        "dashed_skewed": sum(1 for c in skewed if c.get("dashed")),
     }
-    return LineIndex(vertical, horizontal, page_w, page_h, stats, all_thin)
+    return LineIndex(vertical, horizontal, page_w, page_h, stats, all_thin, skewed=skewed)
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +716,41 @@ def attach_line_coords(confirmed: List[Dict[str, Any]], line_index: LineIndex) -
                 c["line_cy_margin"] = None
                 c["line_cy_is_leader"] = False
                 c["line_cy_segments"] = 0
+
+        # Check candidate skewed chain lines
+        c["line_skewed"] = None
+        if line_index.skewed:
+            best_skewed_hit = None
+            best_skewed_cost = None
+            by_angle = {}
+            for l in line_index.skewed:
+                by_angle.setdefault(l.get("angle_deg", 0.0), []).append(l)
+            for angle_deg, cands in by_angle.items():
+                rad = math.radians(angle_deg)
+                sin_a = math.sin(rad)
+                cos_a = math.cos(rad)
+                d = -cx * sin_a + cy * cos_a
+                s = cx * cos_a + cy * sin_a
+                hit = _best_line(cands, across=d, along=s)
+                if hit is not None:
+                    line, delta, margin = hit
+                    cost = delta
+                    if best_skewed_cost is None or cost < best_skewed_cost:
+                        best_skewed_cost = cost
+                        x_line = s * cos_a - line["coord"] * sin_a
+                        y_line = s * sin_a + line["coord"] * cos_a
+                        best_skewed_hit = {
+                            "angle_deg": angle_deg,
+                            "line_coord": round(line["coord"], 3),
+                            "line_cx": round(x_line, 3),
+                            "line_cy": round(y_line, 3),
+                            "offset_pts": round(delta, 2),
+                            "dashed": line.get("dashed", False),
+                            "segments": line.get("segments", 1),
+                            "source": "vector_line",
+                        }
+            if best_skewed_hit is not None:
+                c["line_skewed"] = best_skewed_hit
 
     total = len(confirmed) or 1
     deltas_sorted = sorted(deltas)

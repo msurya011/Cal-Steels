@@ -476,6 +476,7 @@ async def run_analyse(
 
     summary = result.get("summary", {})
     grid_dimensions = result.get("grid_dimensions", [])
+    work_point = result.get("work_point")
     await _update_job(
         job_id, "done", 100,
         message=f"Extracted {len(member_rows)} members in {elapsed:.1f}s",
@@ -484,6 +485,7 @@ async def run_analyse(
             "elapsed": round(elapsed, 2),
             "summary": summary,
             "grid_dimensions": grid_dimensions,
+            "work_point": work_point,
         },
         finished=True,
     )

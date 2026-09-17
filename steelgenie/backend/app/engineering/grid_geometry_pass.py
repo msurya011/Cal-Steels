@@ -34,6 +34,7 @@ Fixes vs. the previous version of this module:
 from __future__ import annotations
 import os
 import re
+import statistics
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
 import fitz  # PyMuPDF
@@ -175,9 +176,6 @@ def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
             line_str = "".join(sp.get("text", "") for sp in l.get("spans", []))
             m = scale_re.search(line_str)
             if m:
-                upper = line_str.upper()
-                if any(bad in upper for bad in ("ELEVATION", "DATUM", "FINISH", "BENCHMARK")):
-                    continue
                 frac_str = m.group(1) or m.group(4)
                 if "/" in frac_str:
                     num, den = frac_str.split("/")
@@ -185,8 +183,6 @@ def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
                 else:
                     inch_val = float(frac_str)
                 pts_per_foot = inch_val * 72.0
-                if pts_per_foot <= 0:
-                    continue
                 return pts_per_foot, line_str.strip(), True
 
     return 9.0, "1/8\" = 1'-0\" (DEFAULT -- NOT FOUND ON SHEET)", False
@@ -261,7 +257,6 @@ def _find_confirmed_bubbles(page: "fitz.Page", text_dict: dict,
                         confirmed.append({
                             "text": t, "axis": kind[0], "is_secondary": kind[1],
                             "cx": cx, "cy": cy,
-                            "r": max(r.width, r.height) / 2.0,
                         })
                         break
 
@@ -858,8 +853,6 @@ def _build_axis_tracks(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph
                 "bubble_coord": round(c[pos_key], 2),
                 "bubble_offset_pts": (None if source == "bubble_inferred"
                                       else round(abs(coord - c[pos_key]), 2)),
-                "is_leader_verified": c.get("line_cx_is_leader" if pos_key == "cx" else "line_cy_is_leader", False),
-                "line_segments": c.get("line_cx_segments" if pos_key == "cx" else "line_cy_segments", 0),
             })
         meta["line_outliers_rejected"] = reject_outlier_line_coords(chain_entries)
         meta["line_confirmed_count"] = sum(
@@ -1236,11 +1229,7 @@ def run_deterministic_geometry_pass(
             # bubble row/column itself (the innermost, per-bay track), not
             # a farther-out cumulative/overall track that happens to also
             # fall within the x/y window.
-            # For tight bays (small span_px), drafters place the dimension text
-            # slightly outside the bay with an arrow/leader line. Allow a minimum
-            # search radius so tight bay dimensions are not missed.
-            search_radius = max(span_px * 0.35, min(60.0, span_px * 0.5 + 35.0))
-            candidates = [d for d in dim_spans if abs(d[pos_key] - mid) <= search_radius]
+            candidates = [d for d in dim_spans if abs(d[pos_key] - mid) <= span_px * 0.35]
             # A bay bounded by a grid recovered from an INTERIOR rail is
             # dimensioned on that interior rail, not on the sheet-edge track
             # this chain belongs to. Matching it against the outer band picks
@@ -1411,8 +1400,6 @@ def run_deterministic_geometry_pass(
                                       else round(abs(coord - c[pos_key]), 2)),
                 "line_len_frac": line_len_frac,
                 "line_margin": line_match_margin,
-                "is_leader_verified": c.get("line_cx_is_leader" if pos_key == "cx" else "line_cy_is_leader", False),
-                "line_segments": c.get("line_cx_segments" if pos_key == "cx" else "line_cy_segments", 0),
             })
         # Grids pulled in here skipped the gate that runs inside
         # _build_axis_tracks, so apply it now -- otherwise a bubble added on
@@ -1886,6 +1873,205 @@ def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]
             })
 
     return out
+
+
+def _grid_label_sort_key(label: Any):
+    """Order grid labels the way a detailer actually reads the sequence --
+    natural numeric ordering ("1", "2", ... "10", "11"), sub-grids ("1.1", "2A"),
+    and drafting alphabetical order ("A", "B", ... "Z", "AA", "AB").
+    Strips noise like 'GRID ' or whitespace.
+    """
+    if label is None:
+        return (2, ())
+    s = str(label).strip()
+    s = re.sub(r"^(?:grid|axis)\s*", "", s, flags=re.IGNORECASE).strip()
+    if not s:
+        return (2, ())
+
+    # Split into numeric and non-numeric chunks for natural human sorting
+    chunks = re.split(r"(\d+(?:\.\d+)?)", s)
+    parsed = []
+    for c in chunks:
+        if not c:
+            continue
+        try:
+            parsed.append((0, float(c)))
+        except ValueError:
+            # Length prefix ensures 'A' < 'AA' (single letter before double)
+            c_clean = c.strip().upper()
+            parsed.append((1, len(c_clean), c_clean))
+    return (0 if parsed and parsed[0][0] == 0 else 1, tuple(parsed))
+
+
+def _axis_numbering_direction(grids: List[Dict[str, Any]], coord_key: str) -> int:
+    """Does this axis's label sequence increase or decrease with raw
+    coordinate, e.g. does grid "1" sit at a smaller x than grid "12", or a
+    larger one?  Returns +1 (labels increase with coordinate) or -1
+    (labels decrease with coordinate).
+
+    This is decided from the trend across EVERY grid on the axis (a
+    majority vote over adjacent pairs in label order), not just by looking
+    at where the single lowest-labeled grid happens to sit. That matters
+    because a lone mislabeled or oddly-placed bubble (a detail-callout
+    number reused as a grid label, a partial-plan crop, a stray secondary
+    grid) can put "the first label" somewhere that isn't a real corner of
+    the drawing at all -- trusting one point's position is exactly what
+    produced a Work Point marker floating in blank margin space on a sheet
+    whose numbering ran a different direction than assumed. Voting across
+    the whole sequence means one outlier can't flip the result.
+    """
+    ordered = sorted(grids, key=lambda g: _grid_label_sort_key(g.get("label", "")))
+    coords = [g[coord_key] for g in ordered]
+    if len(coords) < 2:
+        return 1
+    inc = sum(1 for i in range(len(coords) - 1) if coords[i + 1] >= coords[i])
+    dec = sum(1 for i in range(len(coords) - 1) if coords[i + 1] <= coords[i])
+    return 1 if inc >= dec else -1
+
+
+def _drop_extreme_outliers(grids: List[Dict[str, Any]], coord_key: str) -> List[Dict[str, Any]]:
+    """Strip a grid off either end of the axis if it sits implausibly far
+    from the rest of the real sequence -- e.g. a stray detail-callout or
+    section-reference bubble that happens to reuse a real grid's label
+    (a lone "A" from some unrelated note, not an actual column grid line),
+    sitting way outside where the sheet's actual column grid is drawn.
+
+    This is the gap left by both earlier approaches: trusting a single
+    label's own position, and trusting the geometric extreme, BOTH assume
+    every detected grid entry is a real column grid line. Neither checks
+    whether that assumption holds. A real grid sequence has roughly
+    consistent bay spacing; comparing each end's gap to its neighbor
+    against the median gap across the whole sequence catches the case
+    where it doesn't, without needing to know what a "normal" bay size is
+    for any particular building.
+
+    Only trims from the two ends (interior mis-detections are a different,
+    separate problem this function isn't trying to solve), and only while
+    there's still a real sequence of at least 3 grids left to compare
+    against, so it can't be tricked into deleting a legitimately sparse
+    sheet down to nothing.
+    """
+    if len(grids) < 3:
+        return grids
+    ordered = sorted(grids, key=lambda g: g[coord_key])
+    filtered = list(ordered)
+    OUTLIER_GAP_MULTIPLE = 4.0
+    while len(filtered) > 2:
+        coords = [g[coord_key] for g in filtered]
+        gaps = [coords[i + 1] - coords[i] for i in range(len(coords) - 1)]
+        med_gap = statistics.median(gaps) if gaps else 0
+        if med_gap <= 0:
+            break
+        gap_low = coords[1] - coords[0]
+        gap_high = coords[-1] - coords[-2]
+        if gap_low > med_gap * OUTLIER_GAP_MULTIPLE and gap_low >= gap_high:
+            filtered = filtered[1:]
+            continue
+        if gap_high > med_gap * OUTLIER_GAP_MULTIPLE and gap_high > gap_low:
+            filtered = filtered[:-1]
+            continue
+        break
+    return filtered
+
+
+def _resolve_starting_grid(grids: List[Dict[str, Any]], coord_key: str, is_min_side: bool) -> Dict[str, Any]:
+    """Select the starting grid (origin) on an axis.
+    Prioritizes the first grid in label sequence (e.g. '1' or 'A') if its
+    position lies on or near the expected boundary side, falling back to
+    the geometric extreme on that side if the sequence first label sits
+    deep in the interior or is an isolated misdetection.
+    """
+    ordered_by_label = sorted(grids, key=lambda g: _grid_label_sort_key(g.get("label", "")))
+    extreme_grid = min(grids, key=lambda g: g[coord_key]) if is_min_side else max(grids, key=lambda g: g[coord_key])
+    if not ordered_by_label:
+        return extreme_grid
+
+    first_label_grid = ordered_by_label[0]
+    if first_label_grid is extreme_grid:
+        return first_label_grid
+
+    all_coords = [g[coord_key] for g in grids]
+    span = max(all_coords) - min(all_coords) if len(all_coords) > 1 else 1.0
+    dist_from_extreme = abs(first_label_grid[coord_key] - extreme_grid[coord_key])
+
+    # If the first-labeled grid sits within 20% of the extreme edge, it is
+    # legitimately the starting grid (e.g. Grid 1, with a secondary or sub-grid
+    # like 0.5 or a corner jog sitting just slightly beyond it).
+    if span > 0 and (dist_from_extreme / span) <= 0.20:
+        return first_label_grid
+
+    # Otherwise trust the geometric extreme to ensure the origin stays on
+    # the perimeter framing line.
+    return extreme_grid
+
+
+def to_frontend_work_point(results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Identify the plan's implied Work Point (WP) -- the grid intersection a
+    structural detailer/estimator would treat as the origin for erection,
+    anchor-bolt, and dimension-chain layout -- and return it in the same
+    normalized 0-1 frontend coordinate space to_frontend_dimension_lines()
+    uses, so it drops straight into the existing overlay without any extra
+    coordinate handling.
+    """
+    v_grids = results.get("vertical_grids") or []
+    h_grids = results.get("horizontal_grids") or []
+    if not v_grids or not h_grids:
+        return None
+
+    page_dims = results.get("page_dimensions") or {}
+    pw = page_dims.get("width") or 1.0
+    ph = page_dims.get("height") or 1.0
+    if pw <= 0 or ph <= 0:
+        return None
+
+    # Local copies only -- this filtering is specific to picking a Work
+    # Point corner and must never affect dimension-line extraction, beam
+    # centreline snapping, or anything else downstream.
+    v_filtered = _drop_extreme_outliers(v_grids, "x")
+    h_filtered = _drop_extreme_outliers(h_grids, "y")
+    if not v_filtered:
+        v_filtered = v_grids
+    if not h_filtered:
+        h_filtered = h_grids
+
+    v_dir = _axis_numbering_direction(v_filtered, "x")
+    h_dir = _axis_numbering_direction(h_filtered, "y")
+    v_is_min = (v_dir == 1)
+    h_is_min = (h_dir == 1)
+
+    v_origin = _resolve_starting_grid(v_filtered, "x", v_is_min)
+    h_origin = _resolve_starting_grid(h_filtered, "y", h_is_min)
+
+    # Which way is "outside the drawing" from this corner -- used by the
+    # frontend to route its WP callout leader/label AWAY from the plan
+    # instead of a fixed diagonal.
+    outward_dx = -1 if v_is_min else 1
+    outward_dy = -1 if h_is_min else 1
+
+    norm_x = v_origin["x"] / pw if pw > 1.0 else v_origin["x"]
+    norm_y = h_origin["y"] / ph if ph > 1.0 else h_origin["y"]
+
+    # Clamp safely inside [0.01, 0.99] so edge grid bubbles never get
+    # rejected as out-of-bounds by canvas boundary checks
+    clamped_x = round(max(0.005, min(0.995, norm_x)), 4)
+    clamped_y = round(max(0.005, min(0.995, norm_y)), 4)
+
+    v_lbl = str(v_origin.get("label", "")).strip() or "1"
+    h_lbl = str(h_origin.get("label", "")).strip() or "A"
+
+    return {
+        "id": f"wp_{v_lbl}_{h_lbl}",
+        "label": "WP",
+        "v_label": v_lbl,
+        "h_label": h_lbl,
+        "grid_ref": f"{v_lbl}/{h_lbl}",
+        "x": clamped_x,
+        "y": clamped_y,
+        "outward_dx": outward_dx,
+        "outward_dy": outward_dy,
+        "source": "grid_sequence_first",
+    }
 
 
 if __name__ == "__main__":

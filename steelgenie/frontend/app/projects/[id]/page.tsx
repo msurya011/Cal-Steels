@@ -117,6 +117,7 @@ export default function TakeoffWorkspacePage() {
   useEffect(() => {
     if (!currentPageId) {
       useWorkspaceStore.getState().setGridDimensions([])
+      useWorkspaceStore.getState().setWorkPoint(null)
       return
     }
 
@@ -124,6 +125,7 @@ export default function TakeoffWorkspacePage() {
     const hasScale = Boolean((page && page.scale_num && page.scale_num > 0) || (selectedRatio && selectedRatio > 0))
     if (!hasScale) {
       useWorkspaceStore.getState().setGridDimensions(currentPageId, [])
+      useWorkspaceStore.getState().setWorkPoint(currentPageId, null)
       return
     }
 
@@ -135,6 +137,18 @@ export default function TakeoffWorkspacePage() {
     }).catch(() => {
       if (isCurrent && useWorkspaceStore.getState().currentPageId === currentPageId) {
         useWorkspaceStore.getState().setGridDimensions(currentPageId, [])
+      }
+    })
+    // Work Point (WP) marker -- same trigger/lifecycle as the grid
+    // dimensions load above, since both come from the same deterministic
+    // geometry pass and are only meaningful once a scale is applied.
+    floorsApi.getWorkPoint(currentPageId).then((wp: any) => {
+      if (isCurrent && useWorkspaceStore.getState().currentPageId === currentPageId) {
+        useWorkspaceStore.getState().setWorkPoint(currentPageId, wp || null)
+      }
+    }).catch(() => {
+      if (isCurrent && useWorkspaceStore.getState().currentPageId === currentPageId) {
+        useWorkspaceStore.getState().setWorkPoint(currentPageId, null)
       }
     })
     return () => {
@@ -289,6 +303,11 @@ export default function TakeoffWorkspacePage() {
             useWorkspaceStore.getState().setGridDimensions(pageId, dims)
           }
         }).catch(() => {})
+        floorsApi.getWorkPoint(pageId).then((wp: any) => {
+          if (useWorkspaceStore.getState().currentPageId === pageId) {
+            useWorkspaceStore.getState().setWorkPoint(pageId, wp || null)
+          }
+        }).catch(() => {})
       }
     } catch (err: any) {
       toast.error(err.message || 'Failed to save page settings')
@@ -378,6 +397,15 @@ export default function TakeoffWorkspacePage() {
               if (Array.isArray(dims)) useWorkspaceStore.getState().setGridDimensions(extractedPageId, dims)
             }).catch(() => {})
           }
+          if (extractedPageId) {
+            if (job.result?.work_point !== undefined) {
+              useWorkspaceStore.getState().setWorkPoint(extractedPageId, job.result.work_point || null)
+            } else {
+              floorsApi.getWorkPoint(extractedPageId).then((wp: any) => {
+                useWorkspaceStore.getState().setWorkPoint(extractedPageId, wp || null)
+              }).catch(() => {})
+            }
+          }
 
           if (extractedPageId) clearPageDirty(extractedPageId)
           queryClient.invalidateQueries({ queryKey: ['members'] })
@@ -440,6 +468,9 @@ export default function TakeoffWorkspacePage() {
                 clearPageDirty(extractingPageId)
                 floorsApi.getGridDimensions(extractingPageId).then((dims) => {
                   if (Array.isArray(dims)) useWorkspaceStore.getState().setGridDimensions(extractingPageId, dims)
+                }).catch(() => {})
+                floorsApi.getWorkPoint(extractingPageId).then((wp: any) => {
+                  useWorkspaceStore.getState().setWorkPoint(extractingPageId, wp || null)
                 }).catch(() => {})
               }
               bumpModelRefresh(extractingPageId ?? undefined)
@@ -669,6 +700,11 @@ export default function TakeoffWorkspacePage() {
       floorsApi.getGridDimensions(currentPageId).then((dims) => {
         if (Array.isArray(dims) && useWorkspaceStore.getState().currentPageId === currentPageId) {
           useWorkspaceStore.getState().setGridDimensions(currentPageId, dims)
+        }
+      }).catch(() => {})
+      floorsApi.getWorkPoint(currentPageId).then((wp: any) => {
+        if (useWorkspaceStore.getState().currentPageId === currentPageId) {
+          useWorkspaceStore.getState().setWorkPoint(currentPageId, wp || null)
         }
       }).catch(() => {})
     } catch {
