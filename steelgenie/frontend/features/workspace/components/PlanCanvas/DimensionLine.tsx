@@ -15,6 +15,7 @@ export interface GridDimension {
   angle_deg?: number
   source?: string
   ocr_text?: string | null
+  matched_scale?: string | null
   scale_source?: 'explicit' | 'guessed'
   flagged?: boolean
   side?: string
@@ -103,6 +104,7 @@ export function DimensionLine({ dimension, opacity = 0.95 }: DimensionLineProps)
       <title>
         {`[${gridTypeLabel}] Grid ${dimension.label || `${dimension.from_grid}–${dimension.to_grid}`}: ${dimension.text} (${dimension.length_ft} ft) -- ${matchLabel}` +
          (dimension.ocr_text ? ` [OCR on sheet: "${dimension.ocr_text}"]` : '') +
+         (dimension.matched_scale ? ` (Scale: ${dimension.matched_scale})` : '') +
          (dimension.scale_source === 'guessed' ? ' (Scale: Unverified default)' : '')}
       </title>
 
