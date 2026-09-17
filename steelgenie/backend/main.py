@@ -14,7 +14,7 @@ import os
 import io
 import json
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image as PILImage, ImageEnhance, ImageFilter
