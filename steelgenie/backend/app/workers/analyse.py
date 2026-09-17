@@ -10,7 +10,7 @@ import os
 import sys
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import get_settings
 from app.core.events import manager as ws_manager
