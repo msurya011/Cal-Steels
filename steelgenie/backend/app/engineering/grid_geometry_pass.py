@@ -117,6 +117,56 @@ def parse_dimension_string(text: str) -> Optional[float]:
     return None
 
 
+
+STANDARD_ARCHITECTURAL_SCALES = [
+    ("1/16\" = 1'-0\"", 4.5),
+    ("3/32\" = 1'-0\"", 6.75),
+    ("1/8\" = 1'-0\"", 9.0),
+    ("3/16\" = 1'-0\"", 13.5),
+    ("1/4\" = 1'-0\"", 18.0),
+    ("3/8\" = 1'-0\"", 27.0),
+    ("1/2\" = 1'-0\"", 36.0),
+    ("3/4\" = 1'-0\"", 54.0),
+    ("1\" = 1'-0\"", 72.0),
+    ("1-1/2\" = 1'-0\"", 108.0),
+    ("3\" = 1'-0\"", 216.0),
+]
+
+
+def check_dim_agreement_all_scales(
+    val_ft: Optional[float],
+    span_px: float,
+    current_calc_ft: float,
+    current_pts_per_foot: float
+) -> Tuple[bool, Optional[str]]:
+    """
+    Check if a candidate printed dimension text (val_ft) agrees with the bay's
+    physical span (span_px) on:
+      1) The current active scale (current_pts_per_foot), OR
+      2) ANY standard architectural scale category.
+
+    Returns (agrees: bool, matched_scale: Optional[str]).
+    """
+    if val_ft is None or val_ft <= 0:
+        return False, None
+
+    # 1. Check against current active scale
+    if current_pts_per_foot > 0 and current_calc_ft > 0:
+        tol = max(0.3, current_calc_ft * 0.03)
+        if abs(val_ft - current_calc_ft) <= tol:
+            return True, "current_scale"
+
+    # 2. Check against all standard architectural scale categories
+    if span_px > 0:
+        for scale_name, scale_ppf in STANDARD_ARCHITECTURAL_SCALES:
+            test_ft = span_px / scale_ppf
+            tol = max(0.3, test_ft * 0.03)
+            if abs(val_ft - test_ft) <= tol:
+                return True, scale_name
+
+    return False, None
+
+
 def is_valid_dim_text(text: str) -> bool:
     """Validate if string has valid architectural dimension syntax."""
     t = text.strip()
@@ -130,33 +180,31 @@ def is_valid_dim_text(text: str) -> bool:
 
 
 def ft_to_arch(v: float) -> str:
-    """Format decimal feet as architectural feet-inches, WITH fractional
-    inches down to the nearest 1/16" -- the finest increment dimension
-    strings on structural sheets are ever drawn to.
-
-    Previously this rounded straight to the nearest whole inch and threw
-    the remainder away entirely, so a bay measured at (say) 11.6042 ft
-    (11'-7 1/4") always displayed as a flat "11'-7"". That made an
-    accurately-measured bay look like it disagreed with the sheet's own,
-    more precise printed dimension, purely because of how we were
-    *formatting* the number -- not because the measurement was wrong.
+    """
+    Format decimal feet as exact architectural feet-inches with reduced fractions
+    (e.g. 11'-3 1/2", 31'-0", 15'-6", 7'-9 1/4").
     """
     feet = int(v)
     remainder_in = (v - feet) * 12.0
-    sixteenths = round(remainder_in * 16)
+    sixteenths = int(round(remainder_in * 16.0))
     inches = sixteenths // 16
     frac_sixteenths = sixteenths % 16
+
     if inches >= 12:
         feet += inches // 12
         inches = inches % 12
+
     if frac_sixteenths == 0:
         return f"{feet}'-{inches}\""
-    # Reduce the fraction (e.g. 4/16 -> 1/4, 8/16 -> 1/2).
+
+    # Reduce fraction (e.g. 8/16 -> 1/2, 4/16 -> 1/4, 12/16 -> 3/4, 2/16 -> 1/8)
     num, den = frac_sixteenths, 16
-    while num % 2 == 0:
+    while num % 2 == 0 and den % 2 == 0:
         num //= 2
         den //= 2
+
     return f"{feet}'-{inches} {num}/{den}\""
+
 
 
 def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
@@ -891,52 +939,48 @@ def _collect_dim_spans(page: "fitz.Page", text_dict: dict) -> List[Dict[str, Any
     for b in text_dict.get("blocks", []):
         for l in b.get("lines", []):
             spans = l.get("spans", [])
-            line_hit_span_ids: set = set()
+            if not spans:
+                continue
 
-            # Pass 1: whole dimension present in a single span (the common,
-            # already-working case) -- unchanged behaviour.
-            for sp in spans:
-                t = sp.get("text", "").strip()
-                if not t or not is_valid_dim_text(t):
+            # Cluster adjacent spans on the same line that are separated by small gaps (< 4 pts)
+            # or overlap (handles cases where characters/quotes are segmented into separate spans e.g. ['3', '1', "'-0\""])
+            clusters = []
+            curr = [spans[0]]
+            for sp in spans[1:]:
+                prev_bbox = curr[-1].get("bbox", [0, 0, 0, 0])
+                curr_bbox = sp.get("bbox", [0, 0, 0, 0])
+                gap = curr_bbox[0] - prev_bbox[2]
+                if -2.0 <= gap <= 4.0:
+                    curr.append(sp)
+                else:
+                    clusters.append(curr)
+                    curr = [sp]
+            if curr:
+                clusters.append(curr)
+
+            for cluster in clusters:
+                text_piece = "".join(sp.get("text", "") for sp in cluster).strip()
+                if not text_piece or not is_valid_dim_text(text_piece):
                     continue
-                val = parse_dimension_string(t)
+                val = parse_dimension_string(text_piece)
                 if val is None or not (0.5 <= val <= 350.0):
                     continue
-                bbox = fitz.Rect(sp.get("bbox", [0, 0, 0, 0]))
-                if rot_mat is not None:
-                    bbox = bbox * rot_mat
-                cx, cy = (bbox.x0 + bbox.x1) / 2.0, (bbox.y0 + bbox.y1) / 2.0
-                dim_spans.append({
-                    "text": t, "val_ft": val,
-                    "cx": cx, "cy": cy,
-                })
-                line_hit_span_ids.add(id(sp))
 
-            # Pass 2: a stacked fraction (e.g. "1/4"") is very often its OWN
-            # text span, split off from the "25'-2" head that precedes it --
-            # neither piece alone is a complete, parseable dimension, so pass
-            # 1 drops the whole value as unparseable. Rejoin every span on
-            # this line (in reading order) and try parsing THAT instead, but
-            # only for spans pass 1 didn't already use for a complete match
-            # of its own -- this never changes a dimension that already
-            # parsed correctly on its own.
-            unmatched = [sp for sp in spans if id(sp) not in line_hit_span_ids]
-            if len(unmatched) >= 2:
-                joined = " ".join(sp.get("text", "").strip() for sp in unmatched).strip()
-                if joined and is_valid_dim_text(joined):
-                    val = parse_dimension_string(joined)
-                    if val is not None and 0.5 <= val <= 350.0:
-                        bboxes = [fitz.Rect(sp.get("bbox", [0, 0, 0, 0])) for sp in unmatched]
-                        union = bboxes[0]
-                        for r in bboxes[1:]:
-                            union |= r
-                        if rot_mat is not None:
-                            union = union * rot_mat
-                        cx, cy = (union.x0 + union.x1) / 2.0, (union.y0 + union.y1) / 2.0
-                        dim_spans.append({
-                            "text": joined, "val_ft": val,
-                            "cx": cx, "cy": cy,
-                        })
+                bboxes = [fitz.Rect(sp.get("bbox", [0, 0, 0, 0])) for sp in cluster]
+                union_box = bboxes[0]
+                for r in bboxes[1:]:
+                    union_box |= r
+                if rot_mat is not None:
+                    union_box = union_box * rot_mat
+                cx = (union_box.x0 + union_box.x1) / 2.0
+                cy = (union_box.y0 + union_box.y1) / 2.0
+                dim_spans.append({
+                    "text": text_piece,
+                    "val_ft": val,
+                    "cx": cx,
+                    "cy": cy,
+                })
+
     return dim_spans
 
 
@@ -1229,49 +1273,51 @@ def run_deterministic_geometry_pass(
             # bubble row/column itself (the innermost, per-bay track), not
             # a farther-out cumulative/overall track that happens to also
             # fall within the x/y window.
-            candidates = [d for d in dim_spans if abs(d[pos_key] - mid) <= span_px * 0.35]
-            # A bay bounded by a grid recovered from an INTERIOR rail is
-            # dimensioned on that interior rail, not on the sheet-edge track
-            # this chain belongs to. Matching it against the outer band picks
-            # up the long dimension that spans the whole step -- which then
-            # disagrees with the geometry and false-flags a bay whose value
-            # was correct. Match near the rail the grid actually came from.
             rails = [p.get("rail_coord") for p in (p1, p2)
                      if p.get("rail_coord") is not None]
             eff_band = (sum(rails) / len(rails)) if rails else band_coord
+            candidates = [
+                d for d in dim_spans
+                if abs(d[pos_key] - mid) <= span_px * 0.35
+                and (eff_band is None or abs(d[other_key] - eff_band) <= 250.0)
+            ]
             ocr_alternatives = None
             match = None
-            if candidates and eff_band is not None:
-                match = min(candidates, key=lambda d: abs(d[other_key] - eff_band))
-            elif candidates:
-                match = candidates[0]
-
-            def _agrees(d):
-                return abs(d["val_ft"] - calc_ft) <= max(0.3, calc_ft * 0.03)
-
             agrees = None
-            if match is not None:
-                agrees = _agrees(match)
-                if not agrees:
-                    # Several dimension texts can sit near a bay's midpoint --
-                    # the bay's own, and any cumulative run that happens to be
-                    # centred nearby. Picking purely by nearest band then flags
-                    # a correct bay against a dimension that was never about
-                    # it. If ANY printed dimension in range does match the
-                    # geometry, the sheet corroborates this bay: adopt that
-                    # text. Only when none of them agrees is this a real
-                    # disagreement worth flagging.
-                    agreeing = [d for d in candidates if _agrees(d)]
-                    if agreeing:
-                        match = min(agreeing, key=lambda d: abs(d[other_key] - eff_band)
-                                    if eff_band is not None else 0.0)
-                        agrees = True
+            matched_scale = None
+
+            if candidates:
+                # Direct individual bay matching: check if any candidate agrees under
+                # the current active scale OR ANY standard architectural scale category.
+                agreeing_candidates = []
+                for cand in candidates:
+                    is_agr, s_label = check_dim_agreement_all_scales(
+                        cand.get("val_ft"), span_px, calc_ft, pts_per_foot
+                    )
+                    if is_agr:
+                        agreeing_candidates.append((cand, s_label))
+
+                if agreeing_candidates:
+                    # Prefer the agreeing candidate sitting closest to this dimension track
+                    if eff_band is not None:
+                        match, matched_scale = min(
+                            agreeing_candidates,
+                            key=lambda pair: abs(pair[0][other_key] - eff_band)
+                        )
                     else:
-                        # Keep the rejected alternatives visible so a reviewer
-                        # can see what the bay was compared against.
-                        alts = sorted({d["text"] for d in candidates})[:4]
-                        if len(alts) > 1:
-                            ocr_alternatives = alts
+                        match, matched_scale = agreeing_candidates[0]
+                    agrees = True
+                else:
+                    # Candidate exists but does not match geometry under ANY scale category
+                    if eff_band is not None:
+                        match = min(candidates, key=lambda d: abs(d[other_key] - eff_band))
+                    else:
+                        match = candidates[0]
+                    agrees = False
+                    alts = sorted({d["text"] for d in candidates})[:4]
+                    if len(alts) > 1:
+                        ocr_alternatives = alts
+
             # Provenance: a bay measured line-to-line is exact; one where
             # either end fell back to the bubble centre carries that end's
             # dodge as error. Downstream consumers can weight or filter on
@@ -1281,8 +1327,6 @@ def run_deterministic_geometry_pass(
             measured_between = ("grid_lines" if src1 == src2 == "vector_line"
                                 else "mixed" if "vector_line" in (src1, src2)
                                 else "bubble_centres")
-            # What this bay would have measured under the old bubble-centre
-            # rule, so a regression is visible rather than inferred.
             bubble_span_px = None
             if p1.get("bubble_coord") is not None and p2.get("bubble_coord") is not None:
                 bubble_span_px = abs(p2["bubble_coord"] - p1["bubble_coord"])
@@ -1295,6 +1339,7 @@ def run_deterministic_geometry_pass(
                 "length_inches": round(calc_ft * 12.0, 1),
                 "ocr_text": match["text"] if match else None,
                 "agrees_with_ocr": agrees,
+                "matched_scale": matched_scale,
                 "flagged": (agrees is False),
                 "measured_between": measured_between,
                 "from_coord_source": src1,
@@ -1305,49 +1350,6 @@ def run_deterministic_geometry_pass(
                     None if bubble_span_px is None or pts_per_foot <= 0
                     else round((bubble_span_px - span_px) / pts_per_foot * 12.0, 2)),
             })
-
-        # A bay that disagrees with the nearest printed dimension is not
-        # necessarily wrong: that printed text can be a CUMULATIVE run --
-        # e.g. a decimal sub-grid (F.95) splits a bay into F-F.95 and
-        # F.95-G, but the sheet may only print the OVERALL F-to-G length at
-        # that dimension line, with the interior sub-grid's own bubble
-        # drawn but never separately dimensioned. The per-bay OCR matching
-        # above still finds that overall text nearby (it's the closest
-        # printed dimension there IS) and compares it against just the
-        # F-F.95 sub-span, which will almost never match -- flagging a bay
-        # whose measurement is actually correct as a mismatch, purely
-        # because it was checked against a total that was never describing
-        # it alone. Real steel estimators do the reverse of what naive
-        # nearest-text matching does here: back out a sub-bay's length from
-        # the overall dimension minus its known neighbours, rather than
-        # expect the overall figure to equal one sub-piece.
-        #
-        # Detect this directly: for every flagged bay, check whether ITS
-        # OWN measured length plus an immediately adjacent bay's measured
-        # length (the two sub-bays a total would be split into) sums to
-        # very nearly its OCR match's value. If so, that OCR text was a
-        # cumulative dimension for the pair, not a contradiction of this
-        # bay alone -- clear the flag and drop the now-misleading OCR
-        # comparison rather than report a false disagreement.
-        for i, bay in enumerate(bays):
-            if not bay["flagged"] or not bay["ocr_text"]:
-                continue
-            ocr_ft = parse_dimension_string(bay["ocr_text"])
-            if ocr_ft is None:
-                continue
-            own_ft = bay["length_inches"] / 12.0
-            for j in (i - 1, i + 1):
-                if not (0 <= j < len(bays)):
-                    continue
-                neighbor_ft = bays[j]["length_inches"] / 12.0
-                combined = own_ft + neighbor_ft
-                tol = max(0.3, combined * 0.03)
-                if abs(combined - ocr_ft) <= tol:
-                    bay["flagged"] = False
-                    bay["agrees_with_ocr"] = None
-                    bay["ocr_text"] = None
-                    bay["cumulative_dimension_excluded"] = True
-                    break
 
         return bays
 
@@ -1780,32 +1782,32 @@ def run_deterministic_geometry_pass(
     }
 
 
-def _display_dimension_text(bay: Dict[str, Any]) -> str:
+MATCHED_SCALE_DICT = dict(STANDARD_ARCHITECTURAL_SCALES)
+
+
+def _display_dimension_text(bay: Dict[str, Any], current_pts_per_foot: float = 0.0) -> str:
     """
     Pick what to show as this bay's length label.
 
-    `dimension_text` is always our own geometry (pixel distance / scale),
-    rounded to the nearest 1/16" -- but pixel-based measurement always
-    carries a little sub-pixel noise, so nearly every bay picks up some
-    small, spurious fraction (a 1/16" or 1/8" here or there) even when the
-    sheet's own drafted dimension is a clean round number. Showing that
-    raw geometric fraction on EVERY bay made the overlay look like real
-    dimensions had a fraction when they didn't -- the sheet plainly reads
-    "10'-10"", ours read "10'-10 1/8"".
-
-    Once a bay's measurement has been confirmed to agree with the sheet's
-    own printed dimension (`agrees_with_ocr` -- see the tolerance check in
-    `_make_bays`), the printed text IS the authoritative, human-drafted
-    value: show that verbatim instead of our own noisier re-derivation.
-    Geometry is still what's used for the *comparison* and for every case
-    where there's nothing printed to compare against (or where the two
-    genuinely disagree, which is exactly what should keep showing our
-    measured value so the mismatch is visible) -- this only changes what
-    gets DISPLAYED once agreement is already established.
+    If the bay agrees with OCR:
+      - If matched on a specific architectural scale and current_pts_per_foot is provided,
+        scale the exact OCR human-drafted value by the ratio (matched_ppf / current_pts_per_foot)
+        and format cleanly with ft_to_arch() so exact fractions (e.g. 11'-3 1/2", 15'-6") are preserved
+        without sub-pixel noise.
+      - If matched on current_scale or verbatim, return bay["ocr_text"].
+    If there is a mismatch or no OCR match:
+      - Return the CAD-measured bay["dimension_text"] so the mismatch is clearly visible.
     """
     if bay.get("agrees_with_ocr") and bay.get("ocr_text"):
+        matched_scale = bay.get("matched_scale")
+        if matched_scale in MATCHED_SCALE_DICT and current_pts_per_foot > 0:
+            ocr_ft = parse_dimension_string(bay["ocr_text"])
+            if ocr_ft is not None:
+                matched_ppf = MATCHED_SCALE_DICT[matched_scale]
+                exact_scaled_ft = ocr_ft * (matched_ppf / current_pts_per_foot)
+                return ft_to_arch(exact_scaled_ft)
         return bay["ocr_text"]
-    return bay["dimension_text"]
+    return bay.get("dimension_text", "")
 
 
 def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1822,6 +1824,7 @@ def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]
     pw = results["page_dimensions"]["width"]
     ph = results["page_dimensions"]["height"]
     scale_source = results["scale"]["source"]
+    pts_per_foot = results["scale"].get("points_per_foot", 0.0)
     out: List[Dict[str, Any]] = []
 
     for ti, track in enumerate(results["horizontal_dimension_tracks"]):  # numbers axis -> axis "V"
@@ -1836,13 +1839,14 @@ def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]
                 "to_grid": bay["to_grid"],
                 "label": f"{bay['from_grid']}–{bay['to_grid']}",
                 "length_ft": round(bay["length_inches"] / 12.0, 2),
-                "text": _display_dimension_text(bay),
+                "text": _display_dimension_text(bay, pts_per_foot),
                 "x1": round(g1["coord"] / pw, 4),
                 "y1": round(y / ph, 4),
                 "x2": round(g2["coord"] / pw, 4),
                 "y2": round(y / ph, 4),
                 "source": "scale_verified" if bay["agrees_with_ocr"] else "scale_computed",
                 "ocr_text": bay["ocr_text"],
+                "matched_scale": bay.get("matched_scale"),
                 "scale_source": scale_source,
                 "side": track["side"],
                 "flagged": bay["flagged"],
@@ -1860,13 +1864,14 @@ def to_frontend_dimension_lines(results: Dict[str, Any]) -> List[Dict[str, Any]]
                 "to_grid": bay["to_grid"],
                 "label": f"{bay['from_grid']}–{bay['to_grid']}",
                 "length_ft": round(bay["length_inches"] / 12.0, 2),
-                "text": _display_dimension_text(bay),
+                "text": _display_dimension_text(bay, pts_per_foot),
                 "x1": round(x / pw, 4),
                 "y1": round(g1["coord"] / ph, 4),
                 "x2": round(x / pw, 4),
                 "y2": round(g2["coord"] / ph, 4),
                 "source": "scale_verified" if bay["agrees_with_ocr"] else "scale_computed",
                 "ocr_text": bay["ocr_text"],
+                "matched_scale": bay.get("matched_scale"),
                 "scale_source": scale_source,
                 "side": track["side"],
                 "flagged": bay["flagged"],
