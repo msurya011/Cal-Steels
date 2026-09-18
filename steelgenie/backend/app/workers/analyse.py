@@ -254,6 +254,10 @@ async def run_analyse(
             "sym_h": _raw_geo.get("sym_h"),
             "depth_in": _raw_geo.get("depth_in"),
             "error_flags": _raw_geo.get("error_flags"),
+            "grid_ref": _raw_geo.get("grid_ref") or m.get("grid_ref"),
+            "grid_bay": _raw_geo.get("grid_bay") or m.get("grid_bay"),
+            "grid_line": _raw_geo.get("grid_line") or m.get("grid_line"),
+            "exact_length_text": _raw_geo.get("exact_length_text") or m.get("exact_length_text"),
         }
 
         member_rows.append({
