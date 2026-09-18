@@ -5311,17 +5311,20 @@ def build_members(profiles, page_w, page_h,
 def dedup_overlapping_beams(members, page_w, page_h, pts_per_foot):
     """Remove duplicate beam overlays left after the labeled + unlabeled passes.
 
-    Two beams that are parallel, perpendicular-coincident (within ~half a shallow
-    section depth) and overlap ≥ 50 % are the same physical beam drawn twice.
-    Keep the better one:
-      • a LABELED beam always beats an unlabeled (beam?) candidate,
-      • between two unlabeled candidates, keep the longer.
-    Two DIFFERENT labeled beams are LEFT ALONE — at this perpendicular distance
-    they are almost always two real adjacent beams, not a duplicate, so dropping
-    one would delete a real member.  Universal: keys off geometry only.
+    1. Multi-bay composite line removal:
+       A continuous drawn line (e.g. wall or CMU infill face) that extends across
+       multiple bays parallel to and directly overlapping 2 or more shorter bay beams
+       (e.g. W16x26 10.8' and W12x19 13.7') is a drawing artifact and must be dropped.
+    2. Parallel doubled beam detection:
+       Two beams that are parallel, along the same framing corridor (within ~2.5-3.5 ft)
+       and overlap significantly (>= 70%) represent the same physical member drawn or
+       detected twice. Keeps the primary structural member, dropping secondary note
+       matches (e.g. elevation tags '(+32.46)' or '(LO)') and unlabeled duplicates.
     """
     ppf  = pts_per_foot if pts_per_foot > 0 else 9.0
-    PERP = max(8.0, ppf * 0.6)     # ~ half a shallow (W8–W12) section depth
+    CORRIDOR_TOL = max(32.0, ppf * 3.5)
+    NEAR_TOL     = max(20.0, ppf * 2.2)
+
     beams = [m for m in members
              if m.get("type") == "beam" and m.get("bx1") is not None]
 
@@ -5330,6 +5333,8 @@ def dedup_overlapping_beams(members, page_w, page_h, pts_per_foot):
                 m["bx2"] * page_w, m["by2"] * page_h)
 
     drop = set()
+
+    # Pass 1: Multi-bay composite duplicate removal
     for i in range(len(beams)):
         if id(beams[i]) in drop:
             continue
@@ -5337,37 +5342,83 @@ def dedup_overlapping_beams(members, page_w, page_h, pts_per_foot):
         La = math.hypot(ax2 - ax1, ay2 - ay1) or 1.0
         ux, uy = (ax2 - ax1) / La, (ay2 - ay1) / La
         px, py = -uy, ux
+
+        contained = []
         for j in range(len(beams)):
             if i == j or id(beams[j]) in drop:
                 continue
             bx1, by1, bx2, by2 = geo(beams[j])
             Lb = math.hypot(bx2 - bx1, by2 - by1) or 1.0
             if abs(((bx2 - bx1) * ux + (by2 - by1) * uy) / Lb) < 0.96:
-                continue                                   # not parallel
-            if abs((bx1 - ax1) * px + (by1 - ay1) * py) > PERP:
-                continue                                   # not coincident
+                continue
+            perp_dist = abs((bx1 - ax1) * px + (by1 - ay1) * py)
+            if perp_dist > CORRIDOR_TOL:
+                continue
             t1 = (bx1 - ax1) * ux + (by1 - ay1) * uy
             t2 = (bx2 - ax1) * ux + (by2 - ay1) * uy
-            if min(La, max(t1, t2)) - max(0.0, min(t1, t2)) < 0.5 * min(La, Lb):
-                continue                                   # not enough overlap
+            lo, hi = min(t1, t2), max(t1, t2)
+            ovr = min(La, hi) - max(0.0, lo)
+            if ovr >= 0.70 * Lb:
+                contained.append((j, beams[j], Lb, lo, hi))
+
+        if len(contained) >= 2:
+            tot_cov = sum(cb[2] for cb in contained)
+            if tot_cov >= 0.70 * La and any(cb[2] < 0.75 * La for cb in contained):
+                drop.add(id(beams[i]))
+
+    # Pass 2: Parallel duplicate beams on same corridor (near-equal or heavy overlap)
+    for i in range(len(beams)):
+        if id(beams[i]) in drop:
+            continue
+        ax1, ay1, ax2, ay2 = geo(beams[i])
+        La = math.hypot(ax2 - ax1, ay2 - ay1) or 1.0
+        ux, uy = (ax2 - ax1) / La, (ay2 - ay1) / La
+        px, py = -uy, ux
+
+        for j in range(len(beams)):
+            if i == j or id(beams[j]) in drop:
+                continue
+            bx1, by1, bx2, by2 = geo(beams[j])
+            Lb = math.hypot(bx2 - bx1, by2 - by1) or 1.0
+            if abs(((bx2 - bx1) * ux + (by2 - by1) * uy) / Lb) < 0.96:
+                continue
+            perp_dist = abs((bx1 - ax1) * px + (by1 - ay1) * py)
+            if perp_dist > NEAR_TOL:
+                continue
+            t1 = (bx1 - ax1) * ux + (by1 - ay1) * uy
+            t2 = (bx2 - ax1) * ux + (by2 - ay1) * uy
+            lo, hi = min(t1, t2), max(t1, t2)
+            ovr = min(La, hi) - max(0.0, lo)
+            if ovr < 0.75 * min(La, Lb):
+                continue
+
             ai = not beams[i].get("unlabeled")
             bj = not beams[j].get("unlabeled")
             if ai and not bj:
                 drop.add(id(beams[j]))
             elif bj and not ai:
-                drop.add(id(beams[i])); break              # i is gone
+                drop.add(id(beams[i]))
+                break
             elif (not ai) and (not bj):
                 drop.add(id(beams[j]) if La >= Lb else id(beams[i]))
                 if id(beams[i]) in drop:
                     break
             else:
-                # both labeled.  If they are extremely close (dist < 0.8 ft) and
-                # overlap significantly, it's a double-read/duplicate detection.
-                # Keep the longer one.
-                if abs((bx1 - ax1) * px + (by1 - ay1) * py) < 0.8 * ppf:
+                # Both labeled: check for note tags like (+...), (LO), (TYP)
+                p_i = str(beams[i].get("profile", ""))
+                p_j = str(beams[j].get("profile", ""))
+                has_note_i = any(k in p_i for k in ["(+", "(LO", "TYP"])
+                has_note_j = any(k in p_j for k in ["(+", "(LO", "TYP"])
+                if has_note_i and not has_note_j:
+                    drop.add(id(beams[i]))
+                    break
+                elif has_note_j and not has_note_i:
+                    drop.add(id(beams[j]))
+                elif abs(La - Lb) / max(La, Lb) < 0.25:
                     drop.add(id(beams[j]) if La >= Lb else id(beams[i]))
                     if id(beams[i]) in drop:
                         break
+
     if drop:
         print(f"[DEDUP] removed {len(drop)} duplicate overlapping beam overlay(s)")
     return [m for m in members if id(m) not in drop]
@@ -8714,6 +8765,7 @@ async def analyse_pdf(req: AnalysisRequest):
                 run_deterministic_geometry_pass,
                 to_frontend_dimension_lines,
                 to_frontend_work_point,
+                snap_members_to_grid_bays,
             )
             _override_ppf = pts_per_foot if (req.scale_ratio and req.scale_ratio > 0) else None
             _geom_results = run_deterministic_geometry_pass(
@@ -8721,7 +8773,20 @@ async def analyse_pdf(req: AnalysisRequest):
             )
             grid_dimensions = to_frontend_dimension_lines(_geom_results)
             work_point = to_frontend_work_point(_geom_results)
-            print(f"[ANALYSE] grid_dimensions via run_deterministic_geometry_pass: {len(grid_dimensions)} lines")
+
+            # Snap member lengths, coordinates, and labels to verified grid bays & grid intersections
+            _snapped_cnt = snap_members_to_grid_bays(
+                members, _geom_results, _calc_w, _calc_h, _eff_ppf
+            )
+            members = dedup_overlapping_beams(members, _calc_w, _calc_h, _eff_ppf)
+            print(f"[ANALYSE] grid_dimensions via run_deterministic_geometry_pass: {len(grid_dimensions)} lines (snapped {_snapped_cnt} members to grid bays)")
+
+            # Update grid_bubbles with verified vector grids so DB stores accurate sub-grids
+            if _geom_results.get("vertical_grids") and _geom_results.get("horizontal_grids"):
+                grid_bubbles = {
+                    "v": [{"position": round(g["x"] / _calc_w, 4), "label": g["label"]} for g in _geom_results["vertical_grids"]],
+                    "h": [{"position": round(g["y"] / _calc_h, 4), "label": g["label"]} for g in _geom_results["horizontal_grids"]],
+                }
         except Exception as _geom_exc:
             import traceback
             print(f"[ANALYSE] run_deterministic_geometry_pass failed for page={req.page_index}: {_geom_exc} — falling back to legacy extract_grid_dimensions")

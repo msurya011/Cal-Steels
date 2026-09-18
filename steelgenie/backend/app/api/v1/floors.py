@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 from uuid import UUID
 
 
@@ -160,27 +160,37 @@ async def get_page_grids(page_id: UUID, user: AuthUser):
     return db.table("grids").select("*").eq("page_id", str(page_id)).execute().data or []
 
 
-def _compute_grid_dimensions(pdf_path: str, page_idx: int, scale_num: float | None) -> list:
-    from app.engineering.grid_geometry_pass import (
-        run_deterministic_geometry_pass,
-        to_frontend_dimension_lines,
-    )
+_GEOM_CACHE: Dict[Tuple[str, int, Optional[float], float], Dict[str, Any]] = {}
+
+
+def _get_cached_geom_results(pdf_path: str, page_idx: int, scale_num: float | None) -> Dict[str, Any]:
+    from app.engineering.grid_geometry_pass import run_deterministic_geometry_pass
     override_ppf = (864.0 / scale_num) if scale_num and scale_num > 0 else None
-    results = run_deterministic_geometry_pass(
+    try:
+        mtime = os.path.getmtime(pdf_path)
+    except Exception:
+        mtime = 0.0
+    cache_key = (pdf_path, page_idx, override_ppf, mtime)
+    if cache_key in _GEOM_CACHE:
+        return _GEOM_CACHE[cache_key]
+    res = run_deterministic_geometry_pass(
         pdf_path, page_number=page_idx, override_pts_per_foot=override_ppf
     )
+    if len(_GEOM_CACHE) > 50:
+        _GEOM_CACHE.clear()
+    _GEOM_CACHE[cache_key] = res
+    return res
+
+
+def _compute_grid_dimensions(pdf_path: str, page_idx: int, scale_num: float | None) -> list:
+    from app.engineering.grid_geometry_pass import to_frontend_dimension_lines
+    results = _get_cached_geom_results(pdf_path, page_idx, scale_num)
     return to_frontend_dimension_lines(results)
 
 
 def _compute_work_point(pdf_path: str, page_idx: int, scale_num: float | None) -> dict | None:
-    from app.engineering.grid_geometry_pass import (
-        run_deterministic_geometry_pass,
-        to_frontend_work_point,
-    )
-    override_ppf = (864.0 / scale_num) if scale_num and scale_num > 0 else None
-    results = run_deterministic_geometry_pass(
-        pdf_path, page_number=page_idx, override_pts_per_foot=override_ppf
-    )
+    from app.engineering.grid_geometry_pass import to_frontend_work_point
+    results = _get_cached_geom_results(pdf_path, page_idx, scale_num)
     return to_frontend_work_point(results)
 
 
@@ -192,10 +202,7 @@ async def get_page_grid_dimensions(page_id: UUID, user: AuthUser):
     if not page:
         return []
 
-    # If the page has no scale applied/uploaded, do not compute or return dimensions
     scale_num = page.get("scale_num")
-    if not scale_num or scale_num <= 0:
-        return []
 
     drawing = db.table("drawings").select("*").eq("id", page["drawing_id"]).maybe_single().execute().data
     if not drawing:
