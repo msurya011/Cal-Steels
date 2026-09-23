@@ -34,6 +34,7 @@ Fixes vs. the previous version of this module:
 from __future__ import annotations
 import os
 import re
+import math
 import statistics
 from typing import Dict, List, Tuple, Optional, Any
 from pathlib import Path
@@ -54,12 +55,12 @@ from app.engineering.grid_line_geometry import (
 )
 
 # ---------------------------------------------------------------------------
-# Label patterns
+# Label patterns (Universal support for A-Z, AA-ZZ, Aa, 1-999, and sub-grids)
 # ---------------------------------------------------------------------------
-_GRID_LETTER_PRIMARY = re.compile(r"^[A-Z]$")
-_GRID_LETTER_SECONDARY = re.compile(r"^[A-Z]\.\d+$")
-_GRID_NUMBER_PRIMARY = re.compile(r"^\d{1,2}$")
-_GRID_NUMBER_SECONDARY = re.compile(r"^\d{1,2}\.\d+$")
+_GRID_LETTER_PRIMARY = re.compile(r"^(?:[A-Za-z]|([A-Za-z])\1)$")
+_GRID_LETTER_SECONDARY = re.compile(r"^(?:[A-Za-z]|([A-Za-z])\1)(?:[\.\-][\dA-Za-z]+|['\u2019])$")
+_GRID_NUMBER_PRIMARY = re.compile(r"^\d{1,3}$")
+_GRID_NUMBER_SECONDARY = re.compile(r"^\d{1,3}(?:[\.\-][\dA-Za-z]+|['\u2019])$")
 
 # Dimension-text parsing (unchanged -- this part was already solid)
 _DIM_RE = re.compile(r"""
@@ -88,17 +89,6 @@ _INCH_ONLY_RE = re.compile(r"""
 
 def parse_dimension_string(text: str) -> Optional[float]:
     """Parse dimension strings like 24'-0", 30'-6 1/2", 8" into decimal feet."""
-    # Collapse whitespace to a single space rather than removing it outright.
-    # A fraction like "8 1/2" (inches, then a space, then the fraction) needs
-    # that ONE space to survive -- both _DIM_RE and _INCH_ONLY_RE require
-    # `\s+` between the whole-inches part and the numerator specifically so
-    # "81/2" (no space) can never be misread as the fraction "8 1/2". Deleting
-    # every space instead of collapsing them silently turned every
-    # fractional-inch dimension ("19'-8 1/2"", "14'-6 3/8"") into something
-    # neither regex could match, so it was dropped as unparseable on every
-    # sheet, not just this one -- a whole-number dimension a few points away
-    # would then get matched in its place instead, producing a confidently
-    # wrong "sheet disagrees" flag on a bay that was actually correct.
     t = re.sub(r"\s+", " ", text.strip())
     m = _DIM_RE.match(t)
     if m:
@@ -117,20 +107,36 @@ def parse_dimension_string(text: str) -> Optional[float]:
     return None
 
 
-
 STANDARD_ARCHITECTURAL_SCALES = [
+    # Architectural scales
     ("1/16\" = 1'-0\"", 4.5),
     ("3/32\" = 1'-0\"", 6.75),
     ("1/8\" = 1'-0\"", 9.0),
     ("3/16\" = 1'-0\"", 13.5),
     ("1/4\" = 1'-0\"", 18.0),
+    ("5/16\" = 1'-0\"", 22.5),
     ("3/8\" = 1'-0\"", 27.0),
     ("1/2\" = 1'-0\"", 36.0),
     ("3/4\" = 1'-0\"", 54.0),
     ("1\" = 1'-0\"", 72.0),
     ("1-1/2\" = 1'-0\"", 108.0),
     ("3\" = 1'-0\"", 216.0),
+    # Civil & Engineering scales
+    ("1\" = 10'-0\"", 7.2),
+    ("1\" = 20'-0\"", 3.6),
+    ("1\" = 30'-0\"", 2.4),
+    ("1\" = 40'-0\"", 1.8),
+    ("1\" = 50'-0\"", 1.44),
+    ("1\" = 60'-0\"", 1.2),
+    ("1\" = 100'-0\"", 0.72),
+    # Metric scale ratios (normalized to pts/ft)
+    ("1:20", 108.0),
+    ("1:50", 43.2),
+    ("1:100", 21.6),
+    ("1:200", 10.8),
+    ("1:500", 4.32),
 ]
+
 
 
 def check_dim_agreement_all_scales(
@@ -209,7 +215,7 @@ def ft_to_arch(v: float) -> str:
 
 def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
     """
-    Detect drawing scale from text blocks (e.g. 1/8" = 1'-0").
+    Detect drawing scale from text blocks (e.g. 1/8" = 1'-0", 1" = 20', 1:100).
     Returns (pts_per_foot, scale_label, is_explicit).
     is_explicit is False only when no scale callout was found on the sheet
     and we had to fall back to a default -- this must never be silently
@@ -219,6 +225,8 @@ def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
         r"(?:SCALE\s*:\s*)?(\d+/\d+|\d+(?:\.\d+)?)\s*[\"\u201d]\s*=\s*(\d+)['\u2019](?:-\s*(\d+)[\"\u201d])?"
         r"|SCALE\s*:\s*(\d+/\d+|\d+(?:\.\d+)?)\s*[\"\u201d]\s*=\s*(\d+)"
     )
+    metric_re = re.compile(r"(?:SCALE\s*:\s*)?1\s*:\s*(\d+)", re.IGNORECASE)
+
     candidates = []
     for b in text_dict.get("blocks", []):
         for l in b.get("lines", []):
@@ -226,29 +234,35 @@ def detect_scale_factor(text_dict: dict) -> Tuple[float, str, bool]:
             # Ignore elevation notes like "ACTUAL ELEVATION 489'-0" = 0'-0""
             if "ELEV" in line_str.upper() or "FINISH FLOOR" in line_str.upper():
                 continue
+
+            # 1. Architectural & Civil Scale detection
             m = scale_re.search(line_str)
             if m:
                 frac_str = m.group(1) or m.group(4)
-                if not frac_str:
-                    continue
-                if "/" in frac_str:
-                    num, den = frac_str.split("/")
-                    inch_val = float(num) / float(den)
-                else:
-                    inch_val = float(frac_str)
+                if frac_str:
+                    if "/" in frac_str:
+                        num, den = frac_str.split("/")
+                        inch_val = float(num) / float(den)
+                    else:
+                        inch_val = float(frac_str)
 
-                if inch_val <= 0 or inch_val > 12.0:
-                    continue
+                    if 0 < inch_val <= 12.0:
+                        foot_str = m.group(2) or m.group(5)
+                        foot_val = float(foot_str) if foot_str and float(foot_str) > 0 else 1.0
+                        pts_per_foot = (inch_val * 72.0) / foot_val
+                        if 0.5 <= pts_per_foot <= 500.0:
+                            has_keyword = "SCALE" in line_str.upper()
+                            candidates.append((2 if has_keyword else 1, pts_per_foot, line_str.strip()))
+                            continue
 
-                foot_str = m.group(2) or m.group(5)
-                if foot_str and float(foot_str) <= 0:
-                    continue
-
-                foot_val = float(foot_str) if foot_str else 1.0
-                pts_per_foot = (inch_val * 72.0) / foot_val
-                if 1.0 <= pts_per_foot <= 500.0:
+            # 2. Metric Scale detection (e.g. 1:100 -> 1 ft is 864/R pts)
+            mm = metric_re.search(line_str)
+            if mm:
+                ratio = float(mm.group(1))
+                if 5.0 <= ratio <= 2000.0:
+                    pts_per_foot = 864.0 / ratio
                     has_keyword = "SCALE" in line_str.upper()
-                    candidates.append((1 if has_keyword else 0, pts_per_foot, line_str.strip()))
+                    candidates.append((2 if has_keyword else 1, pts_per_foot, line_str.strip()))
 
     if candidates:
         # Prefer candidates explicitly prefixed with 'SCALE'
@@ -306,7 +320,7 @@ def _find_confirmed_bubbles(page: "fitz.Page", text_dict: dict,
         if w <= 1 or h <= 1:
             continue
         aspect = max(w, h) / max(min(w, h), 0.1)
-        if 6 <= w <= 45 and 6 <= h <= 45 and aspect <= 1.6:
+        if 5 <= w <= 55 and 5 <= h <= 55 and aspect <= 1.85:
             bubble_boxes.append(r)
 
     confirmed = []
@@ -314,7 +328,7 @@ def _find_confirmed_bubbles(page: "fitz.Page", text_dict: dict,
         for l in b.get("lines", []):
             for sp in l.get("spans", []):
                 t = sp.get("text", "").strip()
-                if not t or len(t) > 5:
+                if not t or len(t) > 7:
                     continue
                 kind = _label_kind(t)
                 if kind is None:
@@ -338,19 +352,50 @@ def _find_confirmed_bubbles(page: "fitz.Page", text_dict: dict,
 
 
 def _label_rank(t: str) -> float:
-    m = re.match(r"^([A-Z])(?:\.(\d+))?$", t)
+    # Match letter grids: A, B, AA, AB, Aa, A.1, A-1, A', AA.2
+    m = re.match(r"^([A-Za-z]{1,2})(?:[\.\-]([\dA-Za-z]+)|['\u2019])?$", t)
     if m:
-        return (ord(m.group(1)) - 65) * 100 + (int(m.group(2)) if m.group(2) else 0)
-    m2 = re.match(r"^(\d+)(?:\.(\d+))?$", t)
+        letters = m.group(1).upper()
+        sub_str = m.group(2)
+        sub = 0
+        if sub_str:
+            sub = int(sub_str) if sub_str.isdigit() else (ord(sub_str[0].upper()) - 64)
+        elif "'" in t or "\u2019" in t:
+            sub = 50
+
+        if len(letters) == 1:
+            base = (ord(letters[0]) - 65) * 100
+        else:
+            base = (26 + (ord(letters[0]) - 65) * 26 + (ord(letters[1]) - 65)) * 100
+        return float(base + sub)
+
+    # Match number grids: 1, 2, 101, 1.1, 1-1, 1'
+    m2 = re.match(r"^(\d{1,3})(?:[\.\-]([\dA-Za-z]+)|['\u2019])?$", t)
     if m2:
-        return int(m2.group(1)) * 100 + (int(m2.group(2)) if m2.group(2) else 0)
+        num = int(m2.group(1))
+        sub_str = m2.group(2)
+        sub = 0
+        if sub_str:
+            sub = int(sub_str) if sub_str.isdigit() else (ord(sub_str[0].upper()) - 64)
+        elif "'" in t or "\u2019" in t:
+            sub = 50
+        return float(num * 100 + sub)
+
     return 0.0
 
 
-def _is_valid_grid_band(band: List[Dict[str, Any]], axis: str) -> bool:
+
+
+def _is_valid_grid_band(band: List[Dict[str, Any]], axis: str, pos_key: Optional[str] = None) -> bool:
     if not band:
         return False
-    pos_key = "cx" if axis == "number" else "cy"
+    if pos_key is None:
+        cxs = [p.get("cx", 0.0) for p in band]
+        cys = [p.get("cy", 0.0) for p in band]
+        span_x = max(cxs) - min(cxs) if cxs else 0.0
+        span_y = max(cys) - min(cys) if cys else 0.0
+        pos_key = "cx" if span_x >= span_y else "cy"
+
     ordered = sorted(band, key=lambda p: p.get(pos_key, 0.0))
 
     if axis == "number":
@@ -400,7 +445,7 @@ def _is_valid_grid_band(band: List[Dict[str, Any]], axis: str) -> bool:
                 letters.append(ord(m.group(1)) - 65)
         if not letters:
             return False
-        if min(letters) > 6:
+        if min(letters) > 20:
             return False
         if len(set(letters)) < 2:
             return False
@@ -441,7 +486,7 @@ def _pick_best_grid_band(pts: List[Dict[str, Any]], axis: str, band_key: str, po
     candidates = []
     for b in buckets.values():
         run = _largest_contiguous_run(b, pos_key, axis=axis)
-        if len(run) >= 2 and _is_valid_grid_band(run, axis):
+        if len(run) >= 2 and _is_valid_grid_band(run, axis, pos_key=pos_key):
             center = sum(p[band_key] for p in run) / len(run)
             dist_to_edge = min(center, page_dim - center)
             candidates.append((run, dist_to_edge, len(run)))
@@ -839,91 +884,39 @@ def _build_axis_tracks(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph
     one entry per distinct confirmed track, most-confident first.
     """
     items = [c for c in confirmed if c["axis"] == axis]
+    if not items:
+        return []
 
-    # near_edge below is the gate that decides which confirmed bubbles are
-    # even eligible to seed or join a track -- everything else in this
-    # function only ever removes candidates that pass it. Measuring it
-    # against the raw PAGE box is wrong on any sheet with a wide title
-    # block, notes column, or blank margin: the real plan can occupy well
-    # under half the page, so a genuine grid row sitting near the PLAN's
-    # own edge can still fall in the page's untouched middle 52% and never
-    # be considered at all (this is what silently dropped an entire primary
-    # numbers row, and a primary letters row, on real sheets -- not a
-    # missing sub-grid, a missing PRIMARY grid line, because the row was
-    # real but the page-relative threshold never looked there).
-    # Grounding the box in every confirmed bubble on the page (both axes,
-    # not just this one) instead of the raw page rect fixes that: it is
-    # built from real, already-verified grid geometry, not a guess, and a
-    # sheet where confirmed bubbles happen to already hug the page edges
-    # reduces to the old page-relative behaviour, so this only ever widens
-    # what near_edge accepts, never narrows it.
-    def _robust_range(values: List[float], full_span: float) -> Tuple[float, float]:
-        """5th/95th percentile instead of min/max -- one stray confirmed
-        point far from the real plan (a callout number, a note reference)
-        should not be able to single-handedly drag the content box out and
-        undo the whole point of using it instead of the raw page."""
-        if len(values) < 4:
-            return 0.0, full_span
-        s = sorted(values)
-        n = len(s)
-        lo = s[max(0, int(n * 0.05))]
-        hi = s[min(n - 1, int(n * 0.95))]
-        if hi - lo <= full_span * 0.1:
-            return 0.0, full_span
-        return lo, hi
-
-    all_cx = [c["cx"] for c in confirmed]
-    all_cy = [c["cy"] for c in confirmed]
-    content_x_lo, content_x_hi = _robust_range(all_cx, pw)
-    content_y_lo, content_y_hi = _robust_range(all_cy, ph)
-    # Small padding so a bubble sitting exactly on the content boundary
-    # (the common case -- that is where grid bubbles are drawn) still
-    # counts as "near the edge" rather than landing exactly on the line.
-    cx_pad = max((content_x_hi - content_x_lo) * 0.03, 10.0)
-    cy_pad = max((content_y_hi - content_y_lo) * 0.03, 10.0)
-    content_x_lo -= cx_pad
-    content_x_hi += cx_pad
-    content_y_lo -= cy_pad
-    content_y_hi += cy_pad
-    content_w = max(content_x_hi - content_x_lo, 1.0)
-    content_h = max(content_y_hi - content_y_lo, 1.0)
-
-    def near_edge(c):
-        return (c["cx"] < content_x_lo + content_w * edge or
-                c["cx"] > content_x_hi - content_w * edge or
-                c["cy"] < content_y_lo + content_h * edge or
-                c["cy"] > content_y_hi - content_h * edge)
-
-    perim = [c for c in items if near_edge(c)]
-    remaining = [c for c in perim if not c["is_secondary"]]
+    remaining_primary = [c for c in items if not c["is_secondary"]]
+    remaining_all = list(items)
 
     tracks: List[Tuple[List[Dict[str, Any]], Dict[str, Any]]] = []
-    used_sides: set = set()
+    used_band_coords: List[float] = []
     page_dim = ph if band_key == "cy" else pw
 
     for _ in range(max_tracks):
-        if not remaining:
+        pool = remaining_primary if len(remaining_primary) >= min_track_primary else remaining_all
+        if not pool:
             break
-        band = _pick_best_grid_band(remaining, axis, band_key, pos_key, page_dim)
+        band = _pick_best_grid_band(pool, axis, band_key, pos_key, page_dim)
+        if len(band) < min_track_primary and len(pool) == len(remaining_primary):
+            band = _pick_best_grid_band(remaining_all, axis, band_key, pos_key, page_dim)
+
         if len(band) < min_track_primary:
             break
 
         band_center = sum(p[band_key] for p in band) / len(band)
-        candidate_side = ("top" if band_center < ph / 2 else "bottom") if band_key == "cy" \
-            else ("left" if band_center < pw / 2 else "right")
-        if candidate_side in used_sides:
-            # discard this band as noise and keep looking, but don't let it
-            # block progress -- remove its points and continue
+        if any(abs(band_center - prev_coord) < 60.0 for prev_coord in used_band_coords):
             used_ids = {id(p) for p in band}
-            remaining = [c for c in remaining if id(c) not in used_ids]
+            remaining_primary = [c for c in remaining_primary if id(c) not in used_ids]
+            remaining_all = [c for c in remaining_all if id(c) not in used_ids]
             continue
-        used_sides.add(candidate_side)
-        pos_lo = min(p[pos_key] for p in band) - margin
-        pos_hi = max(p[pos_key] for p in band) + margin
+
+        used_band_coords.append(band_center)
 
         widened = [
-            c for c in perim
-            if abs(c[band_key] - band_center) <= widen and pos_lo <= c[pos_key] <= pos_hi
+            c for c in items
+            if abs(c[band_key] - band_center) <= widen
         ]
 
         best_by_label: Dict[str, Dict[str, Any]] = {}
@@ -952,8 +945,6 @@ def _build_axis_tracks(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph
         chain_entries = []
         for c in chain:
             coord, source = grid_coord(c, pos_key)
-            # NB: _build_axis_tracks already has a `margin` parameter (the
-            # band-widening distance). Do not shadow it here.
             line_len_frac, line_match_margin = line_evidence(c, pos_key)
             chain_entries.append({
                 "line_len_frac": line_len_frac,
@@ -975,10 +966,9 @@ def _build_axis_tracks(confirmed: List[Dict[str, Any]], axis: str, pw: float, ph
         chain_entries.sort(key=lambda e: e["coord"])
         tracks.append((chain_entries, meta))
 
-        # remove this track's primary points from the pool so the next
-        # iteration finds a genuinely different track, not the same one again
-        used_ids = {id(p) for p in band}
-        remaining = [c for c in remaining if id(c) not in used_ids]
+        used_ids = {id(c) for c in widened}
+        remaining_primary = [c for c in remaining_primary if id(c) not in used_ids]
+        remaining_all = [c for c in remaining_all if id(c) not in used_ids]
 
     return tracks
 
@@ -1341,16 +1331,6 @@ def run_deterministic_geometry_pass(
                         has_corroborating_dim = True
                         break
 
-            # If a denser track on this same axis has a confirmed grid line
-            # strictly between these two points AND this particular span is
-            # anomalously large next to this track's own typical bay size
-            # (roughly >1.8x the local median), AND no dimension text corroborates
-            # this span, this track is missing that intermediate grid -- draw nothing
-            # here rather than a single span that silently swallows several real bays.
-            if not has_corroborating_dim and reference_coords and median_span and span_px > median_span * 1.8:
-                lo, hi = min(p1["coord"], p2["coord"]), max(p1["coord"], p2["coord"])
-                if any(lo + 1.0 < rc < hi - 1.0 for rc in reference_coords):
-                    continue
             ocr_alternatives = None
             match = None
             agrees = None
@@ -1870,26 +1850,6 @@ def run_deterministic_geometry_pass(
     }
 
 
-MATCHED_SCALE_DICT = dict(STANDARD_ARCHITECTURAL_SCALES)
-
-
-def _display_dimension_text(bay: Dict[str, Any], current_pts_per_foot: float = 0.0) -> str:
-    """
-    Pick what to show as this bay's length label.
-
-    If the bay agrees with OCR:
-      - If matched on a specific architectural scale and current_pts_per_foot is provided,
-        scale the exact OCR human-drafted value by the ratio (matched_ppf / current_pts_per_foot)
-        and format cleanly with ft_to_arch() so exact fractions (e.g. 11'-3 1/2", 15'-6")
-        without sub-pixel noise.
-      - If matched on current_scale or verbatim, return bay["ocr_text"].
-    If there is a mismatch or no OCR match:
-      - Return the CAD-measured bay["dimension_text"] so the mismatch is clearly visible.
-    """
-    if bay.get("agrees_with_ocr") and bay.get("ocr_text"):
-        matched_scale = bay.get("matched_scale")
-        if matched_scale in MATCHED_SCALE_DICT and current_pts_per_foot > 0:
-            ocr_ft = parse_dimension_string(bay["ocr_text"])
 # ---------------------------------------------------------------------------
 # Dimension text rendering helpers
 # ---------------------------------------------------------------------------
@@ -2107,18 +2067,16 @@ def _grid_label_sort_key(label: Any):
     if not s:
         return (2, ())
 
-    # Split into numeric and non-numeric chunks for natural human sorting
-    chunks = re.split(r"(\d+(?:\.\d+)?)", s)
+    # Tokenize into letters, numbers, and symbols for natural structural sorting
+    tokens = re.findall(r"[A-Za-z]+|\d+(?:\.\d+)?|[^\w\s]", s)
     parsed = []
-    for c in chunks:
-        if not c:
-            continue
+    for t in tokens:
         try:
-            parsed.append((0, float(c)))
+            val = float(t)
+            parsed.append((0, val))
         except ValueError:
-            # Length prefix ensures 'A' < 'AA' (single letter before double)
-            c_clean = c.strip().upper()
-            parsed.append((1, len(c_clean), c_clean))
+            t_clean = t.upper()
+            parsed.append((1, len(t_clean), t_clean))
     return (0 if parsed and parsed[0][0] == 0 else 1, tuple(parsed))
 
 
@@ -2200,8 +2158,18 @@ def _resolve_starting_grid(grids: List[Dict[str, Any]], coord_key: str, is_min_s
     the geometric extreme on that side if the sequence first label sits
     deep in the interior or is an isolated misdetection.
     """
-    ordered_by_label = sorted(grids, key=lambda g: _grid_label_sort_key(g.get("label", "")))
-    extreme_grid = min(grids, key=lambda g: g[coord_key]) if is_min_side else max(grids, key=lambda g: g[coord_key])
+    # Exclude sub-1.0 callout numbers (e.g. '0.2', '0.4', '0.6') from being the origin sequence leader
+    candidate_grids = []
+    for g in grids:
+        lbl = str(g.get("label", "")).strip()
+        if re.match(r"^0(?:\.\d+)?$", lbl):
+            continue
+        candidate_grids.append(g)
+    if not candidate_grids:
+        candidate_grids = grids
+
+    ordered_by_label = sorted(candidate_grids, key=lambda g: _grid_label_sort_key(g.get("label", "")))
+    extreme_grid = min(candidate_grids, key=lambda g: g[coord_key]) if is_min_side else max(candidate_grids, key=lambda g: g[coord_key])
     if not ordered_by_label:
         return extreme_grid
 
@@ -2209,14 +2177,14 @@ def _resolve_starting_grid(grids: List[Dict[str, Any]], coord_key: str, is_min_s
     if first_label_grid is extreme_grid:
         return first_label_grid
 
-    all_coords = [g[coord_key] for g in grids]
+    all_coords = [g[coord_key] for g in candidate_grids]
     span = max(all_coords) - min(all_coords) if len(all_coords) > 1 else 1.0
     dist_from_extreme = abs(first_label_grid[coord_key] - extreme_grid[coord_key])
 
-    # If the first-labeled grid sits within 20% of the extreme edge, it is
+    # If the first-labeled grid sits within 25% of the extreme edge, it is
     # legitimately the starting grid (e.g. Grid 1, with a secondary or sub-grid
     # like 0.5 or a corner jog sitting just slightly beyond it).
-    if span > 0 and (dist_from_extreme / span) <= 0.20:
+    if span > 0 and (dist_from_extreme / span) <= 0.25:
         return first_label_grid
 
     # Otherwise trust the geometric extreme to ensure the origin stays on
@@ -2302,22 +2270,20 @@ def snap_members_to_grid_bays(
     snap_tol_pts: float = 35.0,
 ) -> int:
     """
-    Snap member lengths, coordinates, and labels to verified grid bays and grid intersections.
+    Snap member lengths, coordinates, and labels strictly using hierarchical center-to-center rules:
     
-    1. For Beams:
-       - Identifies if beam endpoints (bx1, by1) -> (bx2, by2) align with grid lines.
-       - Matches the span to the verified bay (or contiguous sum of bays).
-       - Locks member['length_ft'] directly to the exact bay length (e.g. 33.0 ft, 36.67 ft).
-       - Tags member with 'grid_bay' (e.g. '2–3') and 'grid_line' (e.g. 'B').
-       - Sets 'exact_length_text' (e.g. "33'-0\"", "36'-8\"", "31'-9\"").
+    1. PRIMARY CONDITION (Tier 1): Column Center to Column Center
+       - When column symbols exist near beam endpoints, snap endpoints exactly to the Column Centers.
+       - Locks exact center-to-center cut length and tags framing type.
+       
+    2. SECONDARY CONDITION (Tier 2): Grid Center to Grid Center
+       - If no column exists at an endpoint (e.g. infill beams framing into girders/grids),
+         snap to the nearest verified Grid Intersection / Grid Line coordinate.
+       - Enforces strict anti-overshoot boundaries so beams never falsely stretch across adjacent bays.
     
-    2. For Columns:
-       - Snaps column (x, y) to the nearest grid intersection.
-       - Tags member with 'grid_ref' (e.g. '1/A', '6.5/B').
-
-    Returns the count of snapped members.
+    Returns the count of successfully snapped members.
     """
-    if not members or not geom_results:
+    if not members or not geom_results or page_w <= 0 or page_h <= 0:
         return 0
 
     v_grids = geom_results.get("vertical_grids", [])
@@ -2339,35 +2305,67 @@ def snap_members_to_grid_bays(
 
     snapped_count = 0
 
+    # -----------------------------------------------------------------------
+    # Step 1: Extract and Snap All Column Centers to Grid Intersections
+    # -----------------------------------------------------------------------
+    columns_list: List[Dict[str, Any]] = []
     for m in members:
         mtype = (m.get("type") or m.get("kind") or "").lower()
-
-        # 1. Snap Columns to nearest grid intersection (X_i, Y_j)
         if mtype == "column":
             cx = m.get("x")
             cy = m.get("y")
-            if cx is not None and cx <= 1.0 and page_w > 1.0:
-                cx_pt = cx * page_w
-            else:
-                cx_pt = cx
-            if cy is not None and cy <= 1.0 and page_h > 1.0:
-                cy_pt = cy * page_h
-            else:
-                cy_pt = cy
+            if cx is None or cy is None:
+                continue
 
-            if cx_pt is not None and cy_pt is not None:
-                closest_vg = min(v_grids, key=lambda g: abs(g["x"] - cx_pt)) if v_grids else None
-                closest_hg = min(h_grids, key=lambda g: abs(g["y"] - cy_pt)) if h_grids else None
+            cx_pt = cx * page_w if (cx <= 1.0 and page_w > 1.0) else cx
+            cy_pt = cy * page_h if (cy <= 1.0 and page_h > 1.0) else cy
 
-                if closest_vg and abs(closest_vg["x"] - cx_pt) <= snap_tol_pts:
-                    if closest_hg and abs(closest_hg["y"] - cy_pt) <= snap_tol_pts:
-                        m["grid_ref"] = f"{closest_vg['label']}/{closest_hg['label']}"
-                        m["snapped_grid_x"] = round(closest_vg["x"] / page_w, 4)
-                        m["snapped_grid_y"] = round(closest_hg["y"] / page_h, 4)
-                        snapped_count += 1
+            closest_vg = min(v_grids, key=lambda g: abs(g["x"] - cx_pt)) if v_grids else None
+            closest_hg = min(h_grids, key=lambda g: abs(g["y"] - cy_pt)) if h_grids else None
+
+            if closest_vg and abs(closest_vg["x"] - cx_pt) <= snap_tol_pts and closest_hg and abs(closest_hg["y"] - cy_pt) <= snap_tol_pts:
+                m["grid_ref"] = f"{closest_vg['label']}/{closest_hg['label']}"
+                m["snapped_grid_x"] = round(closest_vg["x"] / page_w, 4)
+                m["snapped_grid_y"] = round(closest_hg["y"] / page_h, 4)
+                snapped_count += 1
+                columns_list.append({
+                    "member": m,
+                    "x_pt": closest_vg["x"],
+                    "y_pt": closest_hg["y"],
+                    "grid_ref": m["grid_ref"],
+                    "vg_label": closest_vg["label"],
+                    "hg_label": closest_hg["label"],
+                })
+            else:
+                columns_list.append({
+                    "member": m,
+                    "x_pt": cx_pt,
+                    "y_pt": cy_pt,
+                    "grid_ref": m.get("grid_ref", ""),
+                    "vg_label": closest_vg["label"] if closest_vg else "",
+                    "hg_label": closest_hg["label"] if closest_hg else "",
+                })
+
+    # -----------------------------------------------------------------------
+    # Step 2: Snap Beams (Tier 1: Column Center to Column Center, Tier 2: Grid)
+    # -----------------------------------------------------------------------
+    col_snap_tol = max(22.0, pts_per_foot * 2.5) if pts_per_foot > 0 else 35.0
+
+    def find_nearest_column(px: float, py: float) -> Optional[Dict[str, Any]]:
+        best_col = None
+        best_dist = float("inf")
+        for col in columns_list:
+            d = math.hypot(col["x_pt"] - px, col["y_pt"] - py)
+            if d <= col_snap_tol and d < best_dist:
+                best_dist = d
+                best_col = col
+        return best_col
+
+    for m in members:
+        mtype = (m.get("type") or m.get("kind") or "").lower()
+        if mtype == "column":
             continue
 
-        # 2. Snap Beams & Framing Members to Grid Bays
         bx1, by1 = m.get("bx1"), m.get("by1")
         bx2, by2 = m.get("bx2"), m.get("by2")
         if bx1 is None or by1 is None or bx2 is None or by2 is None:
@@ -2377,106 +2375,253 @@ def snap_members_to_grid_bays(
         x2_pt, y2_pt = bx2 * page_w, by2 * page_h
         dx = abs(x2_pt - x1_pt)
         dy = abs(y2_pt - y1_pt)
+        if dx < 6.0 and dy < 6.0:
+            continue
 
-        # Horizontal framing (runs primarily along X axis)
-        if dx >= dy and dx > 10.0 and v_grids:
+        is_horizontal = dx >= dy
+
+        # Look for bounding columns at beam endpoints
+        col_start = find_nearest_column(x1_pt, y1_pt)
+        col_end = find_nearest_column(x2_pt, y2_pt)
+
+        # -------------------------------------------------------------------
+        # TIER 1: Column Center to Column Center (Primary Priority)
+        # -------------------------------------------------------------------
+        if col_start and col_end and col_start != col_end:
+            snap_x1 = col_start["x_pt"]
+            snap_y1 = col_start["y_pt"]
+            snap_x2 = col_end["x_pt"]
+            snap_y2 = col_end["y_pt"]
+
+            if is_horizontal and abs(snap_y2 - snap_y1) <= 15.0:
+                avg_y = (snap_y1 + snap_y2) / 2.0
+                snap_y1, snap_y2 = avg_y, avg_y
+            elif not is_horizontal and abs(snap_x2 - snap_x1) <= 15.0:
+                avg_x = (snap_x1 + snap_x2) / 2.0
+                snap_x1, snap_x2 = avg_x, avg_x
+
+            span_pt = math.hypot(snap_x2 - snap_x1, snap_y2 - snap_y1)
+
+            matched_bay = None
+            if is_horizontal and col_start["vg_label"] and col_end["vg_label"]:
+                matched_bay = h_bays.get((col_start["vg_label"], col_end["vg_label"]))
+            elif not is_horizontal and col_start["hg_label"] and col_end["hg_label"]:
+                matched_bay = v_bays.get((col_start["hg_label"], col_end["hg_label"]))
+
+            if matched_bay:
+                bay_len_ft = round(matched_bay["length_inches"] / 12.0, 2)
+                m["length_ft"] = bay_len_ft
+                m["exact_length_text"] = matched_bay.get("ocr_text") or ft_to_arch(bay_len_ft)
+            elif pts_per_foot > 0:
+                calc_len_ft = round(span_pt / pts_per_foot, 2)
+                m["length_ft"] = calc_len_ft
+                m["exact_length_text"] = ft_to_arch(calc_len_ft)
+
+            m["bx1"] = round(snap_x1 / page_w, 4)
+            m["by1"] = round(snap_y1 / page_h, 4)
+            m["bx2"] = round(snap_x2 / page_w, 4)
+            m["by2"] = round(snap_y2 / page_h, 4)
+            m["x"] = round((m["bx1"] + m["bx2"]) / 2.0, 4)
+            m["y"] = round((m["by1"] + m["by2"]) / 2.0, 4)
+            m["lx"] = m["x"]
+            m["ly"] = m["y"]
+            m["sx"] = m["bx1"]
+            m["sy"] = m["by1"]
+            m["span_type"] = "column_to_column"
+            m["is_bay_snapped"] = True
+
+            if is_horizontal:
+                if col_start.get("vg_label") and col_end.get("vg_label"):
+                    m["grid_bay"] = f"{col_start['vg_label']}–{col_end['vg_label']}"
+                if col_start.get("hg_label"):
+                    m["grid_line"] = col_start["hg_label"]
+            else:
+                if col_start.get("hg_label") and col_end.get("hg_label"):
+                    m["grid_bay"] = f"{col_start['hg_label']}–{col_end['hg_label']}"
+                if col_start.get("vg_label"):
+                    m["grid_line"] = col_start["vg_label"]
+
+            if isinstance(m.get("geometry"), dict):
+                m["geometry"]["bx1"] = m["bx1"]
+                m["geometry"]["by1"] = m["by1"]
+                m["geometry"]["bx2"] = m["bx2"]
+                m["geometry"]["by2"] = m["by2"]
+                m["geometry"]["x"] = m["x"]
+                m["geometry"]["y"] = m["y"]
+
+            snapped_count += 1
+            continue
+
+        # -------------------------------------------------------------------
+        # TIER 2: Grid Center to Grid Center (Anti-Overshoot Clamping)
+        # -------------------------------------------------------------------
+        # Horizontal framing along X axis
+        if is_horizontal and dx > 10.0 and v_grids and h_grids:
             start_x = min(x1_pt, x2_pt)
             end_x = max(x1_pt, x2_pt)
             mid_y = (y1_pt + y2_pt) / 2.0
 
+            # Guard: Must lie within structural horizontal grid extent (not in margins/notes)
+            h_min_y = min(g["y"] for g in h_grids)
+            h_max_y = max(g["y"] for g in h_grids)
+            h_corridor_tol = max(18.0, pts_per_foot * 2.0) if pts_per_foot > 0 else 25.0
+            if mid_y < h_min_y - h_corridor_tol or mid_y > h_max_y + h_corridor_tol:
+                # Outside building framing grid boundary — do not snap to grid bay
+                continue
+
+            # If start or end aligns with a single column, anchor that side to the column center
+            g_start_col = col_start if x1_pt <= x2_pt else col_end
+            g_end_col = col_end if x1_pt <= x2_pt else col_start
+
+            g_start_x = g_start_col["x_pt"] if g_start_col else None
+            g_end_x = g_end_col["x_pt"] if g_end_col else None
+
             g_start = min(v_grids, key=lambda g: abs(g["x"] - start_x))
             g_end = min(v_grids, key=lambda g: abs(g["x"] - end_x))
 
-            eff_tol = min(snap_tol_pts, dx * 0.15)
-            if g_start != g_end and abs(g_start["x"] - start_x) <= eff_tol and abs(g_end["x"] - end_x) <= eff_tol:
+            eff_tol = min(snap_tol_pts, max(14.0, dx * 0.12))
+
+            start_ok = (g_start_col is not None) or (abs(g_start["x"] - start_x) <= eff_tol)
+            end_ok = (g_end_col is not None) or (abs(g_end["x"] - end_x) <= eff_tol)
+
+            if g_start != g_end and start_ok and end_ok:
+                final_x1 = g_start_x if g_start_x is not None else g_start["x"]
+                final_x2 = g_end_x if g_end_x is not None else g_end["x"]
+
                 bay = h_bays.get((g_start["label"], g_end["label"]))
                 if bay:
                     bay_len_ft = round(bay["length_inches"] / 12.0, 2)
                     m["length_ft"] = bay_len_ft
                     m["exact_length_text"] = bay.get("ocr_text") or ft_to_arch(bay_len_ft)
-                    m["grid_bay"] = f"{g_start['label']}–{g_end['label']}"
-                    m["is_bay_snapped"] = True
-                    snapped_count += 1
                 else:
-                    grid_span_px = abs(g_end["x"] - g_start["x"])
+                    grid_span_px = abs(final_x2 - final_x1)
                     if pts_per_foot > 0:
                         bay_len_ft = round(grid_span_px / pts_per_foot, 2)
                         m["length_ft"] = bay_len_ft
                         m["exact_length_text"] = ft_to_arch(bay_len_ft)
-                        m["grid_bay"] = f"{g_start['label']}–{g_end['label']}"
-                        m["is_bay_snapped"] = True
-                        snapped_count += 1
 
-                if page_w > 0 and page_h > 0:
-                    if x1_pt <= x2_pt:
-                        m["bx1"] = round(g_start["x"] / page_w, 4)
-                        m["bx2"] = round(g_end["x"] / page_w, 4)
-                    else:
-                        m["bx1"] = round(g_end["x"] / page_w, 4)
-                        m["bx2"] = round(g_start["x"] / page_w, 4)
-                    if h_grids:
-                        closest_hg = min(h_grids, key=lambda g: abs(g["y"] - mid_y))
-                        if abs(closest_hg["y"] - mid_y) <= snap_tol_pts:
-                            m["grid_line"] = closest_hg["label"]
-                            snap_y = round(closest_hg["y"] / page_h, 4)
-                            m["by1"] = snap_y
-                            m["by2"] = snap_y
-                            m["y"] = snap_y
-                    if isinstance(m.get("geometry"), dict):
-                        m["geometry"]["bx1"] = m["bx1"]
-                        m["geometry"]["by1"] = m["by1"]
-                        m["geometry"]["bx2"] = m["bx2"]
-                        m["geometry"]["by2"] = m["by2"]
+                m["grid_bay"] = f"{g_start['label']}–{g_end['label']}"
+                m["span_type"] = "grid_to_grid"
+                m["is_bay_snapped"] = True
+                snapped_count += 1
 
-        # Vertical framing (runs primarily along Y axis)
-        elif dy > dx and dy > 10.0 and h_grids:
+                if x1_pt <= x2_pt:
+                    m["bx1"] = round(final_x1 / page_w, 4)
+                    m["bx2"] = round(final_x2 / page_w, 4)
+                else:
+                    m["bx1"] = round(final_x2 / page_w, 4)
+                    m["bx2"] = round(final_x1 / page_w, 4)
+
+                closest_hg = min(h_grids, key=lambda g: abs(g["y"] - mid_y))
+                if abs(closest_hg["y"] - mid_y) <= snap_tol_pts:
+                    m["grid_line"] = closest_hg["label"]
+                    snap_y = round(closest_hg["y"] / page_h, 4)
+                    m["by1"] = snap_y
+                    m["by2"] = snap_y
+                    m["y"] = snap_y
+                else:
+                    norm_y = round(mid_y / page_h, 4)
+                    m["by1"] = norm_y
+                    m["by2"] = norm_y
+                    m["y"] = norm_y
+
+                m["x"] = round((m["bx1"] + m["bx2"]) / 2.0, 4)
+                m["lx"] = m["x"]
+                m["ly"] = m["y"]
+                m["sx"] = m["bx1"]
+                m["sy"] = m["by1"]
+
+                if isinstance(m.get("geometry"), dict):
+                    m["geometry"]["bx1"] = m["bx1"]
+                    m["geometry"]["by1"] = m["by1"]
+                    m["geometry"]["bx2"] = m["bx2"]
+                    m["geometry"]["by2"] = m["by2"]
+                    m["geometry"]["x"] = m["x"]
+                    m["geometry"]["y"] = m["y"]
+
+        # Vertical framing along Y axis
+        elif not is_horizontal and dy > 10.0 and h_grids and v_grids:
             start_y = min(y1_pt, y2_pt)
             end_y = max(y1_pt, y2_pt)
             mid_x = (x1_pt + x2_pt) / 2.0
 
+            # Guard: Must lie within structural vertical grid extent (not in margins/notes)
+            v_min_x = min(g["x"] for g in v_grids)
+            v_max_x = max(g["x"] for g in v_grids)
+            v_corridor_tol = max(18.0, pts_per_foot * 2.0) if pts_per_foot > 0 else 25.0
+            if mid_x < v_min_x - v_corridor_tol or mid_x > v_max_x + v_corridor_tol:
+                # Outside building framing grid boundary — do not snap to grid bay
+                continue
+
+            g_start_col = col_start if y1_pt <= y2_pt else col_end
+            g_end_col = col_end if y1_pt <= y2_pt else col_start
+
+            g_start_y = g_start_col["y_pt"] if g_start_col else None
+            g_end_y = g_end_col["y_pt"] if g_end_col else None
+
             g_start = min(h_grids, key=lambda g: abs(g["y"] - start_y))
             g_end = min(h_grids, key=lambda g: abs(g["y"] - end_y))
 
-            eff_tol = min(snap_tol_pts, dy * 0.15)
-            if g_start != g_end and abs(g_start["y"] - start_y) <= eff_tol and abs(g_end["y"] - end_y) <= eff_tol:
+            eff_tol = min(snap_tol_pts, max(14.0, dy * 0.12))
+
+            start_ok = (g_start_col is not None) or (abs(g_start["y"] - start_y) <= eff_tol)
+            end_ok = (g_end_col is not None) or (abs(g_end["y"] - end_y) <= eff_tol)
+
+            if g_start != g_end and start_ok and end_ok:
+                final_y1 = g_start_y if g_start_y is not None else g_start["y"]
+                final_y2 = g_end_y if g_end_y is not None else g_end["y"]
+
                 bay = v_bays.get((g_start["label"], g_end["label"]))
                 if bay:
                     bay_len_ft = round(bay["length_inches"] / 12.0, 2)
                     m["length_ft"] = bay_len_ft
                     m["exact_length_text"] = bay.get("ocr_text") or ft_to_arch(bay_len_ft)
-                    m["grid_bay"] = f"{g_start['label']}–{g_end['label']}"
-                    m["is_bay_snapped"] = True
-                    snapped_count += 1
                 else:
-                    grid_span_px = abs(g_end["y"] - g_start["y"])
+                    grid_span_px = abs(final_y2 - final_y1)
                     if pts_per_foot > 0:
                         bay_len_ft = round(grid_span_px / pts_per_foot, 2)
                         m["length_ft"] = bay_len_ft
                         m["exact_length_text"] = ft_to_arch(bay_len_ft)
-                        m["grid_bay"] = f"{g_start['label']}–{g_end['label']}"
-                        m["is_bay_snapped"] = True
-                        snapped_count += 1
 
-                if page_w > 0 and page_h > 0:
-                    if y1_pt <= y2_pt:
-                        m["by1"] = round(g_start["y"] / page_h, 4)
-                        m["by2"] = round(g_end["y"] / page_h, 4)
-                    else:
-                        m["by1"] = round(g_end["y"] / page_h, 4)
-                        m["by2"] = round(g_start["y"] / page_h, 4)
-                    if v_grids:
-                        closest_vg = min(v_grids, key=lambda g: abs(g["x"] - mid_x))
-                        if abs(closest_vg["x"] - mid_x) <= snap_tol_pts:
-                            m["grid_line"] = closest_vg["label"]
-                            snap_x = round(closest_vg["x"] / page_w, 4)
-                            m["bx1"] = snap_x
-                            m["bx2"] = snap_x
-                            m["x"] = snap_x
-                    if isinstance(m.get("geometry"), dict):
-                        m["geometry"]["bx1"] = m["bx1"]
-                        m["geometry"]["by1"] = m["by1"]
-                        m["geometry"]["bx2"] = m["bx2"]
-                        m["geometry"]["by2"] = m["by2"]
+                m["grid_bay"] = f"{g_start['label']}–{g_end['label']}"
+                m["span_type"] = "grid_to_grid"
+                m["is_bay_snapped"] = True
+                snapped_count += 1
+
+                if y1_pt <= y2_pt:
+                    m["by1"] = round(final_y1 / page_h, 4)
+                    m["by2"] = round(final_y2 / page_h, 4)
+                else:
+                    m["by1"] = round(final_y2 / page_h, 4)
+                    m["by2"] = round(final_y1 / page_h, 4)
+
+                closest_vg = min(v_grids, key=lambda g: abs(g["x"] - mid_x))
+                if abs(closest_vg["x"] - mid_x) <= snap_tol_pts:
+                    m["grid_line"] = closest_vg["label"]
+                    snap_x = round(closest_vg["x"] / page_w, 4)
+                    m["bx1"] = snap_x
+                    m["bx2"] = snap_x
+                    m["x"] = snap_x
+                else:
+                    norm_x = round(mid_x / page_w, 4)
+                    m["bx1"] = norm_x
+                    m["bx2"] = norm_x
+                    m["x"] = norm_x
+
+                m["y"] = round((m["by1"] + m["by2"]) / 2.0, 4)
+                m["lx"] = m["x"]
+                m["ly"] = m["y"]
+                m["sx"] = m["bx1"]
+                m["sy"] = m["by1"]
+
+                if isinstance(m.get("geometry"), dict):
+                    m["geometry"]["bx1"] = m["bx1"]
+                    m["geometry"]["by1"] = m["by1"]
+                    m["geometry"]["bx2"] = m["bx2"]
+                    m["geometry"]["by2"] = m["by2"]
+                    m["geometry"]["x"] = m["x"]
+                    m["geometry"]["y"] = m["y"]
+
 
     return snapped_count
 
@@ -2485,16 +2630,47 @@ if __name__ == "__main__":
     import json
     import sys
     import os
+    from pathlib import Path
 
-    default_pdf = r"d:\Steel-ghost 2\Steel-ghost\AI_Extraction\pdf's\Structural (CCD#2)-4-8.pdf"
-    target_pdf = sys.argv[1] if len(sys.argv) > 1 else default_pdf
+    def _pick_pdf_file() -> str:
+        """Select a PDF file using CLI arguments or an interactive GUI file dialog."""
+        if len(sys.argv) > 1 and sys.argv[1].strip():
+            arg_path = sys.argv[1].strip()
+            if os.path.exists(arg_path):
+                return arg_path
+            print(f"Warning: Specified file not found: {arg_path}")
+
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            selected = filedialog.askopenfilename(
+                title="Select Structural/Architectural PDF Drawing",
+                filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+            )
+            root.destroy()
+            if selected and os.path.exists(selected):
+                return selected
+        except Exception:
+            pass
+
+        default_pdf = r"d:\Steel-ghost 2\Steel-ghost\AI_Extraction\pdf's\Structural (CCD#2)-4-8.pdf"
+        if os.path.exists(default_pdf):
+            return default_pdf
+
+        return ""
+
+    target_pdf = _pick_pdf_file()
     page_num = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
-    if not os.path.exists(target_pdf):
-        print(f"File not found: {target_pdf}")
+    if not target_pdf or not os.path.exists(target_pdf):
+        print("No valid PDF file selected or provided.")
+        print("Usage: python grid_geometry_pass.py [path_to_pdf] [page_number]")
         sys.exit(1)
 
-    print(f"--- Running Step 1 (fixed): Deterministic Geometry Pass on: {Path(target_pdf).name} (page {page_num+1}) ---")
+    print(f"--- Running Step 1: Deterministic Geometry Pass on: {Path(target_pdf).name} (page {page_num+1}) ---")
     results = run_deterministic_geometry_pass(target_pdf, page_number=page_num)
 
     print(f"\n[SCALE]: {results['scale']['scale_string']}  ({results['scale']['points_per_foot']} pts/ft)  explicit={results['scale']['is_explicit']}  source={results['scale']['source']}")
@@ -2530,45 +2706,4 @@ if __name__ == "__main__":
         for bay in track["bays"]:
             flag = "  [FLAGGED]" if bay["flagged"] else ""
             print(f"      {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{flag}")
-    page_num = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
-    if not os.path.exists(target_pdf):
-        print(f"File not found: {target_pdf}")
-        sys.exit(1)
-
-    print(f"--- Running Step 1 (fixed): Deterministic Geometry Pass on: {Path(target_pdf).name} (page {page_num+1}) ---")
-    results = run_deterministic_geometry_pass(target_pdf, page_number=page_num)
-
-    print(f"\n[SCALE]: {results['scale']['scale_string']}  ({results['scale']['points_per_foot']} pts/ft)  explicit={results['scale']['is_explicit']}  source={results['scale']['source']}")
-    print(f"\n[VERTICAL GRIDS] ({len(results['vertical_grids'])}) side={results['vertical_axis_meta'].get('side')} primary={results['vertical_axis_meta'].get('primary_count')} secondary={results['vertical_axis_meta'].get('secondary_count')}:")
-    print("  " + ", ".join(f"{g['label']}@{g['x']}" for g in results['vertical_grids']))
-    print(f"\n[HORIZONTAL GRIDS] ({len(results['horizontal_grids'])}) side={results['horizontal_axis_meta'].get('side')} primary={results['horizontal_axis_meta'].get('primary_count')} secondary={results['horizontal_axis_meta'].get('secondary_count')}:")
-    print("  " + ", ".join(f"{g['label']}@{g['y']}" for g in results['horizontal_grids']))
-
-    print(f"\n[HORIZONTAL BAYS] ({len(results['horizontal_bays'])}):")
-    for bay in results["horizontal_bays"]:
-        flag = "  [FLAGGED: disagrees with sheet text]" if bay["flagged"] else ""
-        ocr = f"  (sheet says: {bay['ocr_text']})" if bay["ocr_text"] else ""
-        print(f"  {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{ocr}{flag}")
-
-    print(f"\n[VERTICAL BAYS] ({len(results['vertical_bays'])}):")
-    for bay in results["vertical_bays"]:
-        flag = "  [FLAGGED: disagrees with sheet text]" if bay["flagged"] else ""
-        ocr = f"  (sheet says: {bay['ocr_text']})" if bay["ocr_text"] else ""
-        print(f"  {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{ocr}{flag}")
-
-    print(f"\n[INTERSECTIONS]: {results['total_intersections_count']} grid intersections generated with crop bounding boxes.")
-
-    print(f"\n[HORIZONTAL DIMENSION TRACKS] (numbers axis): {results['horizontal_dimension_track_count']} track(s) found")
-    for ti, track in enumerate(results["horizontal_dimension_tracks"]):
-        print(f"  Track {ti+1}: side={track['side']}  primary={track['primary_count']}  secondary={track['secondary_count']}  grids=[{', '.join(g['label'] for g in track['grids'])}]")
-        for bay in track["bays"]:
-            flag = "  [FLAGGED]" if bay["flagged"] else ""
-            print(f"      {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{flag}")
-
-    print(f"\n[VERTICAL DIMENSION TRACKS] (letters axis): {results['vertical_dimension_track_count']} track(s) found")
-    for ti, track in enumerate(results["vertical_dimension_tracks"]):
-        print(f"  Track {ti+1}: side={track['side']}  primary={track['primary_count']}  secondary={track['secondary_count']}  grids=[{', '.join(g['label'] for g in track['grids'])}]")
-        for bay in track["bays"]:
-            flag = "  [FLAGGED]" if bay["flagged"] else ""
-            print(f"      {bay['from_grid']:>5} -> {bay['to_grid']:<5}: {bay['dimension_text']:>10}{flag}")

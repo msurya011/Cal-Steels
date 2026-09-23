@@ -276,5 +276,48 @@ def extract_grids_with_gemini(pdf_path: str, page_number: int = 0, output_image_
     return structured_data
 
 if __name__ == "__main__":
-    test_pdf = r"d:\Steel-ghost 2\Steel-ghost\AI_Extraction\pdf's\Structural snaps.pdf"
-    extract_grids_with_gemini(test_pdf, page_number=0, output_image_path="gemini_structural_takeoff.png")
+    import sys
+    import os
+    from pathlib import Path
+
+    def _pick_pdf_file() -> str:
+        """Select a PDF file using CLI arguments or an interactive GUI file dialog."""
+        if len(sys.argv) > 1 and sys.argv[1].strip():
+            arg_path = sys.argv[1].strip()
+            if os.path.exists(arg_path):
+                return arg_path
+            print(f"Warning: Specified file not found: {arg_path}")
+
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            selected = filedialog.askopenfilename(
+                title="Select Structural/Architectural PDF Drawing",
+                filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+            )
+            root.destroy()
+            if selected and os.path.exists(selected):
+                return selected
+        except Exception:
+            pass
+
+        default_pdf = r"d:\Steel-ghost 2\Steel-ghost\AI_Extraction\pdf's\Structural snaps.pdf"
+        if os.path.exists(default_pdf):
+            return default_pdf
+
+        return ""
+
+    test_pdf = _pick_pdf_file()
+    page_num = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+    if not test_pdf or not os.path.exists(test_pdf):
+        print("No valid PDF file selected or provided.")
+        print("Usage: python extract_grids_gemini.py [path_to_pdf] [page_number]")
+        sys.exit(1)
+
+    print(f"--- Running Gemini Grid Extraction on: {Path(test_pdf).name} (page {page_num+1}) ---")
+    extract_grids_with_gemini(test_pdf, page_number=page_num, output_image_path="gemini_structural_takeoff.png")
+

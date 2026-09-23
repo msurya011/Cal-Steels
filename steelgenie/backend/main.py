@@ -712,6 +712,8 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
                                 max(_p1.y, _p2.y) > by1 + _TEP):
                             continue
                         thin_segs.append((_p1.x, _p1.y, _p2.x, _p2.y, _tln))
+                        if _tln >= MIN_LEN:
+                            all_lines.append((_p1.x, _p1.y, _p2.x, _p2.y, _tln))
                     except Exception:
                         continue
                 continue
@@ -2142,8 +2144,8 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
         # from the top of this loop instead of a second, inconsistent
         # fixed-pixel limit.
         # ── Small UNFILLED diamond/square outline (footing/pier/pedestal mark) ──
-        # Captured as candidate; column_symbol_classifier approves it if nearby structural mark exists.
-        if (not has_curve and n_lines == 4 and 0.4 < aspect < 2.5):
+        # Captured as candidate on foundation plans only; column_symbol_classifier approves it if nearby structural mark exists.
+        if is_foundation_plan and (not has_curve and n_lines == 4 and 0.4 < aspect < 2.5):
             raw.append((cx, cy, _raw_rect, i, "foundation_outline"))
 
     # ── Fragmented dashed/segmented shape rescue (foundation plans only) ──
@@ -2554,6 +2556,73 @@ def detect_column_symbols(page, scale_ratio: float = 96, is_foundation_plan: boo
         print(f"[SYMBOLS] Column symbols detected (pre mark-filter): {len(symbols)}")
 
     return symbols
+
+
+def extract_grid_anchored_column_symbols(page, v_grid, h_grid, v_labels=None, h_labels=None, search_tol=18.0):
+    """
+    Directly verify real structural I/H / W-section column symbols drawn at Grid Intersections (vg, hg).
+    A real column symbol on a framing plan consists of parallel flanges and a perpendicular web
+    drawn with distinct short vector line segments (4pt to 18pt).
+    """
+    if not v_grid or not h_grid:
+        return []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+        
+    found_cols = []
+    for gx in sorted(v_grid):
+        vl = (v_labels or {}).get(gx, "")
+        for gy in sorted(h_grid):
+            hl = (h_labels or {}).get(gy, "")
+            
+            segs = []
+            for d in drawings:
+                for item in d.get("items", []):
+                    if item[0] == "l":
+                        p1, p2 = item[1], item[2]
+                        mx, my = (p1.x + p2.x)/2, (p1.y + p2.y)/2
+                        if math.hypot(mx - gx, my - gy) <= search_tol:
+                            dx, dy = p2.x - p1.x, p2.y - p1.y
+                            length = math.hypot(dx, dy)
+                            if 4.0 <= length <= 18.0:
+                                angle = math.degrees(math.atan2(dy, dx)) % 180.0
+                                segs.append((p1, p2, dx, dy, length, angle, mx, my))
+            
+            has_ih = False
+            for i, s1 in enumerate(segs):
+                for j, s2 in enumerate(segs):
+                    if i >= j: continue
+                    ang_diff = abs(s1[5] - s2[5]) % 180.0
+                    ang_diff = min(ang_diff, 180.0 - ang_diff)
+                    flange_dist = math.hypot(s1[6] - s2[6], s1[7] - s2[7])
+                    if ang_diff <= 8.0 and abs(s1[4] - s2[4]) <= 4.0 and 3.0 <= flange_dist <= 15.0:
+                        for k, s3 in enumerate(segs):
+                            if k == i or k == j: continue
+                            p_diff = abs(abs(s1[5] - s3[5]) - 90.0) % 180.0
+                            p_diff = min(p_diff, 180.0 - p_diff)
+                            if p_diff <= 12.0 and s3[4] <= 16.0:
+                                has_ih = True
+                                break
+                        if has_ih: break
+                if has_ih: break
+                
+            if has_ih:
+                found_cols.append({
+                    "cx": gx,
+                    "cy": gy,
+                    "inner_cx": gx,
+                    "inner_cy": gy,
+                    "rotation": 0,
+                    "symbol": "I",
+                    "category": "steel_column",
+                    "classifier_confidence": 0.95,
+                    "classifier_reason": "verified I/H column symbol at grid intersection",
+                    "accept_rules": ["ih_pattern"],
+                    "depth_in": 12.0
+                })
+    return found_cols
 
 
 def detect_foundation_footings_grid(page, plan_bounds, scale_ratio: float = 96):
@@ -4617,14 +4686,15 @@ def build_members(profiles, page_w, page_h,
         candidates = []
         for s_idx, sym in enumerate(column_symbols):
             for p_idx, p in enumerate(profiles):
-                # A GIRT label is never a column, no matter how close it sits
-                # to a column symbol (e.g. a roof-edge girt framing right into
-                # a corner column) -- skip it so it falls through to Pass 2's
-                # classify_member, which now returns "beam" for is_girt.
-                if p.get("is_girt"):
+                # A GIRT label or any profile already matched to a drawn beam line is a BEAM, never a column
+                if p.get("is_girt") or p_idx in (beam_line_map or {}):
+                    continue
+                prof_str = (p.get("profile") or "").upper().strip()
+                # Section/sheet callouts like S4.03, S2.06 are detail cuts, not column profiles
+                if re.match(r'^[A-Z]\d+(?:\.\d+)?$', prof_str) and not re.match(r'^(?:C\d+|CC\d+|F\d+|P\d+|W\d+|HSS\d+)$', prof_str):
                     continue
                 d = math.hypot(p["cx"] - sym["cx"], p["cy"] - sym["cy"])
-                if d < SYMBOL_ASSOC_RADIUS:
+                if d < 25.0:  # Tight radius to prevent stealing adjacent beam labels
                     candidates.append((d, s_idx, p_idx))
         candidates.sort()          # process closest pairs first
         used_s: set[int] = set()
@@ -6398,32 +6468,17 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
     # bubble label) or at the symbol classifier (why a dimension centerline
     # mark and a footing mark aren't distinguished) -- not here.
     _grid_envelope = None
-    if is_foundation_plan and v_grid and h_grid:
+    if v_grid and h_grid:
         _bay_x = (max(v_grid) - min(v_grid)) / max(len(v_grid) - 1, 1) if len(v_grid) > 1 else 60.0
         _bay_y = (max(h_grid) - min(h_grid)) / max(len(h_grid) - 1, 1) if len(h_grid) > 1 else 60.0
+        _slack_x = _bay_x if is_foundation_plan else 35.0
+        _slack_y = _bay_y if is_foundation_plan else 35.0
         _grid_envelope = (
-            min(v_grid) - _bay_x, min(h_grid) - _bay_y,
-            max(v_grid) + _bay_x, max(h_grid) + _bay_y,
+            min(v_grid) - _slack_x, min(h_grid) - _slack_y,
+            max(v_grid) + _slack_x, max(h_grid) + _slack_y,
         )
 
-    # Best-guess profile for a symbol-only column with no label of its own --
-    # matches SteelGenie's own behavior (verified live: an unlabeled column
-    # symbol still gets a real guessed section, e.g. "W12X79", flagged with a
-    # warning + "Need Review" status, rather than a placeholder like "COL").
-    # Guess = whichever real column-type profile already appears most often
-    # elsewhere in this project's labeled members -- a far better guess than
-    # a fixed constant, since it reflects what this specific project actually
-    # uses. Falls back to a common light structural column size only when
-    # nothing else on the page gives any hint at all.
-    _COL_PROFILE_RE = re.compile(r'^(?:W\d{1,2}X\d{1,3}|HSS\d+(?:\.\d+)?X\d+(?:\.\d+)?X[\d./]+|PIPE\S*)$', re.IGNORECASE)
-    _col_profile_counts: dict[str, int] = {}
-    for m in members:
-        if m.get("type") == "column":
-            prof = (m.get("profile") or "").upper().strip()
-            if prof and _COL_PROFILE_RE.match(prof):
-                _col_profile_counts[prof] = _col_profile_counts.get(prof, 0) + 1
-    _guessed_profile = (max(_col_profile_counts, key=_col_profile_counts.get)
-                         if _col_profile_counts else None)
+    _guessed_profile = "COL"
 
     beam_ends = []
     beam_end_dirs: dict[tuple[float, float], str] = {}
@@ -6561,16 +6616,29 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
         snap_x, snap_y = raw_x, raw_y
 
         gx, gy = None, None
+        v_matched = False
+        h_matched = False
         if v_grid:
             gx = min(v_grid, key=lambda g: abs(cx - g))
-            if abs(cx - gx) <= SNAP_PT:
+            if abs(cx - gx) <= max(25.0, SNAP_PT):
                 snap_x = gx
-                off_grid = False
+                v_matched = True
         if h_grid:
             gy = min(h_grid, key=lambda g: abs(cy - g))
-            if abs(cy - gy) <= SNAP_PT:
+            if abs(cy - gy) <= max(25.0, SNAP_PT):
                 snap_y = gy
-                off_grid = False
+                h_matched = True
+
+        off_grid = not (v_matched and h_matched)
+
+        if not is_foundation_plan and off_grid and len(unique_ends) < 2:
+            rejected += 1
+            _LAST_COLUMN_VALIDATION_LOG.append({
+                "cx": cx, "cy": cy, "category": s.get("category"),
+                "outcome": "rejected", "stage": "framing_grid_and_beams",
+                "reason": "symbol is off-grid and has fewer than 2 framing beams",
+            })
+            continue
 
         px, py = snap_x, snap_y
 
@@ -6578,15 +6646,23 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
                for ex, ey, rx, ry in existing_with_raw + added):
             continue
 
-        # Match labels (within 20pt)
+        # Match labels (within 15pt) - only valid column profiles/marks, never detail cuts or beam lines
         has_label_match = False
-        matched_profile = _guessed_profile
+        matched_profile = "COL"
         if profiles:
             for p in profiles:
-                if math.hypot(cx - p["cx"], cy - p["cy"]) < 20.0:
-                    has_label_match = True
-                    matched_profile = p["profile"]
-                    break
+                p_prof = (p.get("profile") or "").upper().strip()
+                # Ignore section cut references like S4.03, S2.06
+                if re.match(r'^[A-Z]\d+(?:\.\d+)?$', p_prof) and not re.match(r'^(?:C\d+|CC\d+|F\d+|P\d+|W\d+|HSS\d+)$', p_prof):
+                    continue
+                # Ignore beam labels that belong to beam spans
+                if p.get("has_line") or p.get("is_girt"):
+                    continue
+                if math.hypot(cx - p["cx"], cy - p["cy"]) < 15.0:
+                    if re.match(r'^(?:HSS|PIPE|COL|C\d+|CC\d+|P\d+|F\d+)', p_prof):
+                        has_label_match = True
+                        matched_profile = p_prof
+                        break
 
         # Column Validation Engine: don't trust geometry/label matching
         # alone. Combine grid-intersection proximity, the Symbol
@@ -6832,67 +6908,7 @@ def emit_symbol_columns(members, column_symbols, v_grid, h_grid,
             "is_column": True, "size_unknown": not has_label_match,
         })
 
-    # ── Emit Suggested Ghost Columns ──────────────────────────────────────────
-    # Framing plans: columns sit at grid intersections where beams/girders frame into or cross
-    if v_grid and h_grid and not is_foundation_plan:
-        _FRAME_DIST = max(36.0, pts_per_foot * 4.0)
-        for gx in v_grid:
-            for gy in h_grid:
-                close_ends = [(ex, ey) for ex, ey in beam_ends
-                              if math.hypot(gx - ex, gy - ey) < _FRAME_DIST]
-                # Also check if any beam center passes through this grid intersection
-                crossing_beams = []
-                for m in members:
-                    if m.get("type") == "beam" and m.get("bx1") is not None:
-                        bx1, by1 = m["bx1"] * page_w, m["by1"] * page_h
-                        bx2, by2 = m["bx2"] * page_w, m["by2"] * page_h
-                        if min(bx1, bx2) - 15 <= gx <= max(bx1, bx2) + 15 and min(by1, by2) - 15 <= gy <= max(by1, by2) + 15:
-                            dx, dy = bx2 - bx1, by2 - by1
-                            if dx*dx + dy*dy > 0:
-                                t = max(0, min(1, ((gx - bx1)*dx + (gy - by1)*dy) / (dx*dx + dy*dy)))
-                                proj_x, proj_y = bx1 + t*dx, by1 + t*dy
-                                if math.hypot(gx - proj_x, gy - proj_y) < 14.0:
-                                    crossing_beams.append(m)
 
-                if len(close_ends) >= 1 or len(crossing_beams) >= 1:
-                    has_col = False
-                    for m in members:
-                        if m.get("type") == "column":
-                            mx, my = m["x"] * page_w, m["y"] * page_h
-                            if math.hypot(gx - mx, gy - my) < DEDUP_PT:
-                                has_col = True
-                                break
-                    if not has_col:
-                        v_idx = sorted(v_grid).index(gx) + 1
-                        h_idx = sorted(h_grid).index(gy) + 1
-                        grid_ref = f"{v_idx}-{h_idx}"
-
-                        members.append({
-                            "profile": "COL", "type": "column", "length_ft": 0.0,
-                            "beam_dir": None,
-                            "bx1": None, "by1": None, "bx2": None, "by2": None,
-                            "x":  round(gx / page_w, 4), "y":  round(gy / page_h, 4),
-                            "lx": round(gx / page_w, 4), "ly": round(gy / page_h, 4),
-                            "sx": round(gx / page_w, 4), "sy": round(gy / page_h, 4),
-                            "rotation": 90,
-                            "source": "grid_intersection",
-                            "status": "active",
-                            "confirmed": True,
-                            "is_column": True,
-                            "w": 0.018, "h": 0.018,
-                            "color": MEMBER_COLORS["column"],
-                            "geometry": {
-                                "x": round(gx / page_w, 4),
-                                "y": round(gy / page_h, 4),
-                                "raw_x": round(gx / page_w, 4),
-                                "raw_y": round(gy / page_h, 4),
-                                "snap_offset_ft": 0.0,
-                                "grid_ref": grid_ref,
-                                "symbol": "I",
-                                "depth_in": 12.0,
-                                "error_flags": [],
-                            }
-                        })
 
     print(f"[COLUMNS] emitted {len(added)} symbol columns "
           f"(rejected {rejected} fp — < {MIN_BEAMS} beam endpoints; "
@@ -8245,6 +8261,22 @@ async def analyse_pdf(req: AnalysisRequest):
                     print(f"[ANALYSE] h_grid derived from {len(_framing_syms)} framing symbols: "
                           f"{[round(y) for y in h_grid]}")
 
+        # For framing plans, detect all genuine structural I/H column symbols drawn at Grid Intersections
+        if not _is_foundation_plan and v_grid and h_grid and not is_raster:
+            grid_anchored_cols = extract_grid_anchored_column_symbols(
+                page, v_grid, h_grid, v_labels=v_labels, h_labels=h_labels
+            )
+            if grid_anchored_cols:
+                existing_coords = [(s["cx"], s["cy"]) for s in column_symbols]
+                added_gc = 0
+                for gc in grid_anchored_cols:
+                    if not any(math.hypot(gc["cx"] - ex, gc["cy"] - ey) < 20.0 for ex, ey in existing_coords):
+                        column_symbols.append(gc)
+                        existing_coords.append((gc["cx"], gc["cy"]))
+                        added_gc += 1
+                if added_gc > 0:
+                    print(f"[ANALYSE] Added {added_gc} verified grid-anchored column symbols")
+
         # 4. Extract profile labels within the plan
         profiles = extract_profiles(page, page_w, page_h, plan_bounds,
                                     text_dict=text_dict)
@@ -8329,11 +8361,46 @@ async def analyse_pdf(req: AnalysisRequest):
                     v_grid=v_grid,
                     h_grid=h_grid)
 
+        # ── Arrow-Linked Typical Beam Association ─────────────────────────────
+        # Resolves beams connected via outside leader arrows, doglegs, or spanning row arrows (e.g. ◄── W16x31 ──►)
+        if not is_raster and _all_struct_lns and profiles:
+            try:
+                from app.engineering.beam_leader_resolver import resolve_arrow_linked_beams
+                _arrow_map = resolve_arrow_linked_beams(
+                    page, profiles, beam_line_map, _all_struct_lns, pts_per_foot=pts_per_foot
+                )
+                if _arrow_map:
+                    print(f"[ANALYSE] Arrow-linked beam resolver propagated {len(_arrow_map)} beam profiles across rows/leaders")
+                    for _l_idx, _arrow_info in _arrow_map.items():
+                        _new_prof_idx = len(profiles)
+                        _arr_bx1, _arr_by1, _arr_bx2, _arr_by2 = _arrow_info["x1"], _arrow_info["y1"], _arrow_info["x2"], _arrow_info["y2"]
+                        _arr_dir = "H" if abs(_arr_bx2 - _arr_bx1) >= abs(_arr_by2 - _arr_by1) else "V"
+                        profiles.append({
+                            "profile": _arrow_info["profile"],
+                            "cx": (_arr_bx1 + _arr_bx2) / 2.0,
+                            "cy": (_arr_by1 + _arr_by2) / 2.0,
+                            "dir_hint": _arr_dir,
+                            "text_angle": 0.0,
+                            "bbox_w": 20.0, "bbox_h": 8.0,
+                            "is_girt": False,
+                            "source": "arrow_propagated",
+                        })
+                        beam_line_map[_new_prof_idx] = {
+                            "x1": _arr_bx1, "y1": _arr_by1,
+                            "x2": _arr_bx2, "y2": _arr_by2,
+                            "dir": _arr_dir,
+                            "length_pt": _arrow_info["length_pt"],
+                            "source": "arrow_propagated",
+                        }
+            except Exception as _arr_exc:
+                print(f"[ANALYSE] Arrow-linked beam resolution warning: {_arr_exc}")
+
+
         # ── Unclaimed / Unlabeled beam detection ──────────────────────────────
         # Detects real drawn structural beams on the blueprint that have no nearby text label
         # (e.g. infill beams, typical filler beams, stair/elevator opening headers).
         # We consider lines in _all_struct_lns that were NOT claimed by any labeled profile.
-        if not is_raster and _all_struct_lns and getattr(req, 'detect_unlabeled', False):
+        if not is_raster and _all_struct_lns and getattr(req, 'detect_unlabeled', True):
             _pb = plan_bounds
             _plan_w = _pb[2] - _pb[0] if _pb else 1000.0
             _plan_h = _pb[3] - _pb[1] if _pb else 1000.0
@@ -8367,24 +8434,14 @@ async def analyse_pdf(req: AnalysisRequest):
                 else:
                     continue
 
-                # F3 — reject full-plan-width / full-plan-height lines (grid lines)
-                if bdir == "H" and adx > _plan_w * 0.50:
+                # F3 — reject full-plan-width / full-plan-height lines (sheet borders / overall grid lines)
+                if bdir == "H" and adx > _plan_w * 0.85:
                     continue
-                if bdir == "V" and ady > _plan_h * 0.50:
+                if bdir == "V" and ady > _plan_h * 0.85:
                     continue
 
-                # Multi-bay span rejection: an infill beam without text never spans across multiple bays
-                if v_grid and len(v_grid) >= 2 and bdir == "H":
-                    _max_v_bay = max(v_grid[i+1] - v_grid[i] for i in range(len(v_grid)-1))
-                    if adx > _max_v_bay * 1.30:
-                        continue
-                if h_grid and len(h_grid) >= 2 and bdir == "V":
-                    _max_h_bay = max(h_grid[i+1] - h_grid[i] for i in range(len(h_grid)-1))
-                    if ady > _max_h_bay * 1.30:
-                        continue
-
-                # Discard short ticks / dimension marks / leader arrows (under 3.5 ft real span)
-                _min_real_beam_pt = max(30.0, pts_per_foot * 3.5) if pts_per_foot > 0 else 30.0
+                # Discard short ticks / dimension marks / leader arrows (under 3.0 ft real span)
+                _min_real_beam_pt = max(24.0, pts_per_foot * 3.0) if pts_per_foot > 0 else 24.0
                 if ln < _min_real_beam_pt:
                     continue
 
@@ -8395,18 +8452,21 @@ async def analyse_pdf(req: AnalysisRequest):
                 if any(zx0 <= mx <= zx1 and zy0 <= my <= zy1 for zx0, zy0, zx1, zy1 in (excluded_zones or [])):
                     continue
 
-                # Discard ANY unlabeled line that lies directly on or near a structural grid line
-                if v_grid and bdir == "V" and any(abs(mx - gx) < 14.0 for gx in v_grid):
-                    continue
-                if h_grid and bdir == "H" and any(abs(my - gy) < 14.0 for gy in h_grid):
-                    continue
+                # Discard full-span drawn grid centerlines (lines lying on grid lines that span across the whole plan)
+                if v_grid and h_grid and bdir == "V" and any(abs(mx - gx) < 8.0 for gx in v_grid):
+                    if ady > (max(h_grid) - min(h_grid)) * 0.70:
+                        continue
+                if v_grid and h_grid and bdir == "H" and any(abs(my - gy) < 8.0 for gy in h_grid):
+                    if adx > (max(v_grid) - min(v_grid)) * 0.70:
+                        continue
 
                 # Exclude lines outside the primary structural grid framing envelope (dimension strings, extension lines)
                 if v_grid and h_grid:
-                    min_gx, max_gx = min(v_grid) - 2.0, max(v_grid) + 2.0
-                    min_gy, max_gy = min(h_grid) - 2.0, max(h_grid) + 2.0
-                    if not (min_gx <= min(lx1, lx2) and max(lx1, lx2) <= max_gx and
-                            min_gy <= min(ly1, ly2) and max(ly1, ly2) <= max_gy):
+                    _env_pad_x = max(35.0, pts_per_foot * 3.5) if pts_per_foot > 0 else 45.0
+                    _env_pad_y = max(35.0, pts_per_foot * 3.5) if pts_per_foot > 0 else 45.0
+                    min_gx, max_gx = min(v_grid) - _env_pad_x, max(v_grid) + _env_pad_x
+                    min_gy, max_gy = min(h_grid) - _env_pad_y, max(h_grid) + _env_pad_y
+                    if not (min_gx <= mx <= max_gx and min_gy <= my <= max_gy):
                         continue
 
                 # F4 — deduplicate against already-claimed beam lines and previously added synthetics
@@ -8430,7 +8490,18 @@ async def analyse_pdf(req: AnalysisRequest):
                 _seen_mids.append((mx, my))
 
             if _syn_profiles:
-                print(f"[ANALYSE] Extracted {len(_syn_profiles)} unlabeled structural beam lines "
+                try:
+                    from app.engineering.beam_leader_resolver import propagate_bay_typical_beams
+                    _filled = propagate_bay_typical_beams(
+                        page, profiles, beam_line_map, _syn_profiles, _syn_line_map,
+                        v_grid=v_grid, h_grid=h_grid, pts_per_foot=pts_per_foot
+                    )
+                    if _filled > 0:
+                        print(f"[ANALYSE] Bay typical propagation auto-filled {_filled} infill beams with dominant bay sections")
+                except Exception as _typ_exc:
+                    print(f"[ANALYSE] Bay typical propagation warning: {_typ_exc}")
+
+                print(f"[ANALYSE] Extracted {len(_syn_profiles)} structural beam lines "
                       f"(alongside {len(profiles)} labeled profiles)")
                 profiles.extend(_syn_profiles)
                 beam_line_map.update(_syn_line_map)
@@ -8778,8 +8849,32 @@ async def analyse_pdf(req: AnalysisRequest):
             _snapped_cnt = snap_members_to_grid_bays(
                 members, _geom_results, _calc_w, _calc_h, _eff_ppf
             )
+            # Filter out false-positive beam overlays lying completely outside the structural building envelope (e.g. title notes, detail boxes)
+            _env = _geom_results.get("envelope")
+            if _env and _calc_w > 0 and _calc_h > 0:
+                _min_x, _max_x = _env.get("min_x", 0), _env.get("max_x", _calc_w)
+                _min_y, _max_y = _env.get("min_y", 0), _env.get("max_y", _calc_h)
+                _pad_x = max(35.0, _eff_ppf * 3.5) if _eff_ppf > 0 else 45.0
+                _pad_y = max(35.0, _eff_ppf * 3.5) if _eff_ppf > 0 else 45.0
+
+                _valid_members = []
+                for _m in members:
+                    _mtype = (_m.get("type") or _m.get("kind") or "").lower()
+                    if _mtype == "beam":
+                        _bx1, _by1 = _m.get("bx1"), _m.get("by1")
+                        _bx2, _by2 = _m.get("bx2"), _m.get("by2")
+                        if _bx1 is not None and _by1 is not None and _bx2 is not None and _by2 is not None:
+                            _mx = ((_bx1 + _bx2) / 2.0) * _calc_w
+                            _my = ((_by1 + _by2) / 2.0) * _calc_h
+                            if (_mx < _min_x - _pad_x or _mx > _max_x + _pad_x or
+                                _my < _min_y - _pad_y or _my > _max_y + _pad_y) and not _m.get("is_bay_snapped"):
+                                continue
+                    _valid_members.append(_m)
+                members = _valid_members
+
             members = dedup_overlapping_beams(members, _calc_w, _calc_h, _eff_ppf)
             print(f"[ANALYSE] grid_dimensions via run_deterministic_geometry_pass: {len(grid_dimensions)} lines (snapped {_snapped_cnt} members to grid bays)")
+
 
             # Update grid_bubbles with verified vector grids so DB stores accurate sub-grids
             if _geom_results.get("vertical_grids") and _geom_results.get("horizontal_grids"):

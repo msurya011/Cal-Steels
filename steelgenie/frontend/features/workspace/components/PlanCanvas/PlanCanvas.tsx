@@ -52,34 +52,33 @@ export function PlanCanvas({
   floorPages,
   currentPageId,
 }: PlanCanvasProps) {
-  const {
-    activeTool,
-    zoomLevel,
-    setZoom,
-    isPanning,
-    setIsPanning,
-    rulerStart,
-    setRulerStart,
-    rulerEnd,
-    setRulerEnd,
-    rulerDragging,
-    setRulerDragging,
-    addRulerLine,
-    pushUndo,
-    markerDots,
-    addMarkerDot,
-    rulerLines,
-    setWrapperSize,
-    selectedMemberId,
-    selectMember,
-    setImageNaturalWidth,
-    imageNaturalWidth,
-    selectedRatio,
-    imageAspect,
-    setImageAspect,
-    zoomTarget,
-    layers,
-  } = useWorkspaceStore()
+  const activeTool        = useWorkspaceStore(s => s.activeTool)
+  const zoomLevel         = useWorkspaceStore(s => s.zoomLevel)
+  const setZoom           = useWorkspaceStore(s => s.setZoom)
+  const isPanning         = useWorkspaceStore(s => s.isPanning)
+  const setIsPanning      = useWorkspaceStore(s => s.setIsPanning)
+  const rulerStart        = useWorkspaceStore(s => s.rulerStart)
+  const setRulerStart     = useWorkspaceStore(s => s.setRulerStart)
+  const rulerEnd          = useWorkspaceStore(s => s.rulerEnd)
+  const setRulerEnd       = useWorkspaceStore(s => s.setRulerEnd)
+  const rulerDragging     = useWorkspaceStore(s => s.rulerDragging)
+  const setRulerDragging  = useWorkspaceStore(s => s.setRulerDragging)
+  const addRulerLine      = useWorkspaceStore(s => s.addRulerLine)
+  const pushUndo          = useWorkspaceStore(s => s.pushUndo)
+  const markerDots        = useWorkspaceStore(s => s.markerDots)
+  const addMarkerDot      = useWorkspaceStore(s => s.addMarkerDot)
+  const rulerLines        = useWorkspaceStore(s => s.rulerLines)
+  const setWrapperSize    = useWorkspaceStore(s => s.setWrapperSize)
+  const selectedMemberId  = useWorkspaceStore(s => s.selectedMemberId)
+  const selectMember      = useWorkspaceStore(s => s.selectMember)
+  const setImageNaturalWidth = useWorkspaceStore(s => s.setImageNaturalWidth)
+  const imageNaturalWidth    = useWorkspaceStore(s => s.imageNaturalWidth)
+  const selectedRatio     = useWorkspaceStore(s => s.selectedRatio)
+  const imageAspect       = useWorkspaceStore(s => s.imageAspect)
+  const setImageAspect    = useWorkspaceStore(s => s.setImageAspect)
+  const zoomTarget        = useWorkspaceStore(s => s.zoomTarget)
+  const layers            = useWorkspaceStore(s => s.layers)
+
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const imageWrapperRef = useRef<HTMLDivElement>(null)

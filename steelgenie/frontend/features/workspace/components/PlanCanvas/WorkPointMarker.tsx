@@ -57,84 +57,48 @@ export function WorkPointMarker({ workPoint }: WorkPointMarkerProps) {
   // glance. Magenta has no overlap with any of them.
   const WP_COLOR = '#EC4899'
 
-  // Arrow comes in from outside the plan, on whichever side the backend says
-  // is actually "away from the drawing" for this specific corner (see
-  // outward_dx/outward_dy on the backend) -- a corner grid intersection is
-  // often exactly where a real column/beam callout sits, so a hardcoded
-  // direction eventually routes straight through that content on some sheet.
-  // Falls back to up-and-left only if an older backend response is missing
-  // these fields.
+  // Tight, compact leader right near the corner grid node (2.2% instead of 6.5% sprawling into margins)
   const dirX = workPoint.outward_dx ?? -1
   const dirY = workPoint.outward_dy ?? -1
-  const arrowLen = 6.5 // % of image width/height
+  const arrowLen = 2.2 // % of image width/height
 
-  // Clamp the label's anchor point to stay inside the visible canvas. The
-  // overlay SVG clips anything outside 0-100% (see OverlayLayer's
-  // `overflow: hidden`), so an origin sitting very close to the edge of the
-  // sheet -- normal for a real bottom-left/top-right corner grid -- would
-  // otherwise push the "WP" label itself past the edge and off-screen,
-  // leaving just a dangling line with no visible label. The leader still
-  // starts from the clamped anchor, so it just reads as a shorter line near
-  // an edge rather than an invisible label.
-  const clampPct = (v: number) => Math.max(4, Math.min(96, v))
+  const clampPct = (v: number) => Math.max(1, Math.min(99, v))
   const ax = clampPct(cx + dirX * arrowLen)
   const ay = clampPct(cy + dirY * arrowLen)
 
   return (
     <g style={{ pointerEvents: 'none' }}>
       <title>
-        {`Work Point (WP) -- implied origin at grid ${workPoint.grid_ref}. ` +
-          'Best-guess convention marker (first grid in each axis sequence), not a verified stamped benchmark.'}
+        {`Work Point (WP) -- implied origin at grid ${workPoint.grid_ref}.`}
       </title>
 
-      {/* Leader line from the label out to the actual grid intersection */}
+      {/* Target Crosshair & Concentric Target Ring on Grid Intersection */}
+      <circle
+        cx={`${cx}%`} cy={`${cy}%`} r={5.5}
+        fill="none" stroke={WP_COLOR} strokeWidth={1.5}
+        strokeDasharray="2,1.5"
+        opacity={0.9}
+      />
+      <circle
+        cx={`${cx}%`} cy={`${cy}%`} r={2}
+        fill={WP_COLOR}
+        opacity={0.9}
+      />
+
+      {/* Leader line from the compact badge to the target node */}
       <line
         x1={`${ax}%`} y1={`${ay}%`}
         x2={`${cx}%`} y2={`${cy}%`}
         stroke={WP_COLOR}
-        strokeWidth={1.6}
-        markerEnd="url(#wp-arrowhead)"
+        strokeWidth={1.5}
       />
 
-      <defs>
-        <marker
-          id="wp-arrowhead"
-          markerWidth="8"
-          markerHeight="8"
-          refX="6"
-          refY="4"
-          orient="auto"
-        >
-          <path d="M0,0 L8,4 L0,8 Z" fill={WP_COLOR} />
-        </marker>
-      </defs>
-
-      {/* Target crosshair at the actual origin grid intersection -- kept
-        deliberately light (thin dashed ring, no solid fill/center dot) since
-        a corner grid intersection is very often exactly where a real column
-        symbol and its beam/joist callouts are drawn. A bold solid marker
-        there would visually fight with that real content instead of just
-        pointing it out. */}
-      <circle
-        cx={`${cx}%`} cy={`${cy}%`} r={4.5}
-        fill="none" stroke={WP_COLOR} strokeWidth={1.2}
-        strokeDasharray="2,1.5"
-        opacity={0.85}
-      />
-
-      {/* "WP" label + grid reference, centered on the outside anchor point.
-        No background box -- an opaque box here was covering real sheet
-        notes/text underneath it (exactly the kind of "disturbing other
-        material detail" problem already fixed for the crosshair itself).
-        Legibility instead comes from a white halo stroke behind the colored
-        fill, the same technique DimensionLine.tsx already uses elsewhere in
-        this overlay -- readable over both blank paper and dense linework
-        without blocking anything. */}
+      {/* "WP" compact badge + grid reference */}
       <g style={{ paintOrder: 'stroke fill' }}>
         <text
-          x={`${ax}%`} y={`${ay - 0.3}%`}
+          x={`${ax}%`} y={`${ay - 0.2}%`}
           fill={WP_COLOR}
-          fontSize="10px"
+          fontSize="9.5px"
           fontWeight="800"
           textAnchor="middle"
           style={{
@@ -145,9 +109,9 @@ export function WorkPointMarker({ workPoint }: WorkPointMarkerProps) {
           WP
         </text>
         <text
-          x={`${ax}%`} y={`${ay + 2.3}%`}
+          x={`${ax}%`} y={`${ay + 1.8}%`}
           fill={WP_COLOR}
-          fontSize="7.5px"
+          fontSize="7px"
           fontWeight="700"
           textAnchor="middle"
           style={{
@@ -158,6 +122,7 @@ export function WorkPointMarker({ workPoint }: WorkPointMarkerProps) {
           {workPoint.grid_ref}
         </text>
       </g>
+
     </g>
   )
 }

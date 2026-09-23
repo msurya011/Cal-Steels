@@ -30,7 +30,10 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
 
   const res = await fetch(path.startsWith('http') ? path : `${BASE}${path}`, {
     ...init,
-    cache: 'no-store',
+    // Use 'default' so the browser can apply HTTP caching (Cache-Control headers).
+    // 'no-store' was forcing every GET to hit the network even on fast re-visits.
+    // Mutations (POST/PATCH/DELETE) still bypass cache via their method semantics.
+    cache: init.method && init.method !== 'GET' ? 'no-store' : 'default',
     headers: {
       'Content-Type': 'application/json',
       ...init.headers,

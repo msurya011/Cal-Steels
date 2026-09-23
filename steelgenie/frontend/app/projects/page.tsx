@@ -63,10 +63,16 @@ export default function ProjectsPage() {
     return tabbedProjects.filter((p: any) => p.folder_id === activeFolderId)
   }, [tabbedProjects, activeFolderId])
 
-  // Filter projects by search
-  const filteredProjects = folderFiltered.filter((p: any) =>
-    p.name.toLowerCase().includes(search.toLowerCase()) ||
-    (p.number && p.number.toLowerCase().includes(search.toLowerCase()))
+  // Filter projects by search — memoized so it only re-runs when search text
+  // or the folder-filtered list actually changes, not on every render.
+  const filteredProjects = useMemo(
+    () =>
+      folderFiltered.filter(
+        (p: any) =>
+          p.name.toLowerCase().includes(search.toLowerCase()) ||
+          (p.number && p.number.toLowerCase().includes(search.toLowerCase()))
+      ),
+    [folderFiltered, search]
   )
 
   const handleNewFolder = async () => {
